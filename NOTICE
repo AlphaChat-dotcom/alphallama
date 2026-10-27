@@ -1,0 +1,31 @@
+AlphaLlama
+Copyright 2026 The AlphaLlama authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is a fork of llama.cpp and ggml and includes or adapts code from the projects below. Their
+license texts are in licenses/.
+
+- llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT License.
+  Copyright (c) 2023-2026 The ggml authors. See licenses/LICENSE-llama.cpp.
+  Files that come from llama.cpp keep the MIT License.
+
+- ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp), MIT License.
+  Quantization types and dequantization kernels in ggml/src/ggml-quants-ik.*,
+  ggml/src/ggml-cuda/convert-ik.cu. See licenses/LICENSE-ik_llama.cpp.
+
+- Strata, MIT License. The MTP draft block in src/llama-context-mtp4.cpp follows its
+  reference implementation. See licenses/LICENSE-strata.
+
+- Marlin (IST-DASLab, as modified in vLLM / Neural Magic), Apache License 2.0.
+  tools/serve/marlin/ and tools/serve/serve-marlin.cu.
+
+- NInfer, Apache License 2.0. The shape of the MoE down-projection kernel in
+  ggml/src/ggml-cuda/moe-down9.cu follows its kernels; the code is original.
+
+- nlohmann/json, MIT License. See licenses/LICENSE-jsonhpp.
+
+- cpp-httplib, MIT License. See vendor/cpp-httplib/LICENSE.
+
+Optional, not bundled: FlashInfer (Apache License 2.0), cloned into vendor/flashinfer to
+enable the FlashInfer serving backend.

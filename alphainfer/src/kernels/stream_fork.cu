@@ -1,0 +1,26 @@
+// Second compute stream for the ggml CUDA backend (AI_MOE_CONCURRENT).
+//
+// Small GEMVs lose a fixed few microseconds per kernel to ramp and drain, independent of grid size, which only
+// concurrency hides. The MoE block has two branches that meet only at the merge -- the shared
+// expert and the routed experts -- but ggml runs them one after the other on one stream. The backend
+// already keeps per-stream contexts and pools (upstream's concurrency support); this file only lets the
+// engine choose which of those streams the next graph launches on. The fork and join are event
+// record/wait pairs, which a stream capture records as parallel branches of the round's graph.
+#include "kernels/kernels.h"
+
+#include "ggml-backend-impl.h"
+#include "ggml-cuda/common.cuh"
+
+namespace ai::kern {
+
+void backend_set_stream_no(ggml_backend * backend, int n) {
+    auto * ctx          = (ggml_backend_cuda_context *) backend->context;
+    ctx->curr_stream_no = n;
+}
+
+void * backend_stream_no(ggml_backend * backend, int n) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return ctx->stream(ctx->device, n);
+}
+
+}   // namespace ai::kern

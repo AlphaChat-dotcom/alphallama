@@ -1,0 +1,24 @@
+// Minimal cuda/cmath compatibility shim for CUDA 12.2
+// Provides cuda::fast_mod_div needed by FlashInfer's fastdiv.cuh
+#pragma once
+#include <cstdint>
+
+namespace cuda {
+
+template <typename T>
+struct fast_mod_div {
+    T divisor_;
+    __host__ __device__ fast_mod_div() : divisor_(1) {}
+    __host__ __device__ explicit fast_mod_div(T d) : divisor_(d) {}
+
+    // Division operator (n / fast_mod_div)
+    friend __host__ __device__ __forceinline__ T operator/(T n, const fast_mod_div& d) {
+        return n / d.divisor_;
+    }
+    // Modulo operator (n % fast_mod_div)
+    friend __host__ __device__ __forceinline__ T operator%(T n, const fast_mod_div& d) {
+        return n % d.divisor_;
+    }
+};
+
+}  // namespace cuda
