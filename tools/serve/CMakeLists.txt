@@ -23,6 +23,12 @@ set(ALPHASERVE_SOURCES
     serve-response.h
 )
 
+# Without the CUDA backend the expert-cache / DRE entry points the engine calls do not exist; link no-ops instead
+# (CPU-only builds, e.g. Windows ARM64).
+if (NOT GGML_CUDA)
+    list(APPEND ALPHASERVE_SOURCES serve-cuda-stubs.cpp)
+endif()
+
 # ALPHA_FLASHINFER (top-level CMakeLists.txt) adds the FlashInfer dense path and the Marlin W4A16
 # AWQ/GPTQ INT4 Tensor-Core path, both gated on ALPHA_HAS_FLASHINFER.
 

@@ -7,6 +7,8 @@ int LLAMA_BUILD_NUMBER = @LLAMA_BUILD_NUMBER@;
 char const * LLAMA_COMMIT = "@LLAMA_BUILD_COMMIT@";
 char const * LLAMA_COMPILER = "@BUILD_COMPILER@";
 char const * LLAMA_BUILD_TARGET = "@BUILD_TARGET@";
+char const * ALPHALLAMA_VERSION = "@ALPHALLAMA_VERSION@";
+char const * ALPHALLAMA_VERSION_NAME = "@ALPHALLAMA_VERSION_NAME@";
 
 int llama_build_number(void) {
     return LLAMA_BUILD_NUMBER;
@@ -24,12 +26,21 @@ const char * llama_build_target(void) {
     return LLAMA_BUILD_TARGET;
 }
 
+const char * alphallama_version(void) {
+    return ALPHALLAMA_VERSION;
+}
+
+const char * alphallama_version_name(void) {
+    return ALPHALLAMA_VERSION_NAME;
+}
+
 const char * llama_build_info(void) {
     static std::string s = "b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT;
     return s.c_str();
 }
 
 void llama_print_build_info(void) {
+    fprintf(stderr, "%s: %s (%s)\n",            __func__, alphallama_version_name(), alphallama_version());
     fprintf(stderr, "%s: build = %d (%s)\n",      __func__, llama_build_number(), llama_commit());
     fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
 }

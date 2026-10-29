@@ -31,6 +31,10 @@ else()
     set(LLAMA_STANDALONE OFF)
 endif()
 
+# Release name and semantic version, shown by --version, the build-info line and the server banners.
+set(ALPHALLAMA_VERSION      "2.0.0")
+set(ALPHALLAMA_VERSION_NAME "AlphaLlama v2 Flash")
+
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)

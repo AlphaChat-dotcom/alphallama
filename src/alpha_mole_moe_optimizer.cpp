@@ -6312,10 +6312,10 @@ void alpha_moe_optimizer_restore_expert_remap(alpha_moe_optimizer * opt) {
     if (opt->ctx) llama_context_reset_sched(opt->ctx);
 }
 
-// Non-CUDA, non-Windows stub implementations.
-// When building without CUDA on Linux, these symbols are unresolved.
+// Non-CUDA stub implementations, for every build that lacks the Windows DLL forwarders above (those exist only
+// with LLAMA_SHARED): Linux without CUDA and static Windows CPU builds would otherwise leave these unresolved.
 // They are no-ops - DMA functions do nothing without a GPU.
-#if !defined(GGML_USE_CUDA) && !defined(_WIN32)
+#if !defined(GGML_USE_CUDA) && !(defined(_WIN32) && defined(LLAMA_SHARED))
 extern "C" {
 void _acdi(void) {}
 void _acda(struct ggml_tensor *, const void *, size_t, size_t) {}

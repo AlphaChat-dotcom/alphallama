@@ -17,7 +17,16 @@
 #include <unordered_set>
 #include <unordered_map>
 
-GGML_BACKEND_API_C void ggml_cuda_set_expert_user(int user_id);
+// ggml-cuda entry points; without the CUDA backend they are no-ops from serve-cuda-stubs.cpp, declared
+// extern "C" there because a dllimport declaration would not pull the stub object out of the static library.
+#ifndef ALPHA_CUDA_API_C
+#  ifdef GGML_USE_CUDA
+#    define ALPHA_CUDA_API_C GGML_BACKEND_API_C
+#  else
+#    define ALPHA_CUDA_API_C extern "C"
+#  endif
+#endif
+ALPHA_CUDA_API_C void ggml_cuda_set_expert_user(int user_id);
 #include "alpha_mole_speculative.h"   // alpha_recurrent_snapshot/restore
 #include "ggml-backend.h"
 
@@ -195,12 +204,12 @@ namespace alphaserve {
 
 extern int g_serve_prompt_chunk;     // serve-slot.h: prefill chunk (--ubatch)
 extern int g_serve_ubatch_prefill;   // serve-slot.h: runtime-grow target (0 = off)
-GGML_BACKEND_API_C size_t ggml_cuda_dre_borrow(size_t want);   // ggml-cuda/dre.cu
-GGML_BACKEND_API_C void   ggml_cuda_dre_return(void);
-GGML_BACKEND_API_C void   ggml_cuda_dre_return_begin(size_t keep_extra);
-GGML_BACKEND_API_C void   ggml_cuda_dre_return_finish(void);
-GGML_BACKEND_API_C void   ggml_cuda_dre_set_prefill_tokens(int n);
-GGML_BACKEND_API_C void   ggml_cuda_dre_pipe_prestart(void);
+ALPHA_CUDA_API_C size_t ggml_cuda_dre_borrow(size_t want);   // ggml-cuda/dre.cu
+ALPHA_CUDA_API_C void   ggml_cuda_dre_return(void);
+ALPHA_CUDA_API_C void   ggml_cuda_dre_return_begin(size_t keep_extra);
+ALPHA_CUDA_API_C void   ggml_cuda_dre_return_finish(void);
+ALPHA_CUDA_API_C void   ggml_cuda_dre_set_prefill_tokens(int n);
+ALPHA_CUDA_API_C void   ggml_cuda_dre_pipe_prestart(void);
 
 // External draft model for MTP (ALPHA_DRAFT_MODEL).
 // The MTP head predicts every depth from the same carried hidden h_t (it is trained for one step

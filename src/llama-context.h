@@ -549,6 +549,8 @@ private:
     void    mtp_seq_bookkeep(int32_t first, int32_t last, const float * last_h, int64_t n_embd);
     int32_t mtp_kv_base() const { return mtp_cur_seq * mtp_kv_stride; }
     // plan of the fill the current graph carries (ALPHA_MTP_FILL_INGRAPH, see mtp_ingraph_append)
+    // Public to match its forward declaration above (clang rejects a redeclaration that changes access).
+public:
     struct mtp_ingraph_t {
         bool active = false;                    // the last built graph fills the head KV itself
         bool built  = false;                    // the graph held in gf_res_prev carries fill nodes (no reuse)
@@ -558,7 +560,9 @@ private:
         std::vector<std::vector<int32_t>>   ix_h, ps_h;
         ggml_tensor *       hprev = nullptr;
         std::vector<float>  last_row;
-    } mtp_ig;
+    };
+private:
+    mtp_ingraph_t                mtp_ig;
     std::vector<llama_seq_id>    mtp_fill_seq;        // seq of each captured row
 
     int32_t                      mtp_chain_step = 0;  // drafts issued in the current window

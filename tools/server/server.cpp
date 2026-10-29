@@ -92,6 +92,7 @@ int main(int argc, char ** argv) {
         "   (AlphaServe: fused-infer / ALL_GPU, ~8x faster). ALPHA_NO_AUTOROUTE=1\n"
         "   forces this engine.\n"
         "==================================================================\n");
+    fprintf(stderr, "%s (%s), build %s\n", alphallama_version_name(), alphallama_version(), llama_build_info());
 
     // own arguments required by this example
     common_params params;

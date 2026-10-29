@@ -244,3 +244,20 @@ target_link_libraries(ai-q4x-load PRIVATE aicore)
 set_target_properties(alphainfer ai-ref ai-q4x-inspect ai-q4x-load ai-dflash2-check ai-smallm-check ai-fadq-check ai-requant ai-bench-gemv ai-bench-fixed ai-bench-head-ncols ai-kernel-diff PROPERTIES
     BUILD_RPATH "${AI_VENDOR_BUILD}/bin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# The engine's kernels need compute capability 8.0 or newer (warp reduce intrinsics, f16 mma shapes). Older entries in
+# CMAKE_CUDA_ARCHITECTURES (e.g. a release build that also targets Turing for ggml) are dropped for AlphaInfer only;
+# alphallama-serve routes to AlphaInfer only for validated (GPU, model) rows, so older GPUs use the ggml path.
+set(AI_CUDA_ARCHS "")
+foreach(a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    string(REGEX MATCH "^[0-9]+" a_num "${a}")
+    if (NOT a_num OR a_num GREATER_EQUAL 80)
+        list(APPEND AI_CUDA_ARCHS "${a}")
+    endif()
+endforeach()
+if (CMAKE_CUDA_ARCHITECTURES AND NOT AI_CUDA_ARCHS)
+    message(FATAL_ERROR "AlphaInfer needs a CUDA architecture of 80 or newer in CMAKE_CUDA_ARCHITECTURES")
+endif()
+if (AI_CUDA_ARCHS)
+    set_target_properties(aicore ai-doorbell-bench PROPERTIES CUDA_ARCHITECTURES "${AI_CUDA_ARCHS}")
+endif()

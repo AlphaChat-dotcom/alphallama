@@ -1,0 +1,257 @@
+# Release binaries of AlphaLlama v2 Flash.
+#
+# Run it from the Actions tab (workflow_dispatch) to get the packages as workflow artifacts, or push a tag v* to
+# also attach them to a draft GitHub release. Every package carries BUILD_INFO (commit, toolkit, architectures,
+# build options), the license files, and a .sha256 next to it.
+#
+# Packages:
+#   linux-x64-cuda12     CUDA 12.8, RTX 20-series (PTX) through RTX 50-series, AlphaInfer on sm_80 and newer
+#   win-x64-cuda12       CUDA 12.4, RTX 20-series (PTX) through RTX 40-series and H100, driver 551 or newer
+#   win-x64-cuda13       CUDA 13.1, RTX 20-series through RTX 50-series, driver 580 or newer
+#   win-x64-vulkan       any GPU with a Vulkan 1.2 driver (NVIDIA, AMD, Intel)
+#   win-x64-cpu          x86-64 with AVX2
+#   win-arm64-cpu        Windows on ARM (Snapdragon X and similar)
+# The Windows packages do not include the AlphaInfer engine (Linux only); alphallama-serve uses its built-in engine.
+
+name: AlphaLlama release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  PKG: alphallama-v2-flash
+
+jobs:
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    env:
+      ARCHS: '75-virtual;80-virtual;86-real;89-real;90-real;120a-real'
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates python3-pip patchelf zstd file
+          pip3 install -q "cmake==3.28.*" ninja
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON -DALPHA_ALPHAINFER=ON -DGGML_CUDA_NCCL=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build build -j "$(nproc)"
+
+      - name: Package
+        run: |
+          N="$PKG-linux-x64-cuda12"; R="dist/$N"
+          mkdir -p "$R/bin" "$R/licenses"
+          cp -P build/bin/* "$R/bin/"
+          rm -f "$R"/bin/test-* "$R"/bin/*.a
+          for l in cudart cublas cublasLt; do cp -P /usr/local/cuda/lib64/lib$l.so* "$R/bin/"; done
+          for f in "$R"/bin/*; do
+            [ -L "$f" ] && continue
+            file -b "$f" | grep -q ELF && patchelf --set-rpath '$ORIGIN' "$f"
+          done
+          cp LICENSE NOTICE README.md "$R/"
+          cp -r licenses/. "$R/licenses/"
+          cp alphainfer/LICENSE "$R/licenses/LICENSE-alphainfer"
+          cp tools/serve/LICENSE "$R/licenses/LICENSE-alphaserve"
+          [ -f /usr/local/cuda/EULA.txt ] && cp /usr/local/cuda/EULA.txt "$R/licenses/NVIDIA-CUDA-EULA.txt"
+          {
+            echo "AlphaLlama v2 Flash, $N"
+            echo "source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY commit $GITHUB_SHA"
+            echo "toolkit: CUDA $(nvcc --version | grep -o 'release [0-9.]*' | cut -d' ' -f2), image nvidia/cuda:12.8.1-devel-ubuntu22.04"
+            echo "cuda architectures: $ARCHS (AlphaInfer: 80 and newer)"
+            echo "build options: GGML_CUDA=ON ALPHA_ALPHAINFER=ON GGML_CUDA_NCCL=OFF GGML_NATIVE=OFF BUILD_SHARED_LIBS=ON"
+            echo "cpu baseline: x86-64 with AVX2, FMA, F16C, BMI2"
+            echo "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA, licenses/NVIDIA-CUDA-EULA.txt)"
+            echo "needs: NVIDIA driver 525 or newer (570 or newer for RTX 20-series, which runs from PTX, and RTX 50-series), glibc 2.35 or newer"
+          } > "$R/BUILD_INFO"
+          cd dist
+          tar -cf - "$N" | zstd -T0 -19 -q > "$N.tar.zst"
+          sha256sum "$N.tar.zst" > "$N.tar.zst.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-cuda12
+          path: dist/*.tar.zst*
+
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.4'
+            tag: cuda12
+            archs: '75-virtual;80-virtual;86-real;89-real;90-real'
+            driver: '551 or newer'
+          - cuda: '13.1'
+            tag: cuda13
+            archs: '75-virtual;80-virtual;86-real;89-real;90-real;100-real;120-real'
+            driver: '580 or newer'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        env:
+          CFLAGS: /utf-8
+          CXXFLAGS: /utf-8
+          CUDAFLAGS: -Xcompiler /utf-8
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DALPHA_FLASHINFER=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $n = "$env:PKG-win-x64-${{ matrix.tag }}"; $r = "dist\$n"
+          New-Item -ItemType Directory -Force "$r\licenses" | Out-Null
+          Get-ChildItem build\bin -File -Include *.exe,*.dll -Recurse | Where-Object { $_.Name -notlike 'test-*' } | Copy-Item -Destination $r
+          Get-ChildItem $env:CUDA_PATH -Recurse -Include cudart64_*.dll,cublas64_*.dll,cublasLt64_*.dll | Copy-Item -Destination $r
+          $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC" -Directory | Where-Object { $_.Name -match '^\d' } | Sort-Object Name | Select-Object -Last 1
+          Copy-Item "$($redist.FullName)\x64\Microsoft.VC143.CRT\*.dll", "$($redist.FullName)\x64\Microsoft.VC143.OpenMP\*.dll" $r
+          Copy-Item LICENSE, NOTICE, README.md $r
+          Copy-Item licenses\* "$r\licenses" -Recurse
+          Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
+          if (Test-Path "$env:CUDA_PATH\LICENSE") { Copy-Item "$env:CUDA_PATH\LICENSE" "$r\licenses\NVIDIA-CUDA-LICENSE.txt" }
+          @(
+            "AlphaLlama v2 Flash, $n"
+            "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
+            "toolkit: CUDA ${{ matrix.cuda }}, MSVC $($redist.Name)"
+            "cuda architectures: ${{ matrix.archs }}"
+            "build options: GGML_CUDA=ON GGML_NATIVE=OFF ALPHA_FLASHINFER=OFF (no AlphaInfer on Windows)"
+            "cpu baseline: x86-64 with AVX2, FMA, F16C"
+            "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA), Visual C++ runtime and OpenMP"
+            "needs: NVIDIA driver ${{ matrix.driver }}, Windows 10 or 11 x64"
+          ) | Set-Content "$r\BUILD_INFO"
+          Compress-Archive -Path $r -DestinationPath "dist\$n.zip"
+          "$((Get-FileHash "dist\$n.zip" -Algorithm SHA256).Hash.ToLower())  $n.zip" | Set-Content "dist\$n.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-x64-${{ matrix.tag }}
+          path: dist/*.zip*
+
+  windows-cpu:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VULKAN_VERSION: 1.4.313.2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: x64-cpu
+            arch: x64
+            vcvars: x64
+            defines: '-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+            info: 'x86-64 with AVX2, FMA, F16C (MSVC)'
+          - tag: x64-vulkan
+            arch: x64
+            vcvars: x64
+            defines: '-DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+            info: 'x86-64 with AVX2, FMA, F16C (MSVC); GPU through Vulkan 1.2 or newer'
+          - tag: arm64-cpu
+            arch: arm64
+            vcvars: amd64_arm64
+            defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF'
+            info: 'ARMv8.7-A (Snapdragon X class), clang'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        if: matrix.tag == 'x64-vulkan'
+        shell: pwsh
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        env:
+          CFLAGS: ${{ matrix.arch == 'x64' && '/utf-8' || '' }}
+          CXXFLAGS: ${{ matrix.arch == 'x64' && '/utf-8' || '' }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }}
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF ${{ matrix.defines }} ^
+            -DALPHA_FLASHINFER=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $n = "$env:PKG-win-${{ matrix.tag }}"; $r = "dist\$n"
+          New-Item -ItemType Directory -Force "$r\licenses" | Out-Null
+          Get-ChildItem build\bin -File -Include *.exe,*.dll -Recurse | Where-Object { $_.Name -notlike 'test-*' } | Copy-Item -Destination $r -Force
+          $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC" -Directory | Where-Object { $_.Name -match '^\d' } | Sort-Object Name | Select-Object -Last 1
+          $a = "${{ matrix.arch }}"
+          Copy-Item "$($redist.FullName)\$a\Microsoft.VC143.CRT\*.dll" $r
+          if ($a -eq 'x64') { Copy-Item "$($redist.FullName)\x64\Microsoft.VC143.OpenMP\*.dll" $r }
+          else { Copy-Item "$($redist.FullName)\debug_nonredist\arm64\Microsoft.VC143.OpenMP.LLVM\libomp140.aarch64.dll" $r }
+          Copy-Item LICENSE, NOTICE, README.md $r
+          Copy-Item licenses\* "$r\licenses" -Recurse
+          Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
+          @(
+            "AlphaLlama v2 Flash, $n"
+            "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
+            "toolkit: MSVC $($redist.Name)"
+            "build options: GGML_CUDA=OFF ${{ matrix.defines }} (no AlphaInfer on Windows)"
+            "cpu baseline: ${{ matrix.info }}"
+            "bundled: Visual C++ runtime and OpenMP"
+            "needs: Windows 10 or 11, ${{ matrix.arch }}"
+          ) | Set-Content "$r\BUILD_INFO"
+          Compress-Archive -Path $r -DestinationPath "dist\$n.zip"
+          "$((Get-FileHash "dist\$n.zip" -Algorithm SHA256).Hash.ToLower())  $n.zip" | Set-Content "dist\$n.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-${{ matrix.tag }}
+          path: dist/*.zip*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-cuda, windows-cuda, windows-cpu]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft \
+            --title "AlphaLlama v2 Flash ($GITHUB_REF_NAME)" --notes "Binaries built by the AlphaLlama release workflow from $GITHUB_SHA."

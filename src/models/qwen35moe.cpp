@@ -84,6 +84,11 @@ static ggml_tensor * alpha_fused_weight(ggml_context * ctx, std::initializer_lis
         if (w->buffer != w0->buffer || !ggml_is_contiguous(w)) {
             return nullptr;
         }
+        // The CPU repack buffer keeps each weight's layout traits in `extra`; the alias must carry the same
+        // traits, or the plain kernel reads the interleaved bytes (garbage decode on ARM, where Q5_K repacks).
+        if (w->extra != w0->extra) {
+            return nullptr;
+        }
         if ((const char *) w->data != expected) {
             return nullptr;   // not allocated adjacently
         }
@@ -93,6 +98,7 @@ static ggml_tensor * alpha_fused_weight(ggml_context * ctx, std::initializer_lis
     ggml_tensor * f = ggml_new_tensor_2d(ctx, w0->type, w0->ne[0], ne1_sum);
     f->buffer = w0->buffer;
     f->data   = w0->data;
+    f->extra  = w0->extra;   // repacked rows are 8-row groups in order, so adjacent weights concatenate exactly
     ggml_format_name(f, "%s (fused)", w0->name);
     return f;
 }

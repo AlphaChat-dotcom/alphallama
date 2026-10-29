@@ -57,54 +57,63 @@ extern "C" void marlin_reset_locks(void *);
 typedef bool   (*ggml_expert_pcache_fn_t)(void*, void*, const void*, size_t, int64_t, int64_t, size_t);
 typedef void   (*ggml_expert_pcache_flush_fn_t)(void*);
 typedef void * (*ggml_expert_pcache_redirect_fn_t)(void*, void*);
-GGML_BACKEND_API_C bool   ggml_cuda_expert_pcache_copy(void*, void*, const void*, size_t, int64_t, int64_t, size_t);
-GGML_BACKEND_API_C void   ggml_cuda_expert_pcache_flush(void*);
-GGML_BACKEND_API_C void * ggml_cuda_expert_pcache_get_extra(void);
+// ggml-cuda entry points; without the CUDA backend they are no-ops from serve-cuda-stubs.cpp, declared
+// extern "C" there because a dllimport declaration would not pull the stub object out of the static library.
+#ifndef ALPHA_CUDA_API_C
+#  ifdef GGML_USE_CUDA
+#    define ALPHA_CUDA_API_C GGML_BACKEND_API_C
+#  else
+#    define ALPHA_CUDA_API_C extern "C"
+#  endif
+#endif
+ALPHA_CUDA_API_C bool   ggml_cuda_expert_pcache_copy(void*, void*, const void*, size_t, int64_t, int64_t, size_t);
+ALPHA_CUDA_API_C void   ggml_cuda_expert_pcache_flush(void*);
+ALPHA_CUDA_API_C void * ggml_cuda_expert_pcache_get_extra(void);
 GGML_API_C void ggml_backend_set_expert_cache_copy_fn(ggml_expert_pcache_fn_t);
 GGML_API_C void ggml_backend_set_expert_cache_flush_fn(ggml_expert_pcache_flush_fn_t);
 GGML_API_C void ggml_backend_set_expert_cache_redirect_fn(ggml_expert_pcache_redirect_fn_t);
 typedef void * (*ggml_expert_pcache_extra_fn_t)(void);
 GGML_API_C void ggml_backend_set_expert_cache_extra_fn(ggml_expert_pcache_extra_fn_t);
 typedef void (*ggml_expert_pcache_ntokens_fn_t)(int, int, int, int);
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_set_ntokens(int, int, int, int);
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_ntokens(int, int, int, int);
 GGML_API_C void ggml_backend_set_expert_cache_ntokens_fn(ggml_expert_pcache_ntokens_fn_t);
 typedef void (*ggml_expert_pcache_pass_begin_fn_t)(void);
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_pass_begin(void);
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_pass_begin(void);
 GGML_API_C void ggml_backend_set_expert_cache_pass_begin_fn(ggml_expert_pcache_pass_begin_fn_t);
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_prealloc(void);
-GGML_BACKEND_API_C void ggml_cuda_set_pool_reserve_bytes(size_t);   // KV/compute-aware pool reserve
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_prealloc(void);
+ALPHA_CUDA_API_C void ggml_cuda_set_pool_reserve_bytes(size_t);   // KV/compute-aware pool reserve
 typedef void (*ggml_expert_pcache_ids_fn_t)(const int32_t *, int, int, int, int);
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_set_ids(const int32_t *, int, int, int, int);
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_ids(const int32_t *, int, int, int, int);
 GGML_API_C void ggml_backend_set_expert_cache_ids_fn(ggml_expert_pcache_ids_fn_t);
 // Layer-fuse (ALPHA_LAYER_FUSE): MoE layer boundary, so the cache can fetch a whole layer's
 // expert misses in one flush instead of one flush per expert tensor.
 typedef void (*ggml_expert_pcache_group_fn_t)(const void *, int);
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_set_group(const void *, int);
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_group(const void *, int);
 GGML_API_C void ggml_backend_set_expert_cache_group_fn(ggml_expert_pcache_group_fn_t);
 
 // ALPHA_DRE (device-resolved experts): the scheduler leaves decode expert weights in place
 typedef bool (*ggml_sched_direct_weight_fn_t)(const struct ggml_tensor *, const struct ggml_tensor *);
 GGML_API_C void ggml_backend_sched_set_direct_weight_fn(ggml_sched_direct_weight_fn_t);
-GGML_BACKEND_API_C bool ggml_cuda_dre_direct_weight(const struct ggml_tensor *, const struct ggml_tensor *);
-GGML_BACKEND_API_C bool ggml_cuda_dre_prefill_copy(void *, void *, const void *, size_t, int64_t, int64_t, size_t);
-GGML_BACKEND_API_C void ggml_cuda_dre_prefill_flush(void *);
-GGML_BACKEND_API_C void * ggml_cuda_dre_prefill_redirect(void *, void *);
-GGML_BACKEND_API_C bool ggml_cuda_dre_prefill_stream_whole(void *, const void *, int);
-GGML_BACKEND_API_C void ggml_cuda_dre_prefill_ids(const int32_t *, int, int, int, int);
-GGML_BACKEND_API_C void ggml_cuda_dre_prefill_x(void *, const struct ggml_tensor *, const void *, const int32_t *, int, int, int, int);
-GGML_BACKEND_API_C bool ggml_cuda_dre_tier_busy(void);   // ALPHA_DRE_TIER, dre.cu
-GGML_BACKEND_API_C void ggml_cuda_dre_tier_defer(void);
-GGML_BACKEND_API_C void ggml_cuda_dre_tier_start(void);
+ALPHA_CUDA_API_C bool ggml_cuda_dre_direct_weight(const struct ggml_tensor *, const struct ggml_tensor *);
+ALPHA_CUDA_API_C bool ggml_cuda_dre_prefill_copy(void *, void *, const void *, size_t, int64_t, int64_t, size_t);
+ALPHA_CUDA_API_C void ggml_cuda_dre_prefill_flush(void *);
+ALPHA_CUDA_API_C void * ggml_cuda_dre_prefill_redirect(void *, void *);
+ALPHA_CUDA_API_C bool ggml_cuda_dre_prefill_stream_whole(void *, const void *, int);
+ALPHA_CUDA_API_C void ggml_cuda_dre_prefill_ids(const int32_t *, int, int, int, int);
+ALPHA_CUDA_API_C void ggml_cuda_dre_prefill_x(void *, const struct ggml_tensor *, const void *, const int32_t *, int, int, int, int);
+ALPHA_CUDA_API_C bool ggml_cuda_dre_tier_busy(void);   // ALPHA_DRE_TIER, dre.cu
+ALPHA_CUDA_API_C void ggml_cuda_dre_tier_defer(void);
+ALPHA_CUDA_API_C void ggml_cuda_dre_tier_start(void);
 GGML_API_C void ggml_backend_set_expert_cache_pfx_fn(void (*)(void *, const struct ggml_tensor *, const void *, const int32_t *, int, int, int, int));
 extern "C" void ggml_backend_set_expert_cache_stream_fn(bool (*fn)(void *, const void *, int));
-GGML_BACKEND_API_C void ggml_cuda_dre_preregister(const struct ggml_tensor *);
+ALPHA_CUDA_API_C void ggml_cuda_dre_preregister(const struct ggml_tensor *);
 
 // Multi-user expert cache partitioning
-GGML_BACKEND_API_C void ggml_cuda_init_expert_users(int n_users);
-GGML_BACKEND_API_C void ggml_cuda_set_expert_ctx(void * ctx);
+ALPHA_CUDA_API_C void ggml_cuda_init_expert_users(int n_users);
+ALPHA_CUDA_API_C void ggml_cuda_set_expert_ctx(void * ctx);
 
 // Auto serve-mode: programmatic CPU-inline override (enable<0/split<0 = leave unchanged).
-GGML_BACKEND_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int split_pct);
+ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int split_pct);
 
 #define CPPHTTPLIB_NO_EXCEPTIONS
 // The default httplib worker pool (~hardware_concurrency) caps simultaneous long-lived connections,
@@ -239,6 +248,18 @@ static inline int setenv(const char * k, const char * v, int overwrite) {
 
 static inline int alpha_setenv(const char * k, const char * v) {
     return setenv(k, v, 1);
+}
+
+// Free/total VRAM of the current device; false (and zeros) on a build without CUDA.
+static bool alpha_vram_info(size_t * free_b, size_t * total_b) {
+#ifdef GGML_USE_CUDA
+    if (cudaMemGetInfo(free_b, total_b) == cudaSuccess) {
+        return true;
+    }
+    cudaGetLastError();
+#endif
+    *free_b = *total_b = 0;
+    return false;
 }
 
 // MSVC defines _S_IFDIR but not the POSIX S_ISDIR test macro.
@@ -564,7 +585,7 @@ static void alpha_auto_profile(const char * model_path, int n_slots, bool np_exp
 
     size_t free_vram = 0, total_vram = 0;
 #ifdef GGML_USE_CUDA
-    if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { cudaGetLastError(); free_vram = total_vram = 0; }
+    alpha_vram_info(&free_vram, &total_vram);
 #endif
     if (total_vram == 0) { fprintf(stderr, "[auto] no CUDA device: no automatic GPU profile\n"); return; }
     { const char * fv = getenv("ALPHA_FORCE_VRAM_MB"); if (fv && atol(fv) > 0) total_vram = (size_t) atol(fv) * 1024 * 1024; }
@@ -898,6 +919,9 @@ static std::string alpha_model_sha256_cached(const char * path) {
 static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_path) {
     const char * ae = getenv("ALPHA_AUTO");
     if ((ae && atoi(ae) == 0) || !model_path) return nullptr;
+#ifndef GGML_USE_CUDA
+    return nullptr;
+#else
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) { cudaGetLastError(); return nullptr; }
     struct stat st;
@@ -907,6 +931,7 @@ static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_p
         if (alpha_model_sha256_cached(model_path) == r.sha256) return &r;
     }
     return nullptr;
+#endif
 }
 #endif // ALPHA_HAS_ALPHAINFER
 
@@ -921,6 +946,7 @@ int main(int argc, char ** argv) {
         "   Also serves the corpus /api/corpus/query retrieval endpoint.\n"
         "   'alphallama' is the retrieval/dev twin (LUT_DIRECT MoE).\n"
         "==================================================================\n");
+    fprintf(stderr, "%s (%s), build %s\n", alphallama_version_name(), alphallama_version(), llama_build_info());
 #if !defined(_WIN32)
     if (getenv("ALPHA_SEGV_TRACE")) signal(SIGSEGV, alpha_segv_handler);
 #endif
@@ -1122,7 +1148,7 @@ int main(int argc, char ** argv) {
                 }
 #endif
                 size_t free_vram = 0, total_vram = 0;
-                cudaMemGetInfo(&free_vram, &total_vram);
+                alpha_vram_info(&free_vram, &total_vram);
                 { const char * fv = getenv("ALPHA_FORCE_VRAM_MB"); if (fv) { long v = atol(fv);
                     if (v > 0) free_vram = (size_t) v * 1024 * 1024; } }   // dry-run knob for other card sizes
                 const bool fits = weight_bytes > 0 && weight_bytes + (2ull << 30) <= free_vram;
@@ -1396,7 +1422,7 @@ int main(int argc, char ** argv) {
         // explicit -ngl bypasses this entirely.
         {
             size_t free_vram = 0, total_vram = 0;
-            if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_vram > 0) {
+            if (alpha_vram_info(&free_vram, &total_vram) && free_vram > 0) {
                 // Same override as the planner (alpha_hw_planner.cpp): dry-run the auto-fit for any
                 // card size.
                 { const char * fv = getenv("ALPHA_FORCE_VRAM_MB"); if (fv) { long v = atol(fv);
@@ -1656,7 +1682,7 @@ int main(int argc, char ** argv) {
 
                 if (n_expert > 1) {
                     size_t free_vram = 0, total_vram = 0;
-                    cudaMemGetInfo(&free_vram, &total_vram);
+                    alpha_vram_info(&free_vram, &total_vram);
                     // ALPHA_FORCE_VRAM_MB overrides the card VRAM the tier picker sees, so one machine can
                     // dry-run the auto tier decision (ALL_GPU / pool-direct / CPU-inline split) for any card
                     // size. Same knob the external-routing fit guard and the dense auto-fit honor.
@@ -1981,7 +2007,7 @@ int main(int argc, char ** argv) {
             const char * e_try = getenv("ALPHA_KV_TRY_F16");
             const bool blind_try = e_try && atoi(e_try) != 0;
             size_t free_vram = 0, total_vram = 0;
-            cudaMemGetInfo(&free_vram, &total_vram);
+            alpha_vram_info(&free_vram, &total_vram);
             const uint32_t n_cells = ctx_params.n_ctx;
             const size_t kv_f16 = llama_model_kv_size_bytes(model, n_cells, GGML_TYPE_F16, GGML_TYPE_F16);
             const size_t kv_q4  = llama_model_kv_size_bytes(model, n_cells, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);

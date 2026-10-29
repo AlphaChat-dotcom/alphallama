@@ -126,6 +126,27 @@ endif()
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# Windows + clang + OpenMP: ggml-cpu.dll imports libomp140.<arch>.dll, which is not on PATH and not in
+# the VC++ redistributable, so a fresh build fails to start with STATUS_DLL_NOT_FOUND (0xC0000135).
+# Copy it next to the binary, as upstream's Windows release job does. VCToolsRedistDir is set by vcvarsall.
+if (WIN32 AND GGML_OPENMP AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64|aarch64)$")
+        set(ALPHA_OMP_ARCH arm64)
+        set(ALPHA_OMP_DLL  libomp140.aarch64.dll)
+    else()
+        set(ALPHA_OMP_ARCH x64)
+        set(ALPHA_OMP_DLL  libomp140.x86_64.dll)
+    endif()
+    set(ALPHA_OMP_PATH "$ENV{VCToolsRedistDir}debug_nonredist/${ALPHA_OMP_ARCH}/Microsoft.VC143.OpenMP.LLVM/${ALPHA_OMP_DLL}")
+    if (EXISTS "${ALPHA_OMP_PATH}")
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ALPHA_OMP_PATH}" "$<TARGET_FILE_DIR:${TARGET}>")
+        install(FILES "${ALPHA_OMP_PATH}" TYPE BIN)
+    else()
+        message(WARNING "${ALPHA_OMP_DLL} not found under VCToolsRedistDir; copy it next to ${TARGET}.exe by hand")
+    endif()
+endif()
+
 # Oracle model embedding (optional)
 option(ALPHA_EMBED_ORACLE "Embed oracle-0.8b.gguf into the binary" OFF)
 set(ALPHA_ORACLE_GGUF "" CACHE FILEPATH "Path to oracle-0.8b.gguf for embedding")

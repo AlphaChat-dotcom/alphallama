@@ -1052,6 +1052,13 @@ bool alpha_mtp_kv_prealloc(llama_context * ctx) {
 
 bool llama_context::mtp_kv_ensure(int64_t kv_row, ggml_backend_buffer_type_t buft) {
     if (mtp_kv_buf) return mtp_k_cache != nullptr;
+    // Callers pass the buffer type of the head's attention weights. On a CPU that can be an "extra" type
+    // (CPU_REPACK on ARM, which keeps the int8-matmul layout and runs only MUL_MAT), so the cache's SET_ROWS
+    // aborted the first MTP decode. A cache on a CPU device takes that device's plain buffer type; GPU caches
+    // keep the weights' type as before.
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft); dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        buft = ggml_backend_dev_buffer_type(dev);
+    }
     // One column per sequence position (slot j == position j+1), so the head can hold the whole
     // context, not just what its own draft windows wrote (~2 KB per position per cache at 4 kv heads
     // x 128 dims). One region per sequence: column (seq * stride + slot), so two sequences at the same
