@@ -15,7 +15,10 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <mutex>
 #include <new>  // for std::hardware_destructive_interference_size
 
 namespace alphaserve {
@@ -26,6 +29,37 @@ namespace alphaserve {
 #else
     static constexpr size_t CACHE_LINE = 64;
 #endif
+
+// Wake-up for the serve threads' idle waits. Every successful queue push rings it, so a thread with nothing to do
+// waits until the next push (or its timeout) instead of polling with fixed sleeps. Polling cost a CPU core spinning
+// while a batch was in flight, and on Windows a sleep of 50-100 us lasts a whole timer tick (1-15.6 ms), so a short
+// sleep between tokens added several ms to every decoded token there. Read seen() before checking the queues and pass
+// it to wait(): a push in between is never missed.
+struct serve_bell {
+    std::mutex              m;
+    std::condition_variable cv;
+    std::atomic<uint64_t>   n{0};
+
+    uint64_t seen() const { return n.load(std::memory_order_acquire); }
+
+    void ring() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            n.fetch_add(1, std::memory_order_release);
+        }
+        cv.notify_all();
+    }
+
+    void wait(uint64_t seen_before, std::chrono::microseconds timeout) {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait_for(lock, timeout, [&] { return n.load(std::memory_order_acquire) != seen_before; });
+    }
+};
+
+inline serve_bell & g_serve_bell() {
+    static serve_bell bell;
+    return bell;
+}
 
 template<typename T, size_t N = 4096>
 class spsc_queue {
@@ -43,6 +77,7 @@ public:
         }
         buffer_[h] = item;
         head_.store(next, std::memory_order_release);
+        g_serve_bell().ring();
         return true;
     }
 
@@ -55,6 +90,7 @@ public:
         }
         buffer_[h] = std::move(item);
         head_.store(next, std::memory_order_release);
+        g_serve_bell().ring();
         return true;
     }
 

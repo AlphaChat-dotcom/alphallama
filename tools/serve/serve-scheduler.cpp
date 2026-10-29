@@ -67,6 +67,8 @@ void scheduler::loop() {
 //   3. Build batch and send to GPU (if not already busy)
 
 void scheduler::tick() {
+    const uint64_t seen = g_serve_bell().seen();   // before reading any queue (see serve_bell)
+
     // Phase 0: cancel requests whose client is gone (disconnect / handler timeout); this
     // frees the slot + its KV pages instead of decoding to completion for nobody
     process_cancellations();
@@ -80,6 +82,9 @@ void scheduler::tick() {
     // Phase 3: Build and send batch to GPU
     if (!gpu_busy_) {
         build_and_send_batch();
+    } else {
+        // a batch is in flight: wait for its result (or a new request) instead of spinning a core
+        g_serve_bell().wait(seen, std::chrono::microseconds(100));
     }
 }
 
@@ -683,8 +688,8 @@ void scheduler::build_and_send_batch() {
     }
 
     if (batch.n_tokens == 0) {
-        // No work: yield to avoid busy-spin
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        // No work: wait for the next request or result instead of spinning
+        g_serve_bell().wait(g_serve_bell().seen(), std::chrono::microseconds(100));
         return;
     }
 

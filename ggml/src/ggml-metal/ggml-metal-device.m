@@ -1654,6 +1654,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
+        if (!buf_src) {
+            // no-copy wrapping needs a page-aligned pointer and length; without unified memory (Intel Macs with a
+            // discrete GPU) the data is often not aligned, so copy it into a staging buffer instead
+            buf_src = [buf->dev->mtl_device newBufferWithBytes:data_ptr length:size options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_src);
 
@@ -1711,6 +1716,11 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
+        // no-copy wrapping needs a page-aligned pointer and length (see set_tensor): read through a staging buffer
+        const bool staged = buf_dst == nil;
+        if (staged) {
+            buf_dst = [buf->dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_dst);
 
@@ -1730,6 +1740,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (staged) {
+            memcpy(data, [buf_dst contents], size);
+        }
     }
 }
 

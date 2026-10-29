@@ -1025,6 +1025,7 @@ int main(int argc, char ** argv) {
     const char * redis_kv = nullptr;  // --redis-kv HOST:PORT for KV cache persistence
     int port = 8080;
     int n_gpu_layers = 99;
+    int n_threads = -1, n_threads_batch = -1;   // -t / -tb; -1 = automatic (see the context setup)
     bool ngl_explicit = false;   // true once -ngl is parsed; gates the dense auto-fit below
     int n_slots = 4;
     int n_ctx = 2048;
@@ -1052,6 +1053,8 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) { n_gpu_layers = atoi(argv[++i]); ngl_explicit = true; }
         else if ((strcmp(argv[i], "-np") == 0 || strcmp(argv[i], "--parallel") == 0) && i + 1 < argc) { n_slots = atoi(argv[++i]); np_explicit = true; }
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) { n_ctx = atoi(argv[++i]); ctx_explicit = true; }
+        else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threads") == 0) && i + 1 < argc) { n_threads = atoi(argv[++i]); }
+        else if ((strcmp(argv[i], "-tb") == 0 || strcmp(argv[i], "--threads-batch") == 0) && i + 1 < argc) { n_threads_batch = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-kvu") == 0 || strcmp(argv[i], "--kv-unified") == 0) kv_unified = true;
         else if (strcmp(argv[i], "-no-kvu") == 0 || strcmp(argv[i], "--no-kv-unified") == 0) kv_unified = false;
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) backend_str = argv[++i];
@@ -1427,6 +1430,8 @@ int main(int argc, char ** argv) {
             "  -np N                 Number of local slots (default: 4)\n"
             "  -ngl N                GPU layers (default: 99)\n"
             "  -c N                  Context per slot (default: 2048)\n"
+            "  -t N / -tb N          CPU threads for decode / prompt (default: one per physical core\n"
+            "                        without a GPU; the library default with one)\n"
         );
         return 1;
     }
@@ -1891,6 +1896,24 @@ int main(int argc, char ** argv) {
 
         llama_context_params ctx_params = llama_context_default_params();
         ctx_params.n_ctx = n_ctx * n_slots;
+        // CPU threads: -t / -tb when given. Otherwise one per physical core when no GPU runs the model: the library
+        // default of 4 left most cores of a CPU-only machine idle (0.8B on a 13900K: 71 vs alphallama's 86 tok/s).
+        // With a GPU the library default stays, as the measured GPU configurations use it.
+        {
+            bool gpu = false;
+            for (size_t d = 0; d < ggml_backend_dev_count(); d++) {
+                const auto t = ggml_backend_dev_type(ggml_backend_dev_get(d));
+                gpu = gpu || t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            }
+            const bool cpu_only = !gpu || n_gpu_layers == 0;
+            if (n_threads > 0)    ctx_params.n_threads = n_threads;
+            else if (cpu_only)    ctx_params.n_threads = cpu_get_num_math();
+            if (n_threads_batch > 0) ctx_params.n_threads_batch = n_threads_batch;
+            else if (n_threads > 0)  ctx_params.n_threads_batch = n_threads;
+            else if (cpu_only)       ctx_params.n_threads_batch = cpu_get_num_math();
+            fprintf(stderr, "[serve] CPU threads: %d decode, %d prompt%s\n", ctx_params.n_threads, ctx_params.n_threads_batch,
+                    n_threads > 0 || n_threads_batch > 0 ? "" : (cpu_only ? " (one per physical core, no GPU)" : " (library default)"));
+        }
         // iswa models (Gemma sliding-window attention): llama_context_default_params() sets
         // swa_full=true, which sizes the sliding-window KV cache to the full n_ctx instead of the
         // window, so a long-context Gemma runs out of memory during warmup. Bound it by default so
@@ -3599,13 +3622,14 @@ int main(int argc, char ** argv) {
         // AlphaInfer mode: main thread drives the adapter (one engine round per batch) + event routing
         fprintf(stderr, "[serve] alphainfer mode — engine rounds on main thread\n");
         while (g_running.load()) {
+            const uint64_t seen = alphaserve::g_serve_bell().seen();   // before the queue is read
             bool did_work = ai_gpu->process_one();
             alphaserve::TokenEvent event;
             while (local_srv->poll_event(event)) {
                 local_router->route_event(event);
             }
             if (!did_work) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                alphaserve::g_serve_bell().wait(seen, std::chrono::microseconds(50));   // until the next batch
             }
         }
 #endif
@@ -3614,6 +3638,7 @@ int main(int argc, char ** argv) {
         // FlashInfer mode: main thread drives fi_gpu_engine + event routing
         fprintf(stderr, "[serve] flashinfer mode — batched GPU on main thread\n");
         while (g_running.load()) {
+            const uint64_t seen = alphaserve::g_serve_bell().seen();   // before the queue is read
             bool did_work = fi_gpu->process_one();
 
             alphaserve::TokenEvent event;
@@ -3622,7 +3647,7 @@ int main(int argc, char ** argv) {
             }
 
             if (!did_work) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                alphaserve::g_serve_bell().wait(seen, std::chrono::microseconds(50));   // until the next batch
             }
         }
 #endif
@@ -3672,6 +3697,7 @@ int main(int argc, char ** argv) {
             }
         }
         while (g_running.load()) {
+            const uint64_t seen = alphaserve::g_serve_bell().seen();   // before the queue is read
             bool did_work = local_srv->step();
 
             alphaserve::TokenEvent event;
@@ -3683,7 +3709,7 @@ int main(int argc, char ** argv) {
             if (routed) last_token_us.store(ggml_time_us());
 
             if (!did_work) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                alphaserve::g_serve_bell().wait(seen, std::chrono::microseconds(50));   // until the next batch
             }
         }
         if (watchdog.joinable()) watchdog.join();

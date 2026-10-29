@@ -93,7 +93,13 @@ set(GGML_BACKEND_DIR "" CACHE PATH "ggml: directory to load dynamic backends fro
 # TODO: mark all options as advanced when not GGML_STANDALONE
 
 if (APPLE)
-    set(GGML_METAL_DEFAULT ON)
+    # Metal on by default on Apple Silicon only: on Intel Macs (discrete GPUs, no unified memory) decode crashes in
+    # the GPU driver (GGML_OP_SET buffer binding). -DGGML_METAL=ON still enables it there.
+    if ((CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64") OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"))
+        set(GGML_METAL_DEFAULT OFF)
+    else()
+        set(GGML_METAL_DEFAULT ON)
+    endif()
     set(GGML_BLAS_DEFAULT ON)
     set(GGML_BLAS_VENDOR_DEFAULT "Apple")
 else()

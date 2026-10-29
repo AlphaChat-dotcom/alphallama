@@ -285,6 +285,7 @@ endif()
 # golden harness for the ik_llama.cpp quant types - standalone, only needs ggml
 add_executable(test-ik-dequant test-ik-dequant.cpp)
 target_link_libraries(test-ik-dequant PRIVATE ggml)
+target_compile_features(test-ik-dequant PRIVATE cxx_std_17)  # Apple clang 14 defaults to C++98
 add_test(NAME test-ik-dequant COMMAND $<TARGET_FILE:test-ik-dequant>)
 set_property(TEST test-ik-dequant PROPERTY LABELS main)
 
@@ -293,6 +294,7 @@ if (GGML_CUDA)
     find_package(CUDAToolkit QUIET)
     if (CUDAToolkit_FOUND)
         add_executable(test-ik-dequant-cuda test-ik-dequant-cuda.cpp)
+        target_compile_features(test-ik-dequant-cuda PRIVATE cxx_std_17)
         # libggml-cuda's CPU-inline code references ggml_get_type_traits_cpu (in ggml-cpu);
         # --no-as-needed keeps ggml-cpu linked even though the exe doesn't use it directly.
         target_link_libraries(test-ik-dequant-cuda PRIVATE ggml "-Wl,--no-as-needed" ggml-cpu "-Wl,--as-needed" CUDA::cudart)
