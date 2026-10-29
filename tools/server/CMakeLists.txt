@@ -170,8 +170,20 @@ if (ALPHA_EMBED_ORACLE)
             @ONLY
         )
         target_sources(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/oracle_embed.rc")
+    elseif (APPLE)
+        # macOS: Mach-O section and symbol naming differ from ELF
+        enable_language(ASM)
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/oracle_embed_macos.s.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/oracle_embed_macos.s"
+            @ONLY
+        )
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/oracle_embed_macos.s"
+                                    PROPERTIES OBJECT_DEPENDS "${ALPHA_ORACLE_GGUF}")
+        target_sources(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/oracle_embed_macos.s")
     else()
-        # Unix: embed via .incbin in assembly
+        # Unix: embed via .incbin in assembly (the project enables only C and C++, so the .s needs ASM)
+        enable_language(ASM)
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/oracle_embed_unix.s.in"
             "${CMAKE_CURRENT_BINARY_DIR}/oracle_embed_unix.s"

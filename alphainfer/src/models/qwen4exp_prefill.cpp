@@ -819,6 +819,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
     // super-chunk streams the non-resident experts again. AI_Q4X_PREFILL_SUB (default 256): rows per mixer sub-chunk.
     // A super-chunk that does not fit halves (down to 1024) before falling back to kDoorbellT-row rounds.
     int64_t       S   = std::max<int64_t>(8, env_i64("AI_Q4X_PREFILL_SUPER", 16384));
+    bells_live_ = false;   // the bells still hold the previous request's last round
     const int64_t sub = std::max<int64_t>(8, env_i64("AI_Q4X_PREFILL_SUB", 256));
     // a prompt a little past the super-chunk takes one bigger chunk rather than a tiny second chunk that would walk
     // every layer again and re-stream most of the non-resident experts

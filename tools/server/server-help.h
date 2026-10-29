@@ -16,7 +16,8 @@ struct alpha_error_assistant {
     // Returns AI-generated help text, or empty string if oracle unavailable.
     std::string explain(const std::string & error_msg,
                         const std::string & command_line = "",
-                        const std::string & extra_context = "");
+                        const std::string & extra_context = "",
+                        bool is_question = false);  // treat error_msg as a help question
 
     // Release resources.
     void unload();
@@ -35,3 +36,7 @@ std::string alpha_error_explain(const std::string & error_msg,
                                 const std::string & command_line = "",
                                 const std::string & extra_context = "");
 
+
+// Answer a general help question (e.g. from /api/oracle "question").
+// Returns the answer, or a static fallback; always non-empty.
+std::string alpha_oracle_answer(const std::string & question);

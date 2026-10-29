@@ -10629,7 +10629,9 @@ void server_routes::init_kv_chunk_routes() {
             return res;
         }
 
-        std::string explanation = alpha_error_explain(query, "", context);
+        std::string explanation = !error_msg.empty()
+            ? alpha_error_explain(query, "", context)
+            : alpha_oracle_answer(query);
 
         res->status = 200;
         res->data = safe_json_to_str(json{

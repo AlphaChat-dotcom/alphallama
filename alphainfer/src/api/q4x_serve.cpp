@@ -317,6 +317,15 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
     if (n < 1) throw std::runtime_error("q4x prefill: empty prompt");
     if ((int64_t) n + 1 >= m.ctx) throw std::runtime_error("q4x prefill: the prompt does not fit the context");
     feed_.clear();
+    // AI_Q4X_RESIDENCY_RESET (default 1 without MTP, i.e. exact; 0 with): admissions move experts into VRAM from every
+    // earlier request's routing, so a request's CPU / GPU split, and the CPU's rounding, would follow the order of the
+    // requests before it. Each request starts from the initial profile fill again (only the changed slots are recopied),
+    // as DoorbellMoe::reset_residency does for the qwen35 path.
+    static const bool res_reset = env_int("AI_Q4X_RESIDENCY_RESET", m.mtp ? 0 : 1) != 0;
+    if (res_reset) {
+        const int moved = m.run->reset_residency();
+        if (moved > 0 && env_int("AI_Q4X_RESIDENCY_LOG", 0)) fprintf(stderr, "[ai-api] q4x residency reset: %d slots recopied\n", moved);
+    }
     feed_open_ = false;
     // AI_Q4X_PREFIX_REUSE (default 1): a chat resends its history: continue from the committed tokens when the prompt
     // extends them (the previous prompt + answer), else rewind to the last prompt's checkpoint when the prompt still

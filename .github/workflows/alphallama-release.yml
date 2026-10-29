@@ -11,7 +11,10 @@
 #   win-x64-vulkan       any GPU with a Vulkan 1.2 driver (NVIDIA, AMD, Intel)
 #   win-x64-cpu          x86-64 with AVX2
 #   win-arm64-cpu        Windows on ARM (Snapdragon X and similar)
-# The Windows packages do not include the AlphaInfer engine (Linux only); alphallama-serve uses its built-in engine.
+#   macos-arm64          Apple Silicon, Metal; macOS 12 or newer
+#   macos-x64            Intel Mac, CPU only; macOS 12 or newer
+# The Windows and macOS packages do not include the AlphaInfer engine (Linux only); alphallama-serve uses its built-in
+# engine there.
 
 name: AlphaLlama release
 
@@ -51,7 +54,8 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
-          cmake --build build -j "$(nproc)"
+          # 2 jobs: with one per CPU, nvcc compiling six architectures ran the 16 GB runner out of memory
+          cmake --build build -j 2
 
       - name: Package
         run: |
@@ -240,9 +244,103 @@ jobs:
           name: win-${{ matrix.tag }}
           path: dist/*.zip*
 
+  macos:
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: arm64
+            runner: macos-14
+            arch: arm64
+            ssl_target: darwin64-arm64-cc
+            defines: '-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON'
+            info: 'Apple Silicon, GPU through Metal'
+          - tag: x64
+            runner: macos-15-intel
+            arch: x86_64
+            ssl_target: darwin64-x86_64-cc
+            defines: '-DGGML_METAL=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+            info: 'Intel, CPU only (AVX2, FMA, F16C)'
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      # latest 3.5 LTS release; it is linked statically, so a security release means a rebuild (bump both lines)
+      OPENSSL_VERSION: '3.5.9'
+      OPENSSL_SHA256: '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a'
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew's static OpenSSL is built for the runner's own macOS, so a 12.0 binary linked against it would carry
+      # newer-OS calls; build it for 12.0 instead.
+      - name: OpenSSL for macOS 12
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o ossl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+          echo "$OPENSSL_SHA256  ossl.tar.gz" | shasum -a 256 -c -
+          tar xzf ossl.tar.gz && cd "openssl-$OPENSSL_VERSION"
+          ./Configure ${{ matrix.ssl_target }} no-shared no-tests no-docs -mmacosx-version-min=12.0 --prefix="$RUNNER_TEMP/ssl" --libdir=lib
+          make -j "$(sysctl -n hw.ncpu)" build_libs > /dev/null
+          make install_dev > /dev/null
+
+      - name: Build
+        run: |
+          SSL="$RUNNER_TEMP/ssl"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF ${{ matrix.defines }} \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR="$SSL" \
+            -DOPENSSL_INCLUDE_DIR="$SSL/include" -DOPENSSL_CRYPTO_LIBRARY="$SSL/lib/libcrypto.a" \
+            -DOPENSSL_SSL_LIBRARY="$SSL/lib/libssl.a"
+          cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Package
+        run: |
+          N="$PKG-macos-${{ matrix.tag }}"; R="dist/$N"
+          mkdir -p "$R/bin" "$R/licenses"
+          for f in build/bin/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            case "$(basename "$f")" in test-*) continue ;; esac
+            file -b "$f" | grep -q "Mach-O" || continue
+            # nothing outside /System and /usr/lib may be linked: users have no Homebrew
+            if otool -L "$f" | tail -n +2 | grep -v -E '^\s*(/System/Library/|/usr/lib/)'; then
+              echo "ERROR: $f links non-system libraries (above)"; exit 1
+            fi
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b && /minos/{print $2; exit}')
+            [ "$minos" = "12.0" ] || { echo "ERROR: $f has minimum macOS $minos, not 12.0"; exit 1; }
+            cp "$f" "$R/bin/"
+            # ad-hoc signature: Apple Silicon refuses unsigned code (not a Developer ID signature)
+            codesign --force --sign - "$R/bin/$(basename "$f")"
+          done
+          cp LICENSE NOTICE README.md "$R/"
+          cp -r licenses/. "$R/licenses/"
+          cp tools/serve/LICENSE "$R/licenses/LICENSE-alphaserve"
+          printf '%s\n' "AlphaLlama v2 for macOS 12 or newer (${{ matrix.info }})" "" \
+            "Run:  bin/alphallama-serve -m <model.gguf>     or  bin/alphallama -m <model.gguf>" "" \
+            "If macOS says a program \"cannot be opened\" or \"is damaged\" after downloading," \
+            "clear the download quarantine flag once, in this folder:" \
+            "  xattr -dr com.apple.quarantine ." > "$R/README-macos.txt"
+          {
+            echo "AlphaLlama v2, $N"
+            echo "source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY commit $GITHUB_SHA"
+            echo "toolkit: $(clang --version | head -1), macOS SDK $(xcrun --show-sdk-version), deployment target 12.0"
+            echo "build options: BUILD_SHARED_LIBS=OFF GGML_NATIVE=OFF ${{ matrix.defines }} OpenSSL static (no AlphaInfer on macOS)"
+            echo "target: ${{ matrix.info }}"
+            echo "bundled: OpenSSL $OPENSSL_VERSION (static, built for macOS 12.0); links only macOS system libraries"
+            echo "needs: macOS 12 or newer, ${{ matrix.arch }}"
+          } > "$R/BUILD_INFO"
+          cd dist
+          tar -czf "$N.tar.gz" "$N"
+          shasum -a 256 "$N.tar.gz" > "$N.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.tag }}
+          path: dist/*.tar.gz*
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-cuda, windows-cuda, windows-cpu]
+    needs: [linux-cuda, windows-cuda, windows-cpu, macos]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

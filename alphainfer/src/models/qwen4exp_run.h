@@ -66,6 +66,10 @@ public:
     bool                 set_draft_rows(const std::vector<int32_t> & ids, int64_t prefix = 0);
     void   commit(int64_t m1);
     // Clear the history, KV and recurrent state (a new sequence).
+    // Exact serving: put the expert residency back to the initial profile fill (admissions undone, scores cleared;
+    // only the slots that changed are recopied), so a request's output does not depend on the requests before it.
+    // Returns the slots recopied.
+    int    reset_residency();
     void   reset();
     // Prefix reuse: save the recurrent state at the current position (host copy); rewind to it (false: none saved, or
     // the history is already shorter). The committed tokens: history().
@@ -184,6 +188,7 @@ private:
     // once the copy has landed. A victim is unmapped before the next round launches, so no round reads a slot in flight.
     void   admit_after_round();
     void   admit_drain();   // publish every in-flight admission (before a prefill)
+    std::vector<std::vector<int32_t>> init_owner_;   // per layer: the initial fill's expert per slot (reset_residency)
     static float mtp_minp();   // AI_Q4X_MTP_MINP
     // job j uses staging buffer / event j % staging_.size(); recorded_[si] = j once the worker has queued its copies
     struct Pending { int layer, slot, expert; int64_t job; };
@@ -208,6 +213,9 @@ private:
     PinnedHost           staging_mem_;
     std::vector<void *>  staging_ev_;
     uint64_t             n_admit_ = 0, n_publish_ = 0;
+    // the bells hold a round of this sequence: prefill does not ring them, so without this the first decode after a
+    // prompt would count the previous request's last round into the admission scores
+    bool                 bells_live_ = false;
     std::atomic<uint64_t> n_staged_{ 0 }, n_direct_{ 0 };   // admission copies staged / straight from the RAM tier
     struct TierBuf { Tensor * tensor; void * orig; };
     std::vector<TierBuf> tier_;         // RAM tier: tensors re-pointed into tier_mem_ (and what they pointed at)

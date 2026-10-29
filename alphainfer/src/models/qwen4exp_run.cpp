@@ -264,6 +264,7 @@ bool Qwen4ExpRun::restore_checkpoint() {
     mtp_fill_p0_ = ck_fill_p0_;
     mtp_fill_m_  = ck_fill_m_;
     hist_.resize((size_t) ck_len_);
+    bells_live_ = false;   // the bells hold rounds past the checkpoint
     return true;
 }
 
@@ -514,6 +515,7 @@ void Qwen4ExpRun::init_doorbell(int slots) {
         }
         dev_.upload(B.table, table.data(), 0, table.size() * 4);
         B.table_h = table;
+        init_owner_.push_back(std::vector<int32_t>(B.owner.begin(), B.owner.begin() + slots));
         host.push_back({ m.gate_exps, m.up_exps, m.down_exps });
         double cold = 0;
         for (int e = 0; e < E; ++e) if (table[(size_t) e] < 0) cold += prof[il].empty() ? 1.0 : (double) prof[il][(size_t) e];
@@ -1376,7 +1378,7 @@ void Qwen4ExpRun::admit_after_round() {
     // 2) count this round's routing (hits and misses) per layer
     struct Cand { float score; int layer, expert; };
     std::vector<Cand> cand;
-    for (size_t il = 0; il < banks_.size(); ++il) {
+    for (size_t il = 0; bells_live_ && il < banks_.size(); ++il) {   // no round of this sequence yet: nothing to count
         SlotBank &            B  = banks_[il];
         const offload::Bell & bl = miss_->bell((int) il);
         for (auto & v : B.score) v *= 0.97f;
@@ -1449,6 +1451,47 @@ void Qwen4ExpRun::admit_after_round() {
     }
 }
 
+int Qwen4ExpRun::reset_residency() {
+    if (!doorbell_ || banks_.empty() || init_owner_.size() != banks_.size()) return 0;
+    admit_drain();   // every in-flight admission landed and published: owners are final
+    bells_live_ = false;
+    const auto & layers = prog_.layers();
+    const int    E      = prog_.spec().n_expert;
+    void *       st     = adapter::stream(dev_);
+    int          n      = 0;
+    for (size_t il = 0; il < banks_.size(); ++il) {
+        SlotBank &                   B    = banks_[il];
+        const std::vector<int32_t> & want = init_owner_[il];
+        const auto &                 m    = layers[il].moe;
+        const Tensor * src[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+        const Tensor * dst[3] = { &B.gate, &B.up, &B.down };
+        bool dirty = false;
+        for (size_t sl = 0; sl < want.size(); ++sl) {
+            const int32_t e = want[sl], cur = B.owner[sl];
+            if (cur == e) continue;
+            if (e >= 0)
+                for (int r = 0; r < 3; ++r)   // ordered on the compute stream, before the next request's first kernel
+                    cudaMemcpyAsync((char *) dst[r]->data + sl * dst[r]->nb[2], (const char *) src[r]->data + (size_t) e * src[r]->nb[2],
+                                    src[r]->nb[2], cudaMemcpyHostToDevice, (cudaStream_t) st);
+            B.owner[sl] = e;
+            dirty       = true;
+            ++n;
+        }
+        std::fill(B.score.begin(), B.score.end(), 0.0f);
+        if (!dirty) continue;
+        // the table from the owners, not per slot: an expert evicted and re-admitted into ANOTHER slot moves back to its
+        // first slot, and clearing it when its later slot is visited unmapped it while resident (a CPU miss, so the
+        // rounding still followed the request order)
+        std::fill(B.table_h.begin(), B.table_h.end(), -1);
+        for (int sl = 0; sl < B.n_slots; ++sl)
+            if (B.owner[(size_t) sl] >= 0) B.table_h[(size_t) B.owner[(size_t) sl]] = sl;
+        int32_t * pin = table_pin_ + il * (size_t) E;
+        memcpy(pin, B.table_h.data(), (size_t) E * 4);
+        cudaMemcpyAsync(B.table.data, pin, (size_t) E * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
+    }
+    return n;
+}
+
 // Publish every admission still in flight (waiting for its copy), with no new ones: the last decode round of a request
 // leaves its admissions queued and their victims unmapped, so a following prefill would see more non-resident experts
 // than its scratch holds (E - n_slots) and fail with "scratch bank full".
@@ -1492,6 +1535,7 @@ Tensor Qwen4ExpRun::decode(int32_t token) {
 Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
     if (!doorbell_) throw std::runtime_error("Qwen4ExpRun::round: needs AI_Q4X_DOORBELL=1 (the expert pool path reads routing on the host)");
     if (T < 1 || T > kDoorbellT) throw std::runtime_error("Qwen4ExpRun::round: 1 <= T <= kDoorbellT");
+    bells_live_ = true;   // this round rings the bells the next admit_after_round counts
     auto tr = std::chrono::steady_clock::now();
     mtp_flush();
     if (g_rt.on) g_rt.flush += rt_ms_since(tr);
