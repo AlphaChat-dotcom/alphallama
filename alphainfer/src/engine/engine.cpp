@@ -660,13 +660,11 @@ bool Engine::init(const EngineConfig & cfg) {
     if (const char * e = getenv("AI_CHUNK")) {
         if (atoll(e) > 0) cfg_.chunk = atoll(e);
     }
-    if (cfg_.expert_slots == 0) {
-        // q8_1 staging on by default: producers emit the q8_1 copy of an activation so its consumers skip
-        // their quantise. Output is bit-identical to staging off. Must be set before the backend's first
-        // lookup (the switch is a static). Offload is not validated with it, hence the condition.
-        // ALPHA_Q8_STAGE=0 turns it off.
-        setenv("ALPHA_Q8_STAGE", "1", 0);
-    }
+    // q8_1 staging (producers emit the q8_1 copy of an activation so its consumers skip their quantise) is off by
+    // default: on this tree's ggml a staged q8_1 is not bit-identical to the consumer's own quantise, and T = 1 and
+    // verify rounds stage different sets, so exact and plain decode would diverge. Off costs nothing measurable at one
+    // stream. ALPHA_Q8_STAGE=1 opts back in.
+    if (cfg_.expert_slots == 0) setenv("ALPHA_Q8_STAGE", "0", 0);
     // The registry's entries live for a round, not a backend pass (a round is many passes, with producers and
     // consumers in different ones; MTP rounds stage across passes). Set here, not only in the app, so every entry
     // point, including the C API, gets it.
@@ -979,6 +977,7 @@ int32_t Engine::prefill_feed(int stream, const int32_t * tokens, int64_t n, bool
     }
     if (!streams_[(size_t) stream].prefilling) {
         reset_stream(stream);   // a new request starts from a zeroed slot, exactly as prefill_stream starts one
+        request_start();
         streams_[(size_t) stream].prefilling = true;
     }
     Stream & s = streams_[(size_t) stream];
@@ -1017,6 +1016,16 @@ const std::vector<int32_t> & Engine::prefill_buffer(int stream) const {
         throw std::runtime_error("prefill_buffer: slot outside the active batch");
     }
     return streams_[(size_t) stream].pf;
+}
+
+void Engine::request_start() {
+    // default: on when the output is meant to be exact (plain decode, or the EXACT verify), off for FAST drafting,
+    // whose tokens differ from plain anyway and which keeps the residency the history built (saves the restore)
+    const char * env = getenv("AI_DOOR_RESET_PER_REQUEST");
+    const bool   on  = env ? atoi(env) != 0 : (cfg_.mtp_k == 0 || cfg_.exact_verify);
+    if (on && streams_.size() == 1) {
+        prog_.offload_reset_residency();
+    }
 }
 
 void Engine::reset_one(int stream) {
@@ -1289,6 +1298,7 @@ int32_t Engine::prefill_stream(int stream, const std::vector<int32_t> & prompt, 
     // (3+ slots), and a caller that prefills a still-live slot without ai_engine_reset_stream would otherwise continue
     // from that slot's stale recurrent state. The reset is a KV free + one state memset.
     reset_stream(stream);
+    request_start();
     Stream & s = streams_[(size_t) stream];
     if (mm_.pos4) {   // image input: this prefill's rows carry explicit RoPE positions; later rows run at cell + delta
         const int64_t n = (int64_t) prompt.size();

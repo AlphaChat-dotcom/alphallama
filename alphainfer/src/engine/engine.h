@@ -153,6 +153,11 @@ public:
     // Reset one slot so the next request can reuse it. Must be followed by prefill_one before a step:
     // decode_step refuses a slot with fewer drafts than the round's k_in rather than staging garbage.
     void    reset_one(int stream);
+    // A new request is starting on a slot (called by the prefill paths after the slot reset). With one stream and
+    // exact output (plain decode or the EXACT verify; AI_DOOR_RESET_PER_REQUEST=0|1 overrides), the doorbell offload
+    // goes back to its initial residency, so the request's output does not depend on earlier requests (the CPU
+    // rounds missed experts differently from the GPU).
+    void    request_start();
     // Record every decode profile the F ladder can ask for, so nothing instantiates after startup:
     // a lazy instantiate mid-serving can fail, and a capture failure silently degrades to direct
     // launches. Returns the number of profiles recorded.

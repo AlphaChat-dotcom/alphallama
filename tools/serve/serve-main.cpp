@@ -410,6 +410,22 @@ static std::string make_sse_chunk(int request_id, const std::string & text,
     return "data: " + delta.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }
 
+// A chat stream delta carrying reasoning text (the DeepSeek / llama.cpp "reasoning_content" field).
+static std::string make_sse_reasoning_chunk(int request_id, const std::string & text, const std::string & model_name) {
+    json delta = json{
+        {"id",      "chatcmpl-" + std::to_string(request_id)},
+        {"object",  "chat.completion.chunk"},
+        {"created", (int64_t)time(nullptr)},
+        {"model",   model_name},
+        {"choices", json::array({json{
+            {"index",         0},
+            {"delta",         json{{"role", "assistant"}, {"reasoning_content", text}}},
+            {"finish_reason", nullptr},
+        }})},
+    };
+    return "data: " + delta.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+}
+
 // Parse the model's native chat output into an OpenAI assistant message (content, reasoning_content, tool_calls)
 // with the common_chat parser of the request's template. The streaming and the non-streaming paths both use it, so a
 // reply comes back the same way either way. Malformed output degrades to plain content, never an error.
@@ -738,9 +754,10 @@ struct alpha_ai_validated { const char * sha256; long long size; int sm_major, s
                             const char * env;
                             const char * what; };
 static const alpha_ai_validated k_ai_validated[] = {
-    // speed mode: fast MTP k64 + n-gram lookup K64, 1 stream
+    // speed mode: fast MTP k64 + n-gram lookup K64, 1 stream at 32768 cells (1 x 98304 with K64 verify widths runs out
+    // of memory on 24 GB once the workspace is calibrated)
     { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 8, 6, 2, 98304, "exact", 64, nullptr,
-      "AI_LOOKUP=1 AI_LOOKUP_ARM=32 AI_LOOKUP_NMIN=4 AI_MTP_CHAIN=3 AI_GRAPH_MAX=32", 1,
+      "AI_LOOKUP=1 AI_LOOKUP_ARM=32 AI_LOOKUP_NMIN=4 AI_MTP_CHAIN=3 AI_GRAPH_MAX=32 ALPHA_AI_CTX=32768", 1,
       // pin q4_0 so MTP on and off give identical text (auto would choose q4_0 with MTP, f16 without)
       "q4_0", nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 3090)" },
     // Exact MTP (token-identical to plain greedy). Identity at depth needs libalphainfer 583c749+ on cc < 12: older
@@ -1155,7 +1172,9 @@ int main(int argc, char ** argv) {
                 std::string item;
                 while (kv >> item) {
                     const size_t eq = item.find('=');
-                    if (eq != std::string::npos) setenv(item.substr(0, eq).c_str(), item.substr(eq + 1).c_str(), /*overwrite=*/ 0);
+                    if (eq == std::string::npos) continue;
+                    if (ctx_explicit && item.compare(0, eq, "ALPHA_AI_CTX") == 0) continue;   // an explicit -c wins over the row's speed context
+                    setenv(item.substr(0, eq).c_str(), item.substr(eq + 1).c_str(), /*overwrite=*/ 0);
                 }
                 fprintf(stderr, "[auto] ALPHA_SPEED_MODE: row speed env %s\n", air->speed_env);
             }
@@ -3086,11 +3105,15 @@ int main(int argc, char ** argv) {
                         std::string chunk, utf8_tail;
                         int wr;
                         // Reasoning-channel strip for streaming (matches the non-streaming path).
-                        // state: 0 = buffering head (undecided), 1 = buffering a channel preamble,
+                        // state: 0 = buffering head (undecided), 1 = inside a channel preamble,
                         // 2 = pass-through. Buffer only while the head could be a channel opener,
                         // so normal answers stream with no added delay.
+                        // A <think> preamble streams as it is generated, as reasoning_content deltas (the
+                        // non-streaming reply carries it in reasoning_content too); content starts after </think>.
                         int strip_state = getenv("ALPHA_NO_STRIP_THINK") ? 2 : 0;
                         std::string head;
+                        bool think_stream = false;  // state 1 on a <think> opener: stream the reasoning
+                        size_t think_pos = 0;       // head offset of the first reasoning byte not yet sent
                         bool peer_dead = false;    // sink.write fails once the client is gone
                         std::string sent;          // content already sent (tool mode: not sent again after the parse)
                         auto emit = [&](const std::string & t) {
@@ -3098,6 +3121,16 @@ int main(int argc, char ** argv) {
                             sent += t;
                             auto sse = make_sse_chunk(req_id, t, model_name, true, false);
                             if (!sink.write(sse.c_str(), sse.size())) peer_dead = true;
+                        };
+                        auto emit_reasoning = [&](const std::string & t) {
+                            if (t.empty() || peer_dead) return;
+                            auto sse = make_sse_reasoning_chunk(req_id, t, model_name);
+                            if (!sink.write(sse.c_str(), sse.size())) peer_dead = true;
+                        };
+                        // the unsent reasoning of a <think> preamble that never closed (the reply hit its limit)
+                        auto flush_think = [&]() {
+                            if (think_pos < head.size()) emit_reasoning(head.substr(think_pos));
+                            head.clear(); think_pos = 0;
                         };
                         auto ltrim = [](const std::string & x) {
                             size_t b = x.find_first_not_of(" \t\r\n");
@@ -3117,9 +3150,29 @@ int main(int argc, char ** argv) {
                                     if (t.size() >= ol) { if (t.compare(0, ol, o) == 0) is_chan = true; }
                                     else if (std::string(o).compare(0, t.size(), t) == 0) maybe = true;
                                 }
-                                if (is_chan) { strip_state = 1; }
+                                if (is_chan) {
+                                    strip_state = 1;
+                                    if (t.compare(0, 7, "<think>") == 0) { think_stream = true; think_pos = head.find("<think>") + 7; }
+                                }
                                 else if (maybe && head.size() < 256) { return; }  // still could be an opener
                                 else { strip_state = 2; emit(head); head.clear(); return; }  // normal content
+                            }
+                            if (strip_state == 1 && think_stream) {   // stream the reasoning, hold back a possible close
+                                static const std::string close = "</think>";
+                                size_t c = head.find(close, think_pos);
+                                if (c != std::string::npos) {
+                                    emit_reasoning(head.substr(think_pos, c - think_pos));
+                                    std::string rest = ltrim(head.substr(c + close.size()));
+                                    head.clear(); think_pos = 0; strip_state = 2;
+                                    emit(rest);
+                                    return;
+                                }
+                                size_t keep = 0;               // longest tail of head that starts the close tag
+                                for (size_t k = std::min(close.size() - 1, head.size() - think_pos); k > 0; k--)
+                                    if (head.compare(head.size() - k, k, close, 0, k) == 0) { keep = k; break; }
+                                size_t end = head.size() - keep;
+                                if (end > think_pos) { emit_reasoning(head.substr(think_pos, end - think_pos)); think_pos = end; }
+                                return;
                             }
                             if (strip_state == 1) {            // buffer the preamble until its close
                                 if (head.rfind("<channel|>") != std::string::npos ||
@@ -3178,7 +3231,8 @@ int main(int argc, char ** argv) {
                                     std::string s = ltrim(sent), ct = ltrim(c);
                                     while (!s.empty() && isspace((unsigned char) s.back())) s.pop_back();
                                     if (ct.size() > s.size() && ct.compare(0, s.size(), s) == 0) feed(ct.substr(s.size()));
-                                    if (strip_state != 2 && !head.empty()) { emit(strip_reasoning_channel(head)); head.clear(); }
+                                    if (strip_state != 2 && think_stream) flush_think();
+                                    else if (strip_state != 2 && !head.empty()) { emit(strip_reasoning_channel(head)); head.clear(); }
                                     if (!peer_dead) {
                                         auto tsse = make_sse_tool_calls_chunk(req_id, message["tool_calls"], model_name);
                                         if (!sink.write(tsse.c_str(), tsse.size())) peer_dead = true;
@@ -3193,7 +3247,8 @@ int main(int argc, char ** argv) {
                                 }
                             }
                         }
-                        if (strip_state != 2 && !head.empty()) emit(strip_reasoning_channel(head));  // flush buffered head
+                        if (strip_state != 2 && think_stream) flush_think();   // reasoning cut off by the limit
+                        else if (strip_state != 2 && !head.empty()) emit(strip_reasoning_channel(head));  // flush buffered head
                         if (!utf8_tail.empty()) {              // flush any leftover (dump sanitizes it)
                             auto tsse = make_sse_chunk(req_id, utf8_tail, model_name, true, false);
                             sink.write(tsse.c_str(), tsse.size());

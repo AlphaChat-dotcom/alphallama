@@ -173,6 +173,7 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
             copy_expert(B.down, sl, w.down_exps, e);
         }
         cudaMemcpy(B.table.data, B.table_h.data(), (size_t) E_ * 4, cudaMemcpyHostToDevice);
+        B.owner0 = B.owner;
         host.push_back({ w.gate_exps, w.up_exps, w.down_exps });
     }
     for (int rep : stage_rep) {   // every staging slot always holds valid weights (it can serve as a weight-0 filler)
@@ -514,17 +515,55 @@ void DoorbellMoe::after_round() {
     }
 }
 
+void DoorbellMoe::reset_residency() {
+    if (cfg_.admit <= 0) return;   // static residency: it never changes
+    dev_.synchronize();            // no round in flight: nothing reads the slots or the tables below
+    // the copies queued at the last boundary land first (their slots are overwritten here)
+    for (const Pending & p : pending_) {
+        const size_t si = (size_t) (p.job % (int64_t) staging_.size());
+        while (recorded_[si].load(std::memory_order_acquire) != p.job) std::this_thread::yield();
+        cudaEventSynchronize((cudaEvent_t) staging_ev_[si]);
+    }
+    pending_.clear();
+    for (size_t b = 0; b < banks_.size(); ++b) {
+        Bank & B = banks_[b];
+        bool   changed = false;
+        for (int sl = 0; sl < B.n_slots; ++sl) {
+            const int32_t e = B.owner0[(size_t) sl];
+            if (B.owner[(size_t) sl] == e) continue;
+            const Tensor * src[3] = { &B.host_gate, &B.host_up, &B.host_down };
+            const Tensor * dst[3] = { &B.gate, &B.up, &B.down };
+            for (int r = 0; r < 3; ++r) {
+                cudaMemcpy((char *) dst[r]->data + (size_t) sl * dst[r]->nb[2],
+                           (const char *) src[r]->data + (size_t) e * src[r]->nb[2], src[r]->nb[2], cudaMemcpyHostToDevice);
+            }
+            changed = true;
+            n_restored_++;
+        }
+        std::fill(B.score.begin(), B.score.end(), 0.0f);
+        B.last_seq = *pool_->bell((int) b).seq;   // the previous request's last misses are not counted
+        if (!changed) continue;
+        B.owner = B.owner0;
+        std::fill(B.table_h.begin(), B.table_h.end(), -1);
+        for (int sl = 0; sl < B.n_slots; ++sl) B.table_h[(size_t) B.owner[(size_t) sl]] = sl;
+        cudaMemcpy(B.table.data, B.table_h.data(), (size_t) E_ * 4, cudaMemcpyHostToDevice);
+        if (table_pin_) memcpy(table_pin_ + b * (size_t) E_, B.table_h.data(), (size_t) E_ * 4);
+    }
+    n_resets_++;
+}
+
 std::string DoorbellMoe::stats_line() const {
     const auto & ps = pool_->stats();
     char buf[512];
     snprintf(buf, sizeof buf,
              "decode columns %llu, missed %llu (hit %.1f%%), admitted %llu, published %llu | CPU pool rings %llu, "
-             "computed %llu, busy %.1f ms | prefill columns %llu, staged %llu (%.2f GiB copied)",
+             "computed %llu, busy %.1f ms | prefill columns %llu, staged %llu (%.2f GiB copied) | residency resets %llu "
+             "(%llu slots restored)",
              (unsigned long long) n_cols_, (unsigned long long) n_miss_,
              n_cols_ ? 100.0 * (double) (n_cols_ - n_miss_) / (double) n_cols_ : 0.0, (unsigned long long) n_admit_,
              (unsigned long long) n_publish_, (unsigned long long) ps.rings.load(), (unsigned long long) ps.misses.load(),
              ps.busy_ns.load() / 1e6, (unsigned long long) n_bulk_cols_, (unsigned long long) n_bulk_miss_,
-             n_bulk_bytes_ / 1073741824.0);
+             n_bulk_bytes_ / 1073741824.0, (unsigned long long) n_resets_, (unsigned long long) n_restored_);
     return buf;
 }
 

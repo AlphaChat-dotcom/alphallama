@@ -29,6 +29,8 @@ struct HcRead {
 HcRead hc_read(Device & d, const Tensor & R, const HcWeights & w, float eps);
 // HC scatter after a block (GGML_OP_HC_COMBINE): R' = R + out * 2 sigmoid(inject / hc), per stream.
 Tensor hc_scatter(Device & d, const Tensor & R, const Tensor & out, const Tensor & inject);
+// hc_scatter written back into R itself (contiguous f32 [N, hc, T]; out [N, T] and inject [hc, T] with row strides)
+void   hc_scatter_into(Device & d, const Tensor & R, const Tensor & out, const Tensor & inject);
 // Final mixer = the output norm: hc_read without inject. Returns f32 [N, T].
 Tensor hc_head(Device & d, const Tensor & R, const HcWeights & w, float eps);
 

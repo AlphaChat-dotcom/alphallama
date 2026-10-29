@@ -5,6 +5,7 @@
 
 #include "ops/adapter.h"
 #include "kernels/q4x_gdn_conv.h"
+#include "kernels/q4x_gdn_scan.h"
 #include "kernels/q4x_hc.h"
 
 #include "ggml.h"
@@ -207,6 +208,20 @@ Tensor hc_scatter(Device & d, const Tensor & R, const Tensor & out, const Tensor
                                  1.0f / (float) hc, 2.0f));
 }
 
+void hc_scatter_into(Device & d, const Tensor & R, const Tensor & out, const Tensor & inject) {
+    const int64_t N = R.ne[0], hc = R.ne[1], T = R.ne[2];
+    if (!R.contiguous() || R.type != F32 || out.type != F32 || inject.type != F32 || out.ne[0] != N || out.ne[1] != T ||
+        inject.ne[0] != hc || inject.ne[1] != T) {
+        throw std::runtime_error("q4x::hc_scatter_into: shapes");
+    }
+    float *       rp = (float *) R.data;
+    const float * op_ = (const float *) out.data, * ip = (const float *) inject.data;
+    const int64_t ol = (int64_t) (out.nb[1] / 4), il = (int64_t) (inject.nb[1] / 4);
+    const float   s_in = 1.0f / (float) hc;
+    Device *      dev = &d;
+    adapter::native(d, [=]() { kern::q4x_hc_combine_into(adapter::stream(*dev), rp, op_, ip, s_in, 2.0f, N, hc, T, ol, il); });
+}
+
 // build_inp_embd + repeat_4d (qwen4exp.cpp): the hc streams start as copies of the token embedding.
 // token_embd may be IQ3_S; ggml's get_rows gathers it.
 Tensor embed_hc(Device & d, const Tensor & table, const Tensor & ids, int hc) {
@@ -245,8 +260,9 @@ static Tensor gdn_block_native(Device & d, const Tensor & x, const GdnWeights & 
         ggml_context * g  = c.ctx();
         ggml_tensor *  gx = c.in(x, "gdn_in");
         ggml_tensor *  ba = nullptr, * be = nullptr, * al = nullptr;
-        // q6_K/q5_K/q4_K/iq4_xs/iq3_s projections on the fp16 tensor-core dense kernel, after the small bf16 ones
-        const bool dn = w.qkvz.valid() ? dense_ok(w.qkvz, x) : (dense_ok(w.qkv, x) && dense_ok(w.z, x));
+        // q6_K/q5_K/q4_K/iq4_xs/iq3_s projections on the fp16 tensor-core dense kernel, after the small bf16 ones.
+        // Prompt chunks (> 64 rows) keep ggml's projections: the native dense path is a decode-width kernel.
+        const bool dn = L <= 64 && (w.qkvz.valid() ? dense_ok(w.qkvz, x) : (dense_ok(w.qkv, x) && dense_ok(w.z, x)));
         if (w.ba.valid()) {
             ba = ggml_mul_mat(g, c.in(w.ba, "wba"), gx);
             if (!dn) c.late(ba);
@@ -312,7 +328,50 @@ static Tensor gdn_block_native(Device & d, const Tensor & x, const GdnWeights & 
         const bool    ws = rec == nullptr;
         const int64_t ld = qkv_ld;
         Device *      dev = &d;
-        adapter::native(d, [=]() { kern::q4x_gdn_conv(adapter::stream(*dev), st, qp, ld, wp, wld, K, op_, ri, Ci, Li, Bi, ws); });
+        if (L > 64)   // prompt chunk (gdn_block_sigz's pf_ok: one stream, not record mode)
+            adapter::native(d, [=]() { kern::q4x_gdn_pf_conv(adapter::stream(*dev), st, qp, ld, wp, wld, K, op_, Ci, Li); });
+        else
+            adapter::native(d, [=]() { kern::q4x_gdn_conv(adapter::stream(*dev), st, qp, ld, wp, wld, K, op_, ri, Ci, Li, Bi, ws); });
+    }
+    // 3') prompt chunk: the register-state scan natively, then the gated norm and output projection
+    if (L > 64) {
+        const float * bsrc = nullptr, * asrc = nullptr;
+        int64_t       bld  = 0;
+        if (ba_t.valid() && ba_t.type == F32) {
+            bsrc = (const float *) ba_t.data; asrc = bsrc + Hv; bld = (int64_t) (ba_t.nb[1] / 4);
+        } else if (beta_t.valid() && alpha_t.valid() && beta_t.type == F32 && alpha_t.type == F32 && beta_t.nb[1] == alpha_t.nb[1]) {
+            bsrc = (const float *) beta_t.data; asrc = (const float *) alpha_t.data; bld = (int64_t) (beta_t.nb[1] / 4);
+        }
+        if (!bsrc) throw std::runtime_error("q4x::gdn_block_sigz: prompt scan needs f32 beta / alpha projections");
+        Tensor gt = d.ws_alloc(F32, Hv, L), bt = d.ws_alloc(F32, Hv, L), yt = d.ws_alloc(F32, Sv * Hv, L);
+        {
+            float *       st  = (float *) s.ssm.data;
+            float *       h   = (float *) conv_out.data;
+            const float * dt  = (const float *) w.dt_bias.data, * aa = (const float *) w.a.data;
+            float *       gp  = (float *) gt.data, * bp = (float *) bt.data, * yp = (float *) yt.data;
+            const int     Ski = (int) Sk, Hki = (int) Hk, Svi = (int) Sv, Hvi = (int) Hv;
+            const float   eps = p.eps;
+            Device *      dev = &d;
+            adapter::native(d, [=]() {
+                if (!kern::q4x_gdn_pf_scan(adapter::stream(*dev), st, h, C, bsrc, asrc, bld, dt, aa, gp, bp, yp, Ski, Hki, Svi,
+                                           Hvi, L, eps))
+                    throw std::runtime_error("q4x::gdn_block_sigz: prompt scan shape unsupported");
+            });
+        }
+        Call c(d);
+        ggml_context * g = c.ctx();
+        ggml_tensor *  z = nullptr;
+        if (fo_t.valid()) {
+            ggml_tensor * fo = c.in(fo_t, "wqkvz_out");
+            z = ggml_view_3d(g, fo, Sv * Hv, L, B, fo->nb[1], fo->nb[1] * L, (size_t) z_off * ggml_element_size(fo));
+        } else {
+            z = ggml_reshape_3d(g, c.in(z_t, "wqkv_gate_out"), Sv * Hv, L, B);
+        }
+        ggml_tensor * out    = ggml_reshape_4d(g, c.in(yt, "gdn_scan_out"), Sv, Hv, L, B);
+        ggml_tensor * normed = ggml_mul(g, ggml_rms_norm(g, out, p.eps), c.in(w.norm, "ssm_norm"));
+        ggml_tensor * gated  = ggml_mul(g, normed, ggml_sigmoid(g, ggml_reshape_4d(g, z, Sv, Hv, L, B)));
+        ggml_tensor * y      = ggml_mul_mat(g, c.in(w.out, "ssm_out"), ggml_reshape_3d(g, gated, Sv * Hv, L, B));
+        return c.run(ggml_reshape_2d(g, y, y->ne[0], T));
     }
     // 3) delta net, gated norm, output projection
     Call c(d);
@@ -420,7 +479,13 @@ Tensor gdn_block_sigz(Device & d, const Tensor & x, const GdnWeights & w, const 
     // 1 = native in every round; 2 = native outside record (verify) rounds only; 0 = off
     static const int conv_native = getenv("AI_Q4X_GDN_CONV_NATIVE") ? atoi(getenv("AI_Q4X_GDN_CONV_NATIVE")) : 1;
     const int64_t T0 = x.ne[1], B0 = s.conv.ne[1];
-    if (conv_native != 0 && !(conv_native == 2 && rec) && p.conv_k == 4 && B0 > 0 && T0 % B0 == 0 && T0 / B0 <= 64 && w.conv.type == F32 &&
+    // AI_Q4X_GDN_PF (default 1): prompt chunks (> 64 rows, one stream, not record mode) on the native block too, with
+    // the parallel conv and the register-state scan (q4x_gdn_scan.cu) in place of ggml's chunked TF32 scan
+    // (gdn_chunk_intra + gdn_chunk_scan). Not the same bits as the chunked scan; paired NLL is unchanged within noise.
+    static const bool pf_scan = !getenv("AI_Q4X_GDN_PF") || atoi(getenv("AI_Q4X_GDN_PF")) != 0;
+    const bool pf_ok = pf_scan && !rec && B0 == 1 && T0 > 64 && p.head_k == 128 && p.head_v == 128 &&
+                       p.v_heads == 3 * p.k_heads && w.dt_bias.type == F32 && w.a.type == F32 && s.ssm.type == F32;
+    if (conv_native != 0 && !(conv_native == 2 && rec) && p.conv_k == 4 && B0 > 0 && T0 % B0 == 0 && (T0 / B0 <= 64 || pf_ok) && w.conv.type == F32 &&
         w.conv.contiguous() && w.conv.ne[0] == p.conv_k && w.conv.ne[1] == p.channels && s.conv.type == F32 &&
         s.conv.contiguous() && x.type == F32 && p.channels == 2 * p.head_k * p.k_heads + p.head_v * p.v_heads) {
         static const bool check = getenv("AI_Q4X_GDN_REC_CHECK") && atoi(getenv("AI_Q4X_GDN_REC_CHECK")) != 0;
@@ -729,6 +794,28 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
     const bool        use_sparse = r > 0 && T <= 8 && sparse_fa;
     const Tensor zeros_src = (r > 0 && !use_sparse) ? d.ws_alloc(F32, 1, std::min<int64_t>(n_kv, (int64_t) qp.top_k + r - 1), T)
                                                     : Tensor{};
+    // AI_Q4X_QSA_POOL_CACHE (default 1): a complete block's pooled key never changes until one of its cells is written
+    // again (a round writes positions >= pos[0]), so pool only the round's dirty blocks (b >= pos[0] / r, at most
+    // T / r + 2) into qc.pooled (f32) and score against the cache. Each block goes through the same operations, so the
+    // result is bit-identical. 0 = pool every block on every call (a gather over all keys + r strided copies + norm /
+    // rope per round per layer).
+    static const bool pool_cache = !getenv("AI_Q4X_QSA_POOL_CACHE") || atoi(getenv("AI_Q4X_QSA_POOL_CACHE")) != 0;
+    const bool        use_pc = r > 0 && pool_cache && qc.pooled.valid() && qc.pooled.type == F32 &&
+                               qc.pooled.ne[0] == qp.idx_dim && qc.pooled.ne[1] >= n_blocks + 1;
+    const int64_t     pc_M   = use_pc ? T / r + 2 : 0;
+    Tensor            pc_cells, pc_rows, pc_pos;
+    if (use_pc) {
+        pc_cells = d.ws_alloc(I32, r * pc_M);
+        pc_rows  = d.ws_alloc(I64, pc_M);
+        pc_pos   = d.ws_alloc(I32, 4 * pc_M);
+        void *          st  = adapter::stream(d);
+        const int32_t * pp  = (const int32_t *) in.pos4.data;
+        int32_t *       pcc = (int32_t *) pc_cells.data;
+        int64_t *       pcr = (int64_t *) pc_rows.data;
+        int32_t *       pcp = (int32_t *) pc_pos.data;
+        const int64_t   rows = qc.pooled.ne[1];
+        adapter::native(d, [=]() { kern::q4x_qsa_dirty(st, pp, T, r, pc_M, rows, pcc, pcr, pcp); });
+    }
 
     Call c(d);
     ggml_context * g = c.ctx();
@@ -750,19 +837,31 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
         ggml_tensor * k_raw = ggml_mul_mat(g, c.in(qw.k_proj, "indexer_k_proj"), gx);   // [idim, T]
         c.effect(ggml_set_rows(g, keys, k_raw, c.in(in.write_cells, "k_idxs")));
 
-        ggml_tensor * k_all   = ggml_view_2d(g, keys, idim, n_kv, keys->nb[1], 0);
-        ggml_tensor * members = ggml_get_rows(g, k_all, c.in(blk_cells, "qsa_blk_cells"));   // f32 [idim, r*n_blocks]
-        members = ggml_reshape_4d(g, members, idim, r, n_blocks, 1);
-        ggml_tensor * pl = nullptr;
-        for (int64_t i = 0; i < r; ++i) {
-            ggml_tensor * slice = ggml_cont(g, ggml_view_3d(g, members, idim, n_blocks, 1, members->nb[2], members->nb[3],
-                                                            i * members->nb[1]));
-            pl = pl ? ggml_add(g, pl, slice) : slice;
+        ggml_tensor * k_all = ggml_view_2d(g, keys, idim, n_kv, keys->nb[1], 0);
+        // pool nb blocks whose member cells are `cells` and rope positions `bpos` (the reference's operations)
+        auto pool = [&](ggml_tensor * cells, ggml_tensor * bpos, int64_t nb) {
+            ggml_tensor * members = ggml_get_rows(g, k_all, cells);   // f32 [idim, r*nb]
+            members = ggml_reshape_4d(g, members, idim, r, nb, 1);
+            ggml_tensor * pl = nullptr;
+            for (int64_t i = 0; i < r; ++i) {
+                ggml_tensor * slice = ggml_cont(g, ggml_view_3d(g, members, idim, nb, 1, members->nb[2], members->nb[3],
+                                                                i * members->nb[1]));
+                pl = pl ? ggml_add(g, pl, slice) : slice;
+            }
+            pl = ggml_scale(g, pl, 1.0f / (float) r);
+            pl = ggml_mul(g, ggml_rms_norm(g, ggml_reshape_3d(g, pl, idim, nb, 1), p.eps), c.in(qw.k_norm, "indexer_k_norm"));
+            pl = rope(ggml_reshape_3d(g, pl, idim, 1, nb), bpos);
+            return ggml_reshape_2d(g, pl, idim, nb);
+        };
+        ggml_tensor * pooled = nullptr;
+        if (use_pc) {
+            ggml_tensor * cache = c.in(qc.pooled, "qsa_pooled_cache");
+            ggml_tensor * fresh = pool(c.in(pc_cells, "qsa_dirty_cells"), c.in(pc_pos, "qsa_dirty_pos"), pc_M);
+            c.effect(ggml_set_rows(g, cache, fresh, c.in(pc_rows, "qsa_dirty_rows")));
+            pooled = ggml_view_2d(g, cache, idim, n_blocks, cache->nb[1], 0);
+        } else {
+            pooled = pool(c.in(blk_cells, "qsa_blk_cells"), c.in(blk_pos, "qsa_blk_pos"), n_blocks);
         }
-        pl = ggml_scale(g, pl, 1.0f / (float) r);
-        pl = ggml_mul(g, ggml_rms_norm(g, ggml_reshape_3d(g, pl, idim, n_blocks, 1), p.eps), c.in(qw.k_norm, "indexer_k_norm"));
-        pl = rope(ggml_reshape_3d(g, pl, idim, 1, n_blocks), c.in(blk_pos, "qsa_blk_pos"));
-        ggml_tensor * pooled = ggml_reshape_2d(g, pl, idim, n_blocks);
 
         ggml_tensor * q = ggml_reshape_3d(g, ggml_mul_mat(g, c.in(qw.q_proj, "indexer_q_proj"), gx), idim, nih, T);
         q = rope(ggml_mul(g, ggml_rms_norm(g, q, p.eps), c.in(qw.q_norm, "indexer_q_norm")), pos);

@@ -65,6 +65,7 @@ public:
     };
 
     // Copies. `upload`/`download` synchronise the stream and count as blocking calls.
+    void mem_report(const char * when);   // AI_MEM_REPORT: tracked device buffers + VRAM free (no-op when unset)
     void upload(const Tensor & dst, const void * src, size_t offset, size_t n);
     void download(const Tensor & src, void * dst, size_t offset, size_t n);
     void synchronize();

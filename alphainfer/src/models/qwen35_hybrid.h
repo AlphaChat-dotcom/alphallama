@@ -91,6 +91,12 @@ public:
         if (door_) door_->after_round();
 #endif
     }
+    // before a new request: doorbell residency back to its initial fill (no-op otherwise)
+    void offload_reset_residency() {
+#if defined(AI_DOORBELL)
+        if (door_) door_->reset_residency();
+#endif
+    }
     // Streamed-MoE host steps: time blocked on the device (compute + queued copies) and host CPU time.
     // overlap_*: routed experts of a step that the same layer also used in its previous step.
     struct OffloadProf {

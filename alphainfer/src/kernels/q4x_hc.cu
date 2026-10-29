@@ -577,4 +577,24 @@ void q4x_hc_read(void * stream, const char * wd, int64_t wd_nb1, const char * wu
     }
 }
 
+// Prefill: hc_combine in place, R[e, h, t] += out[e, t] * (s_out * sigmoid(s_in * inj[h, t])), with ggml-cuda's
+// hc_combine_f32 float operations in the same order (bit-identical). R is [N, H, T] contiguous, out rows out_ld floats
+// apart, inject rows inj_ld floats apart. Saves the copy back that the graph op's fresh output needs.
+__global__ static void hc_combine_into_k(float * __restrict__ R, const float * __restrict__ out, const float * __restrict__ inj,
+                                         float s_in, float s_out, int64_t N, int64_t H, int64_t T, int64_t out_ld, int64_t inj_ld) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * H * T) return;
+    const int64_t e = i % N, r = i / N, h = r % H, t = r / H;
+    const float   c = inj[t * inj_ld + h];
+    const float   w = __fmaf_rn(s_out, 1.0f / (1.0f + expf(-__fmaf_rn(s_in, c, 0.0f))), 0.0f);
+    R[i] = __fadd_rn(R[i], __fmul_rn(out[t * out_ld + e], w));
+}
+
+void q4x_hc_combine_into(void * stream, float * R, const float * out, const float * inj, float s_in, float s_out, int64_t N,
+                         int64_t H, int64_t T, int64_t out_ld, int64_t inj_ld) {
+    const int64_t n = N * H * T;
+    if (n <= 0) return;
+    hc_combine_into_k<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, inj, s_in, s_out, N, H, T, out_ld, inj_ld);
+}
+
 }  // namespace ai::kern

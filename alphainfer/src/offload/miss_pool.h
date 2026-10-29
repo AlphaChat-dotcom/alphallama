@@ -50,6 +50,17 @@ public:
 
     const Bell & bell(int layer) const { return bells_[(size_t) layer]; }
 
+    // Prefill CPU share: compute `ncols` routed columns of layer `layer` for a prompt batch on the pool. The poller
+    // serves the job between rings, so jobs are published from one thread only (prefill and decode never overlap).
+    // x: host f32 [T][N]; per listed column i: tok[i] its token, ids[i] its expert, w[i] its routing weight, listed in
+    // ascending (token, slot) order. yp: host f32 [T][N], set to the sum over each token's listed columns of w * expert
+    // output (0 for a token with none). Every listed column is computed (no tail rules). The pointers stay valid until
+    // host_job_wait returns.
+    void host_job_begin(int layer, const float * x, int T, const int32_t * tok, const int32_t * ids, const float * w,
+                        int ncols, float * yp);
+    void host_job_wait();
+    long long host_job_ns() const { return hj_ns_; }   // the last host job's duration on the pool (after host_job_wait)
+
     struct Stats {
         std::atomic<unsigned long long> rings{ 0 }, misses{ 0 }, busy_ns{ 0 }, skipped{ 0 };
         // profile: expert groups computed, columns that shared a group (n > 1), and the poller's per-phase time
@@ -88,6 +99,20 @@ private:
     std::vector<std::atomic<int>> worker_done_;
     std::vector<char>     skip_;         // route-tail skipped columns of the current job (host only)
     std::vector<int>      cols_;         // missed columns t*k + j of the current job, sorted by expert id
+    // the current job's column maps: expert of column c, its token (nullptr: c / k), its output row (y + c * N)
+    const int32_t *       jmiss_ = nullptr;
+    const int32_t *       jtok_  = nullptr;
+    float *               jy_    = nullptr;
+    int                   jtok(int c) const { return jtok_ ? jtok_[c] : c / k_; }
+    // the host job (prefill CPU share)
+    std::atomic<bool>     hj_pending_{ false }, hj_done_{ true };
+    int                   hj_layer_ = 0, hj_T_ = 0, hj_ncols_ = 0;
+    const float *         hj_x_ = nullptr, * hj_w_ = nullptr;
+    const int32_t *       hj_tok_ = nullptr, * hj_ids_ = nullptr;
+    float *               hj_yp_ = nullptr;
+    long long             hj_ns_ = 0;
+    std::vector<float>    hy_;           // its compact outputs, one row of N per listed column
+    std::vector<char>     hneed_;        // its tokens with at least one listed column
     struct Group { int c0, n; };         // columns [c0, c0 + n) of cols_ share one expert (n <= 4)
     std::vector<Group>    groups_;
     std::vector<char>     prep_;         // Q2_0 down: each column's h prepared once (ggml_cpu_q2_0_prepare)

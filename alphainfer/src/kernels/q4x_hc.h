@@ -26,6 +26,9 @@ void q4x_hc_ws(int N, int LR, int T, bool inject, int64_t * part_n, int64_t * ps
 
 // dst f32: mixed [N, T] then (when wi) inject [H, T]. wd: Q8_0 [HD -> LR] rows (nb1 bytes), wu: Q8_0 [LR -> HD] rows,
 // wi: inject rows [H][HD] BF16 or F32 (nullptr = no inject), wn: f32 norm gamma [HD], x: f32 streams [N, H, T].
+// Prefill: hc_combine in place over R [N, H, T] (bit-identical to ggml-cuda's hc_combine_f32)
+void q4x_hc_combine_into(void * stream, float * R, const float * out, const float * inj, float s_in, float s_out, int64_t N,
+                         int64_t H, int64_t T, int64_t out_ld, int64_t inj_ld);
 void q4x_hc_read(void * stream, const char * wd, int64_t wd_nb1, const char * wu, int64_t wu_nb1, const char * wi,
                  int64_t wi_nb1, int wi_bf16, const float * x, const float * wn, float * part, float * pss, float * lo,
                  float * scl, float * dst, int N, int LR, int T, float eps);

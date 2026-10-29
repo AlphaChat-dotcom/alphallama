@@ -1103,7 +1103,7 @@ template <ggml_type type, int NG, int W>
 __global__ void __launch_bounds__(32 * W) dn_s_k(const uint8_t * __restrict__ down, const block_q8_1 * __restrict__ y,
                                                  const int32_t * __restrict__ recs, int rec_stride, int count,
                                                  float * __restrict__ out, int F, int N, long long row_bytes, long long exp_bytes,
-                                                 int astride) {
+                                                 int astride, int del) {
     using Q = TQ<type>;
     constexpr int NC = 8 * NG;
     extern __shared__ __align__(16) uint8_t tc_sm[];
@@ -1125,7 +1125,7 @@ __global__ void __launch_bounds__(32 * W) dn_s_k(const uint8_t * __restrict__ do
         const int cpc = rowb / 16;   // 16-byte chunks per column
         for (int i = tid; i < NC * cpc; i += 32 * W) {
             const int c = i / cpc, part = i - c * cpc;
-            if (c0 + c >= ncols) continue;
+            if (c0 + c >= ncols || (del & 2)) continue;
             tc_cp16(asm_ + c * astride + 16 * part, (const uint8_t *) (y + (size_t) o[2 + c0 + c] * nu) + 16 * part);
         }
         tc_commit();
@@ -1151,15 +1151,18 @@ __global__ void __launch_bounds__(32 * W) dn_s_k(const uint8_t * __restrict__ do
                 const int blk = u / Q::UPB, sub = u - blk * Q::UPB;
                 int   av0, av1, am0, am1, bv0, bv1, bm0, bm1;
                 float asw, bsw;
-                Q::unit(ra + blk * Q::SB, sub, tg, av0, av1, am0, am1, asw);
-                Q::unit(rb + blk * Q::SB, sub, tg, bv0, bv1, bm0, bm1, bsw);
+                if (del & 1) { av0 = lane; av1 = u; bv0 = tg; bv1 = lane ^ u; am0 = bm0 = 1; am1 = bm1 = 2; asw = bsw = 1.0f; }
+                else {
+                    Q::unit(ra + blk * Q::SB, sub, tg, av0, av1, am0, am1, asw);
+                    Q::unit(rb + blk * Q::SB, sub, tg, bv0, bv1, bm0, bm1, bsw);
+                }
 #pragma unroll
                 for (int G = 0; G < NG; ++G) {
                     const uint8_t * yb = asm_ + (8 * G + g) * astride + u * (int) sizeof(block_q8_1) + 4;   // qs after ds
                     const int       b0 = *(const int *) (yb + 4 * tg), b1 = *(const int *) (yb + 16 + 4 * tg);
                     int             c[4] = { 0, 0, 0, 0 }, e[4] = { 0, 0, 0, 0 };
-                    tc_mma(c, av0, bv0, b0);
-                    tc_mma(e, av1, bv1, b1);
+                    if (del & 4) { c[0] = b0 ^ av0; c[1] = bv0; c[2] = b1; c[3] = av1 ^ bv1; e[0] = b1 ^ bv1; }
+                    else { tc_mma(c, av0, bv0, b0); tc_mma(e, av1, bv1, b1); }
 #pragma unroll
                     for (int q = 0; q < 2; ++q) {
                         const block_q8_1 * yq = (const block_q8_1 *) (asm_ + (8 * G + 2 * tg + q) * astride) + u;
@@ -1173,7 +1176,7 @@ __global__ void __launch_bounds__(32 * W) dn_s_k(const uint8_t * __restrict__ do
             for (int G = 0; G < NG; ++G)
 #pragma unroll
                 for (int q = 0; q < 2; ++q)
-                    if (ov[G][q]) {
+                    if (ov[G][q] && !(del & 8)) {
                         out[(long long) oc[G][q] * N + r0 + g]     = acc[G][q];
                         out[(long long) oc[G][q] * N + r0 + g + 8] = acc[G][2 + q];
                     }
@@ -1195,7 +1198,10 @@ static void launch_dn_s(cudaStream_t st, const void * down, const block_q8_1 * y
         cudaFuncSetAttribute(dn_s_k<type, NG, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
     }
     const dim3 grid((unsigned) ((N + kTcDnRows * W - 1) / (kTcDnRows * W)), (unsigned) count);
-    dn_s_k<type, NG, W><<<grid, 32 * W, sm, st>>>((const uint8_t *) down, y, recs, rec_stride, count, out, F, N, rb, eb, astride);
+    // AI_Q4X_DN_DEL (default 0, benchmarking only, wrong output): bitmask of stages to skip to find what bounds the
+    // kernel: 1 weight decode, 2 activation staging, 4 mma, 8 stores
+    static const int del = getenv("AI_Q4X_DN_DEL") ? atoi(getenv("AI_Q4X_DN_DEL")) : 0;
+    dn_s_k<type, NG, W><<<grid, 32 * W, sm, st>>>((const uint8_t *) down, y, recs, rec_stride, count, out, F, N, rb, eb, astride, del);
 }
 
 // Prefill gate/up for big batches (AI_Q4X_PF_GU=1): gu_tc_k with NG column groups per weight pass and register-lean
@@ -1812,7 +1818,7 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
                                                            const int8_t * __restrict__ xqs, const float * __restrict__ xd,
                                                            const int32_t * __restrict__ recs, int rec_stride, int count,
                                                            float * __restrict__ act, int K, int F, long long row_bytes,
-                                                           long long exp_bytes, int k) {
+                                                           long long exp_bytes, int k, int del) {
     using Q = TQ<type>;
     constexpr int CH = kTcKC * Q::SB, W4 = CH / 4, STB = 16 * CH, NC = 8 * NG;
     constexpr int ATB = NC * kQsAStride, SCB = NC * kTcKC;   // activation bytes / scale floats per stage
@@ -1830,7 +1836,7 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
     const uint8_t * ub = up + (size_t) ch * exp_bytes + (size_t) (active ? r0 : 0) * row_bytes;
     for (int c0 = 0; c0 < ncols; c0 += NC) {
         auto load = [&](int st, int buf) {
-            if (active) {
+            if (active && !(del & 16)) {
                 uint8_t * dst = wsm + buf * STB;
                 for (int i = lane; i < 16 * W4; i += 32) {
                     const int r = i / W4, w = i - r * W4;
@@ -1838,7 +1844,7 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
                 }
             }
             constexpr int CPC = kTcKC * QK_K / 16;   // 16-byte chunks per column per stage
-            for (int i = tid; i < NC * CPC; i += 32 * W) {
+            for (int i = tid; i < NC * CPC && !(del & 2); i += 32 * W) {
                 const int c = i / CPC, part = i - c * CPC;
                 if (c0 + c >= ncols) continue;
                 const int row = o[2 + c0 + c] / k;
@@ -1880,7 +1886,8 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
 #pragma unroll 2
                 for (int sub = 0; sub < 8; ++sub) {
                     int gv0 = 0, gv1 = 0, gm0 = 0, gm1 = 0, uv0 = 0, uv1 = 0, um0 = 0, um1 = 0;
-                    if (active) {
+                    if (del & 1) { gv0 = lane; gv1 = sub; uv0 = tg; uv1 = lane ^ sub; gm0 = um0 = 1; gm1 = um1 = 2; gsw = usw = 1.0f; }
+                    else if (active) {
                         Q::unit(wb + g * CH + sb * Q::SB, sub, tg, gv0, gv1, gm0, gm1, gsw);
                         Q::unit(wb + (8 + g) * CH + sb * Q::SB, sub, tg, uv0, uv1, um0, um1, usw);
                     }
@@ -1889,8 +1896,8 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
                         const uint8_t * ar = ab + (8 * G + g) * kQsAStride + sb * QK_K + 32 * sub + 4 * tg;
                         const int       b0 = *(const int *) ar, b1 = *(const int *) (ar + 16);
                         int             c[4] = { 0, 0, 0, 0 }, e[4] = { 0, 0, 0, 0 };
-                        tc_mma(c, gv0, uv0, b0);
-                        tc_mma(e, gv1, uv1, b1);
+                        if (del & 4) { c[0] = b0 ^ gv0; c[1] = uv0; c[2] = b1; c[3] = gv1 ^ uv1; e[0] = b1 ^ uv1; }
+                        else { tc_mma(c, gv0, uv0, b0); tc_mma(e, gv1, uv1, b1); }
 #pragma unroll
                         for (int q = 0; q < 2; ++q) {
                             ig[G][q] += c[q] * gm0 + e[q] * gm1;
@@ -1902,6 +1909,7 @@ __global__ void __launch_bounds__(32 * W) gu_q8ks_k(const uint8_t * __restrict__
                 for (int G = 0; G < NG; ++G)
 #pragma unroll
                     for (int q = 0; q < 2; ++q) {
+                        if (del & 8) { ag[G][q] += (float) ig[G][q]; au[G][q] += (float) iu[G][q]; continue; }
                         const float d8 = ov[G][q] ? sb_[(8 * G + 2 * tg + q) * kTcKC + sb] : 0.0f;
                         ag[G][q] = fmaf(gsw * d8, (float) ig[G][q], ag[G][q]);
                         au[G][q] = fmaf(usw * d8, (float) iu[G][q], au[G][q]);
@@ -1932,8 +1940,175 @@ static void launch_gu_q8ks(cudaStream_t st, const void * up, const void * gate, 
         cudaFuncSetAttribute(gu_q8ks_k<type, NG, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
     }
     const dim3 grid((unsigned) ((F + kTcGuRows * W - 1) / (kTcGuRows * W)), (unsigned) count);
+    // AI_Q4X_GU_DEL (benchmarking only; the output is wrong): bound by deletion, a bit mask of the phases to skip --
+    // 1 weight decode, 2 activation staging, 4 mma, 8 epilogue, 16 weight staging. The weight decode is the bound.
+    // Not faster, so not used: the codebook in shared memory, 48 / 64 columns per pass with 6 / 4 warps, weights
+    // decoded straight from global memory
+    static const int del = getenv("AI_Q4X_GU_DEL") ? atoi(getenv("AI_Q4X_GU_DEL")) : 0;
     gu_q8ks_k<type, NG, W><<<grid, 32 * W, sm, st>>>((const uint8_t *) up, (const uint8_t *) gate, xqs, xd, recs,
-                                                         rec_stride, count, act, K, F, rb, eb, k);
+                                                         rec_stride, count, act, K, F, rb, eb, k, del);
+}
+
+// Prefill gate/up with the structure of llama.cpp's MMQ. gu_q8ks_k is bound by its weight decode
+// and decodes each warp's own rows again for every 32 columns. Here a block owns 64 gate rows + the same 64 up rows of
+// one expert and up to 128 of its columns; per superblock of K all 256 threads decode the 128 x 256 weight tile once
+// into shared memory (int8 values, the per-16 integer multipliers, the row scale) from raw rows prefetched under the
+// previous superblock's mma, while the activations for the 128 columns land by 16-byte async copies; then warp w
+// multiplies its 16 rows (8 gate + 8 up, rows 8w..8w+7) against all 128 columns. Per (row, column) the arithmetic is
+// gu_q8ks_k's in the same order, so the results are bit-identical.
+constexpr int kMqStride = QK_K + 16;   // smem bytes per decoded weight row / activation column
+template <ggml_type type, int kMqRows, int kMqCols>
+__global__ void __launch_bounds__(4 * kMqRows) gu_mmq_k(const uint8_t * __restrict__ up, const uint8_t * __restrict__ gate,
+                                                const int8_t * __restrict__ xqs, const float * __restrict__ xd,
+                                                const int32_t * __restrict__ recs, int rec_stride, int count,
+                                                float * __restrict__ act, int K, int F, long long row_bytes,
+                                                long long exp_bytes, int k, int del) {
+    using Q = TQ<type>;
+    constexpr int NA = 2 * kMqRows, NG = kMqCols / 8, NT = 4 * kMqRows;   // A rows (tile w: rows 16w..16w+7 gate, 16w+8.. up), column groups
+    extern __shared__ __align__(16) uint8_t mq_sm[];
+    int8_t * wq = (int8_t *) mq_sm;                                   // [NA][kMqStride]
+    int8_t * xs = wq + NA * kMqStride;                                // [kMqCols][kMqStride]
+    int *    wm = (int *) (xs + kMqCols * kMqStride);                 // [NA][8]: m0 | m1 << 16 per 32-block
+    float *  wd = (float *) (wm + NA * 8);                            // [NA]
+    float *  sd = wd + NA;                                            // [kMqCols]
+    // raw weight rows of the next superblock, prefetched under this one's mma: 4-byte copies from the 4-aligned byte
+    // below the superblock's start (blocks are 66..110 bytes, so a row's superblocks are only 2-aligned)
+    constexpr int RAWS = (Q::SB + 2 + 3) / 4 * 4;
+    uint8_t * raw = (uint8_t *) (sd + kMqCols);                       // [NA][RAWS]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3, tid = threadIdx.x;
+    if ((int) blockIdx.y >= count) return;
+    const int32_t * o = recs + (size_t) blockIdx.y * rec_stride;
+    const int ch = o[0], ncols = o[1], nsb = K / QK_K, rb = blockIdx.x * kMqRows;
+    const uint8_t * gbase = gate + (size_t) ch * exp_bytes, * ubase = up + (size_t) ch * exp_bytes;
+    const int  myr = rb + 8 * warp + g;   // this thread's output row (gate row myr pairs with up row myr)
+    const bool rok = myr < F;
+    for (int c0 = 0; c0 < ncols; c0 += kMqCols) {
+        const int nc = min(kMqCols, ncols - c0);
+        int   oc[NG][2];
+        float ag[NG][2], au[NG][2];
+#pragma unroll
+        for (int G = 0; G < NG; ++G)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int co = 8 * G + 2 * tg + q;
+                oc[G][q] = co < nc ? o[2 + c0 + co] : -1;
+                ag[G][q] = au[G][q] = 0.0f;
+            }
+        auto raw_issue = [&](int sb) {   // group R(sb): the raw rows of superblock sb
+            const int off = (sb * Q::SB) & 3, nw = (off + Q::SB + 3) / 4;
+            const size_t base = (size_t) sb * Q::SB - off;
+            for (int i = tid; i < NA * (RAWS / 4); i += NT) {
+                const int ar = i / (RAWS / 4), w = i - ar * (RAWS / 4);
+                const int tile = ar >> 4, w16 = ar & 15, r = rb + 8 * tile + (w16 & 7);
+                if (r < F && w < nw && !(del & 8)) tc_cp4(raw + ar * RAWS + 4 * w, (w16 < 8 ? gbase : ubase) + (size_t) r * row_bytes + base + 4 * w);
+            }
+            tc_commit();
+        };
+        auto act_issue = [&](int sb) {   // group A(sb): the pass's activation columns of superblock sb, + their scales
+            for (int i = tid; i < kMqCols * (QK_K / 16); i += NT) {
+                const int c = i / (QK_K / 16), part = i - c * (QK_K / 16);
+                if (c < nc && !(del & 2)) tc_cp16(xs + c * kMqStride + 16 * part, xqs + (size_t) (o[2 + c0 + c] / k) * K + (size_t) sb * QK_K + 16 * part);
+            }
+            tc_commit();
+            for (int i = tid; i < kMqCols; i += NT) sd[i] = i < nc ? xd[(size_t) (o[2 + c0 + i] / k) * nsb + sb] : 0.0f;
+        };
+        raw_issue(0);
+        act_issue(0);
+        for (int sb = 0; sb < nsb; ++sb) {
+            tc_wait<1>();   // R(sb) landed (A(sb), the newest group, may still be in flight)
+            __syncthreads();
+            const int off = (sb * Q::SB) & 3;
+            // a thread decodes a whole 32-block, its four quarters in a row: the block's header loads (scale, high bits,
+            // signs, d) are shared instead of repeated by four threads, and the 32 values go out as two 16-byte stores
+            for (int u = tid; u < NA * 8; u += NT) {   // (A row, 32-block)
+                const int ar = u >> 3, sub = u & 7;
+                const int tile = ar >> 4, w16 = ar & 15, r = rb + 8 * tile + (w16 & 7);
+                int   v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }, m0 = 0, m1 = 0;
+                float sw = 0.0f;
+                if (del & 1) {
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) v[q] = lane ^ u ^ q;
+                    m0 = m1 = 1; sw = 1.0f;
+                } else if (r < F) {
+                    const uint8_t * rp = raw + ar * RAWS + off;
+#pragma unroll
+                    for (int t4 = 0; t4 < 4; ++t4) Q::unit(rp, sub, t4, v[t4], v[4 + t4], m0, m1, sw);
+                }
+                int4 * dst = (int4 *) (wq + ar * kMqStride + 32 * sub);   // 16-byte aligned: kMqStride % 16 == 0
+                dst[0] = make_int4(v[0], v[1], v[2], v[3]);
+                dst[1] = make_int4(v[4], v[5], v[6], v[7]);
+                wm[ar * 8 + sub] = (m0 & 0xFFFF) | (m1 << 16);
+                if (sub == 0) wd[ar] = sw;
+            }
+            __syncthreads();   // the raw buffer is free
+            if (sb + 1 < nsb) raw_issue(sb + 1); else tc_commit();
+            tc_wait<1>();   // A(sb) landed (R(sb + 1) may still be in flight)
+            __syncthreads();
+            const int8_t * wa = wq + (16 * warp + g) * kMqStride, * wb = wq + (16 * warp + 8 + g) * kMqStride;
+            int ig[NG][2], iu[NG][2];
+#pragma unroll
+            for (int G = 0; G < NG; ++G) ig[G][0] = ig[G][1] = iu[G][0] = iu[G][1] = 0;
+#pragma unroll 2
+            for (int sub = 0; sub < 8; ++sub) {
+                const int gv0 = *(const int *) (wa + 32 * sub + 4 * tg), gv1 = *(const int *) (wa + 32 * sub + 16 + 4 * tg);
+                const int uv0 = *(const int *) (wb + 32 * sub + 4 * tg), uv1 = *(const int *) (wb + 32 * sub + 16 + 4 * tg);
+                const int gmm = wm[(16 * warp + g) * 8 + sub], umm = wm[(16 * warp + 8 + g) * 8 + sub];
+                const int gm0 = (int) (short) (gmm & 0xFFFF), gm1 = gmm >> 16, um0 = (int) (short) (umm & 0xFFFF), um1 = umm >> 16;
+#pragma unroll
+                for (int G = 0; G < NG; ++G) {
+                    const int8_t * ap = xs + (8 * G + g) * kMqStride + 32 * sub + 4 * tg;
+                    const int      b0 = *(const int *) ap, b1 = *(const int *) (ap + 16);
+                    int            c[4] = { 0, 0, 0, 0 }, e[4] = { 0, 0, 0, 0 };
+                    if (del & 4) { c[0] = b0 ^ gv0; c[1] = uv0; c[2] = b1; c[3] = gv1 ^ uv1; e[0] = b1 ^ uv1; }
+                    else { tc_mma(c, gv0, uv0, b0); tc_mma(e, gv1, uv1, b1); }
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        ig[G][q] += c[q] * gm0 + e[q] * gm1;
+                        iu[G][q] += c[2 + q] * um0 + e[2 + q] * um1;
+                    }
+                }
+            }
+            const float gsw = wd[16 * warp + g], usw = wd[16 * warp + 8 + g];
+#pragma unroll
+            for (int G = 0; G < NG; ++G)
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const float d8 = oc[G][q] >= 0 ? sd[8 * G + 2 * tg + q] : 0.0f;
+                    ag[G][q] = fmaf(gsw * d8, (float) ig[G][q], ag[G][q]);
+                    au[G][q] = fmaf(usw * d8, (float) iu[G][q], au[G][q]);
+                }
+            __syncthreads();   // every warp is done with the tile and the activations
+            if (sb + 1 < nsb) act_issue(sb + 1); else tc_commit();
+        }
+        if (rok) {
+#pragma unroll
+            for (int G = 0; G < NG; ++G)
+#pragma unroll
+                for (int q = 0; q < 2; ++q)
+                    if (oc[G][q] >= 0) act[(long long) oc[G][q] * F + myr] = silu(ag[G][q]) * au[G][q];
+        }
+    }
+}
+
+template <ggml_type type, int kMqRows, int kMqCols>
+static void launch_gu_mmq(cudaStream_t st, const void * up, const void * gate, const int8_t * xqs, const float * xd,
+                          const int32_t * recs, int rec_stride, int count, float * act, int K, int F, long long rb,
+                          long long eb, int k) {
+    constexpr size_t sm = (size_t) (2 * kMqRows + kMqCols) * kMqStride + (size_t) 2 * kMqRows * 8 * sizeof(int) +
+                          (size_t) (2 * kMqRows + kMqCols) * sizeof(float) +
+                          (size_t) 2 * kMqRows * ((TQ<type>::SB + 2 + 3) / 4 * 4);
+    static bool attr = false;
+    if (!attr) {
+        attr = true;
+        if (cudaFuncSetAttribute(gu_mmq_k<type, kMqRows, kMqCols>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) != cudaSuccess)
+            fprintf(stderr, "[q4x] gu_mmq_k<%d,%d,%d>: %zu bytes of shared memory refused%c", (int) type, kMqRows, kMqCols, sm, 10);
+    }
+    const dim3 grid((unsigned) ((F + kMqRows - 1) / kMqRows), (unsigned) count);
+    // AI_Q4X_GU_DEL (default 0, benchmarking only, wrong output): bitmask of stages to skip to find what bounds the
+    // kernel: 1 weight decode, 2 activation staging, 4 mma, 8 raw weight prefetch
+    static const int del = getenv("AI_Q4X_GU_DEL") ? atoi(getenv("AI_Q4X_GU_DEL")) : 0;
+    gu_mmq_k<type, kMqRows, kMqCols><<<grid, 4 * kMqRows, sm, st>>>((const uint8_t *) up, (const uint8_t *) gate, xqs, xd, recs, rec_stride, count,
+                                          act, K, F, rb, eb, k, del);
 }
 
 // Prefill with big MoE batches: the tensor-core wide path in three steps, so the caller can run gate/up over a whole
@@ -1980,6 +2155,20 @@ bool q4x_experts_wide_gu(void * stream, int ty_gu, const void * up, const void *
         // AI_Q4X_PF_GU_WARPS = 8 (default) | 4: rows per block = 8 x warps. Every block of an expert reloads its
         // columns' activations, and those loads are a large share of gate/up, so taller blocks cut that traffic.
         static const int w8 = getenv("AI_Q4X_PF_GU_WARPS") ? atoi(getenv("AI_Q4X_PF_GU_WARPS")) : 8;
+        // AI_Q4X_PF_GU_MMQ (default 1): gu_mmq_k, which decodes the weight tile once per 128 columns from raw rows
+        // prefetched under the previous superblock's mma; 0 = gu_q8ks_k. Both give the same bits. The 64 x 128 tile and
+        // the raw-row prefetch were chosen over smaller tiles and decoding straight from global memory.
+        static const int mmq = getenv("AI_Q4X_PF_GU_MMQ") ? atoi(getenv("AI_Q4X_PF_GU_MMQ")) : 1;
+        if (mmq != 0) {
+            switch (ty_gu) {
+                case GGML_TYPE_IQ2_XXS: launch_gu_mmq<GGML_TYPE_IQ2_XXS, 64, 128>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;
+                case GGML_TYPE_IQ2_XS:  launch_gu_mmq<GGML_TYPE_IQ2_XS, 64, 128>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;
+                case GGML_TYPE_IQ2_S:   launch_gu_mmq<GGML_TYPE_IQ2_S, 64, 128>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;
+                case GGML_TYPE_IQ3_XXS: launch_gu_mmq<GGML_TYPE_IQ3_XXS, 64, 128>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;
+                default:                launch_gu_mmq<GGML_TYPE_IQ3_S, 64, 128>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;
+            }
+            return true;
+        }
         if (w8 == 8) {
             switch (ty_gu) {
                 case GGML_TYPE_IQ2_XXS: launch_gu_q8ks<GGML_TYPE_IQ2_XXS, 4, 8>(st, up, gate, xqs, xd, plan, kWideRec, n_own, act, Ki, Fi, rbg, ebg, k); break;

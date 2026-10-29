@@ -3,7 +3,7 @@
 // Writes each request's tokens (the first token included, as ai-q4x-run --gen-out) so a served stream can be checked
 // against the CLI's.
 //
-//   ai-api-gen -m model.gguf --tokens-in p.i32 [-n 256] [--ctx 4096] [--slots N|-1] [--mtp-k K] [--requests R]
+//   ai-api-gen -m model.gguf --tokens-in p.i32[,q.i32,...] [-n 256] [--ctx 4096] [--slots N|-1] [--mtp-k K] [--requests R]
 //              [--chunk-feed C] [--stop a,b] [--gen-out prefix]   -> prefix.<r>.i32 per request
 #include "api/ai_engine.h"
 
@@ -44,10 +44,20 @@ int main(int argc, char ** argv) {
             }
         } else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
-    std::ifstream     tf(tokens_in, std::ios::binary);
-    std::vector<char> raw((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
-    std::vector<int32_t> prompt(raw.size() / 4);
-    memcpy(prompt.data(), raw.data(), prompt.size() * 4);
+    // --tokens-in a.i32[,b.i32,...]: request r prefills prompt r mod n (several first-seen prompts on one engine, e.g. a
+    // warm-up and then the timed ones, as a long-lived server sees them)
+    std::vector<std::vector<int32_t>> prompts;
+    for (size_t at = 0; at <= tokens_in.size();) {
+        size_t c = tokens_in.find(',', at);
+        if (c == std::string::npos) c = tokens_in.size();
+        std::ifstream     tf(tokens_in.substr(at, c - at), std::ios::binary);
+        std::vector<char> raw((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+        std::vector<int32_t> pr(raw.size() / 4);
+        memcpy(pr.data(), raw.data(), pr.size() * 4);
+        prompts.push_back(std::move(pr));
+        at = c + 1;
+    }
+    std::vector<int32_t> prompt = prompts.empty() ? std::vector<int32_t>() : prompts[0];
     if (model.empty() || prompt.empty()) { fprintf(stderr, "need -m and a non-empty --tokens-in\n"); return 2; }
     std::vector<int32_t> turn;
     if (!chat_turn.empty()) {
@@ -80,6 +90,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> ot((size_t) cap), os((size_t) cap);
     int rc_all = 0;
     for (int r = 0; r < requests; ++r) {
+        if (prompts.size() > 1) prompt = prompts[(size_t) r % prompts.size()];
         const auto tp    = std::chrono::steady_clock::now();
         int32_t    first = -1;
         int        rc    = AI_ENGINE_OK;

@@ -126,7 +126,8 @@ void Qwen4ExpRun::mtp_enable() {
 // One MTP layer pass over T rows: H f32 [N*hc, T], tokens toks[0..T), positions p0..p0+T-1 (= the head's K/V cells).
 // full = false: only the attention half (writes the K/V columns; the fill). full = true (T = 1): the whole layer and
 // the head; returns the argmax and leaves R2 in mtp_R2_.
-int32_t Qwen4ExpRun::mtp_layer(const Tensor & H, const int32_t * toks, int64_t p0, int64_t T, bool full, float * p_top) {
+int32_t Qwen4ExpRun::mtp_layer(const Tensor & H, const int32_t * toks, int64_t p0, int64_t T, bool full, float * p_top,
+                               bool dev_mask) {
     const Qwen4ExpSpec & s = prog_.spec();
     // the visible cells padded to whole FATTN_KQ_STRIDE (256) tiles, as the trunk's envelope F and llama.cpp's KV views
     // are: with an unpadded n_kv, ggml's FA reads past the mask row and drafts differ run to run
@@ -140,14 +141,22 @@ int32_t Qwen4ExpRun::mtp_layer(const Tensor & H, const int32_t * toks, int64_t p
 
     std::vector<int32_t>  pos4((size_t) (4 * T));
     std::vector<int64_t>  cells((size_t) T);
-    std::vector<uint16_t> mask((size_t) (n_kv * T));
-    mtp_ingress(p0, T, n_kv, pos4.data(), cells.data(), mask.data());
+    // dev_mask: the n_kv x T mask is written on the device (for the prompt fill's wide chunks, where a host build costs n_kv * T per call)
+    std::vector<uint16_t> mask(dev_mask ? 0 : (size_t) (n_kv * T));
+    mtp_ingress(p0, T, dev_mask ? 0 : n_kv, pos4.data(), cells.data(), mask.data());
     Tensor pos4_t  = dev_.ws_alloc(I32, 4 * T);
     Tensor cells_t = dev_.ws_alloc(I64, T);
     Tensor mask_t  = dev_.ws_alloc(F16, n_kv, T);
     dev_.upload(pos4_t, pos4.data(), 0, pos4.size() * 4);
     dev_.upload(cells_t, cells.data(), 0, cells.size() * 8);
-    dev_.upload(mask_t, mask.data(), 0, mask.size() * 2);
+    if (dev_mask) {
+        uint16_t * mp = (uint16_t *) mask_t.data;
+        void *     st = adapter::stream(dev_);
+        kern::q4x_causal_mask(st, mp, n_kv, T, p0);
+        kern::q4x_mtp_mask_col0(st, mp, n_kv, T, p0);
+    } else {
+        dev_.upload(mask_t, mask.data(), 0, mask.size() * 2);
+    }
     // every upload above is staged before the first kernel of this pass is queued (uploads are unordered against the
     // stream: staging after queued Calls could overwrite workspace a still-queued kernel reads)
     const Tensor lg = mtp_build(H, ids_t, pos4_t, cells_t, mask_t, T, n_kv, full);
@@ -446,7 +455,9 @@ std::vector<int32_t> Qwen4ExpRun::mtp_draft(int32_t pending, int n, float tau, s
     if (chain) {
         int32_t ct[kMtpChain];
         float   cp[kMtpChain];
+        q4x_rt_mark(0, adapter::stream(dev_));
         mtp_chain(pending, n_eff, ct, cp);
+        q4x_rt_mark(1, adapter::stream(dev_));
         double cum = 1.0;
         for (int i = 0; i < n_eff; ++i) {
             if (tau > 0 && i >= mtp_keep_ && cum * cp[i] < tau) break;

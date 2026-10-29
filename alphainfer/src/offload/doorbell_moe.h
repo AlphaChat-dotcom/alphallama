@@ -60,6 +60,11 @@ public:
     Tensor moe_bulk(int bank, const op::MoeWeights & w, const op::MoeParams & p, const Tensor & x);
 
     void after_round();
+    // Back to the initial residency (the profile fill), scores cleared, before a new request (needs no round in
+    // flight). The CPU computes missed experts with different rounding than the GPU, so with admission on, a
+    // request's output depends on which experts earlier requests left resident; after a reset it depends on the
+    // request alone. Only the slots that changed since the fill are copied again.
+    void reset_residency();
     std::string stats_line() const;
     void        reset_stats();
 
@@ -74,6 +79,7 @@ private:
         int    stage   = -1;                 // staging group (same types and row shapes)
         std::vector<int32_t> table_h;        // expert -> slot or -1
         std::vector<int32_t> owner;          // slot -> expert (-1 free / pending)
+        std::vector<int32_t> owner0;         // owner after the initial fill (reset_residency)
         std::vector<float>   score;          // expert -> decayed use count
         unsigned             last_seq = 0;   // the bell's seq at the previous after_round
     };
@@ -113,6 +119,7 @@ private:
     // stats (rounds seen by after_round)
     uint64_t n_cols_ = 0, n_miss_ = 0, n_admit_ = 0, n_publish_ = 0, n_bulk_cols_ = 0, n_bulk_miss_ = 0;
     uint64_t n_bulk_bytes_ = 0;
+    uint64_t n_resets_ = 0, n_restored_ = 0;
 };
 
 }  // namespace ai::offload

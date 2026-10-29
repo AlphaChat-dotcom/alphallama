@@ -132,6 +132,7 @@ int main(int argc, char ** argv) {
     CK(cudaMalloc(&ref, sizeof(float) * N * k * Tmax));
     for (int T : Ts) {
         const bool use_gu   = path == "gu";   // prefill's gate/up only (q4x_experts_wide_gu; AI_Q4X_PF_GU picks the kernel)
+        const bool use_dn   = path == "dn";   // prefill's down only (q4x_experts_wide_dn over one slice of T rows; AI_Q4X_PF_DN)
         const bool use_wide = path == "wide" || T > 8;
         if (!use_wide && !kern::q4x_experts_ok(tg, td, K, F, N, k, T)) { printf("T %d: grouped kernel declines\n", T); continue; }
         std::vector<std::vector<int32_t>> ids(NDRAW), plans(NDRAW);
@@ -163,6 +164,13 @@ int main(int argc, char ** argv) {
             CK(cudaMemcpy(plan_d + (size_t) d * plan_stride, plans[d].data(), plans[d].size() * 4, cudaMemcpyHostToDevice));
         }
         auto run = [&](int d) {
+            if (use_dn) {
+                if (!kern::q4x_experts_wide_dn(st, tg, up, gate, (int64_t) rbg, (int64_t) ebg, td, down, (int64_t) rbd, (int64_t) ebd,
+                                               plan_d + (size_t) d * plan_stride, nown[d], K, F, N, k, T, scr, out, 0)) {
+                    fprintf(stderr, "wide down declined\n"); exit(1);
+                }
+                return;
+            }
             if (use_gu) {
                 if (!kern::q4x_experts_wide_gu(st, tg, up, gate, (int64_t) rbg, (int64_t) ebg, td, down, (int64_t) rbd,
                                                (int64_t) ebd, x, K, true, plan_d + (size_t) d * plan_stride, nown[d], K, F, N,
@@ -206,6 +214,11 @@ int main(int argc, char ** argv) {
                    T, fam == 1 ? "tc" : fam == 2 ? "smem" : "dp4a", "dp4a", r2 > 0 ? std::sqrt(e2 / r2) : 0.0, mx, rms > 0 ? mx / rms : 0.0, rms,
                    nan, nan_a, nan_b, 100.0 * same / a.size());
         }
+        if (use_dn) {   // the down kernel reads the quantised SwiGLU activations: gate/up + quantise once to fill the scratch
+            kern::q4x_experts_wide_gu(st, tg, up, gate, (int64_t) rbg, (int64_t) ebg, td, down, (int64_t) rbd, (int64_t) ebd, x, K,
+                                      true, plan_d, nown[0], K, F, N, k, T, scr);
+            kern::q4x_experts_wide_qact(st, K, F, k, T, scr);
+        }
         for (int i = 0; i < 20; ++i) run(i % NDRAW);
         CK(cudaStreamSynchronize(st));
         CK(cudaEventRecord(e0, st));
@@ -217,6 +230,11 @@ int main(int argc, char ** argv) {
         CK(cudaGetLastError());
         const double us = 1e3 * ms / reps, dist = dist_sum / NDRAW;
         const double gbs = dist * per_exp / (us * 1e-6) / 1e9;
+        if (use_dn) {   // int8 tensor-core ops of down over every routed column
+            const double tops = 2.0 * (double) F * (double) N * (double) (k * T) / (us * 1e-6) / 1e12;
+            printf("T %5d | down | %6.1f experts | %9.1f us/call | %6.1f TOPS (int8 MACs x 2)\n", T, dist, us, tops);
+            continue;
+        }
         if (use_gu) {   // int8 tensor-core ops of gate + up over every routed column
             const double tops = 2.0 * 2.0 * (double) K * (double) F * (double) (k * T) / (us * 1e-6) / 1e12;
             printf("T %5d | gate/up | %6.1f experts | %9.1f us/call | %6.1f TOPS (int8 MACs x 2)\n", T, dist, us, tops);

@@ -50,7 +50,35 @@ __global__ static void q4x_qsa_inputs_k(const int32_t * pos, long long T, long l
     }
 }
 
+// QSA pooled cache: the round's dirty blocks: b0 = pos[0] / r (the first block a write of this round touches) up to the
+// last complete block n_full - 1, at most M of them (M = T / r + 2 covers any round). Entry j: block b0 + j when it is
+// complete, else the dump row (rows - 1) with member cell 0 -- a fixed shape, so a captured graph stays valid.
+__global__ static void q4x_qsa_dirty_k(const int32_t * pos, long long T, long long r, long long M, long long rows,
+                                       int32_t * dcells, int64_t * drows, int32_t * dpos) {
+    const long long n_full = ((long long) pos[T - 1] + 1) / r;
+    const long long b0     = (long long) pos[0] / r;
+    const long long i      = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M * r) {
+        const long long b = b0 + i / r;
+        dcells[i] = (int32_t) (b < n_full ? b * r + i % r : 0);
+    }
+    if (i < M) {
+        const long long b = b0 + i;
+        const bool      ok = b < n_full;
+        drows[i] = ok ? b : rows - 1;
+        for (int s = 0; s < 4; ++s) dpos[s * M + i] = (int32_t) (ok ? b * r : 0);
+    }
+}
+
 namespace ai::kern {
+
+void q4x_qsa_dirty(void * stream, const int32_t * pos, int64_t T, int64_t r, int64_t M, int64_t rows, int32_t * dcells,
+                   int64_t * drows, int32_t * dpos) {
+    if (T <= 0 || M <= 0) return;
+    q4x_qsa_dirty_k<<<q4x_blocks_for(M * r, 256), 256, 0, (cudaStream_t) stream>>>(pos, (long long) T, (long long) r,
+                                                                                   (long long) M, (long long) rows, dcells,
+                                                                                   drows, dpos);
+}
 
 void q4x_qsa_inputs(void * stream, const int32_t * pos, int64_t T, int64_t n_kv, int64_t r, int64_t n_blocks,
                     int32_t * cell_blk, int32_t * blk_cells, int32_t * blk_pos, float * bias) {

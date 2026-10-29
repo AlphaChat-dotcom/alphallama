@@ -202,6 +202,11 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
     env_default("AI_Q4X_RAM_TIER_GB", "auto");
     env_default("AI_Q4X_ADMIT", "64");
     if (!getenv("AI_Q4X_PROFILE") && getenv("ALPHA_DRE_PROFILE")) env_default("AI_Q4X_PROFILE", getenv("ALPHA_DRE_PROFILE"));
+    // [exact = no MTP] the short-prompt CPU share by a FIXED rule (the CPU takes every expert with <= 2 of the batch's
+    // columns) instead of the online timing cost model, whose split -- and so which experts the CPU rounds -- changed from
+    // start to start: 4080 2026-10-28, 4 prompts x 4 fresh starts, cost model 2/4 prompts varied, fixed rule 4/4 identical
+    // (share off also 4/4, but +0.4 s TTFT on a 34-token prompt vs ~+0.1 s for the rule). Fast (MTP) keeps the cost model.
+    if (c.mtp_k <= 0) env_default("AI_Q4X_PF_SHARE_CMAX", "2");
 
     Impl & m = *p_;
     m.ctx      = c.ctx > 0 ? c.ctx : 8192;
@@ -289,6 +294,7 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
     fprintf(stderr, "[ai-api] q4x engine: 1 stream, ctx %lld, %d expert slots, workspace %zu MiB, %s; FAST decode "
                     "(not token-identical to plain decode)\n", (long long) m.ctx, slots, ws,
             !m.mtp ? "plain decode" : m.copy_min > 0 ? "MTP + suffix copy" : "MTP drafts");
+    m.dev.mem_report("q4x engine created");
 }
 
 Q4xServe::~Q4xServe() = default;

@@ -204,6 +204,9 @@ void   q4x_draft_next(void * stream, const int32_t * idx, const float * p, const
                       int32_t * out_tok, float * out_p);
 // Prefill: one sub-chunk's causal mask f16 [n_kv, T]: m[i * n_kv + j] = j <= p0 + i ? 0 : -inf (q4x_route.cu)
 void   q4x_causal_mask(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int64_t p0);
+void   q4x_mtp_mask_col0(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int64_t p0);   // MTP: column 0 masked past p 0
+// copy n i32 from (mapped pinned host) src to device dst with a kernel on `stream` (not the copy engine)
+void   q4x_copy_i32(void * stream, const int32_t * src, int32_t * dst, int64_t n);
 bool   q4x_gemv16(void * stream, const void * w, bool w_is_bf16, const float * x, int K, int N, int T, float * out);
 // Dense small-M GEMV on fp16 tensor cores, fp16 activations (src/kernels/q4x_dense.cu): out[t * ldo + n] =
 // sum_k W[n][k] x[t * x_stride + k] for q6_K / q5_K / q4_K / iq4_xs / iq3_s rows, T <= 32; flat in T per 8 columns.
@@ -457,5 +460,8 @@ bool    topk_rows(void * stream, const float * x, int64_t V, int64_t row_stride,
 // blk_cells [r*n_blocks], blk_pos [4*n_blocks], bias f32 [n_blocks, T], from pos (pos4 section 0, device).
 void    q4x_qsa_inputs(void * stream, const int32_t * pos, int64_t T, int64_t n_kv, int64_t r, int64_t n_blocks,
                        int32_t * cell_blk, int32_t * blk_cells, int32_t * blk_pos, float * bias);
+// the QSA pooled cache's dirty blocks of a round (kernels/q4x_qsa.cu): dcells i32 [r * M], drows i64 [M], dpos i32 [4 * M]
+void    q4x_qsa_dirty(void * stream, const int32_t * pos, int64_t T, int64_t r, int64_t M, int64_t rows, int32_t * dcells,
+                      int64_t * drows, int32_t * dpos);
 
 }  // namespace ai::kern

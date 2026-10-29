@@ -177,7 +177,7 @@ set_target_properties(ai-doorbell-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${C
 option(AI_Q4X_FORWARD "build the qwen4exp runtime (src/models/qwen4exp_run.cpp + src/ops/q4x_ops.cpp)" ON)
 if (AI_Q4X_FORWARD)
     target_sources(aicore PRIVATE src/models/qwen4exp_run.cpp src/models/qwen4exp_mtp.cpp src/models/qwen4exp_prefill.cpp src/ops/q4x_ops.cpp src/kernels/q4x_qsa.cu src/kernels/q4x_route.cu src/kernels/q4x_experts.cu src/kernels/q4x_dense.cu
-                                  src/kernels/q4x_hc.cu src/kernels/q4x_hc_tc.cu src/kernels/q4x_gdn_conv.cu
+                                  src/kernels/q4x_hc.cu src/kernels/q4x_hc_tc.cu src/kernels/q4x_gdn_conv.cu src/kernels/q4x_gdn_scan.cu src/kernels/q4x_fold.cu
                                   src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/cpu_topo.cpp src/kernels/offload.cu
                                   src/api/q4x_serve.cpp)
     # the C API serves qwen4exp models through api/q4x_serve.cpp
@@ -185,8 +185,10 @@ if (AI_Q4X_FORWARD)
     # decode-once GSQ CPU kernels: AVX2 + FMA + F16C (no -march=native, so the binary stays portable)
     # q4x_experts.cu runs ggml's vec_dot code and op_silu: build it with the same math flags as ggml-cuda
     set_source_files_properties(src/kernels/q4x_experts.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
-    # q4x_hc.cu / q4x_gdn_conv.cu reproduce ggml's hc-fuse.cu and ssm_conv + SiLU (built -use_fast_math) bit for bit
-    set_source_files_properties(src/kernels/q4x_hc.cu src/kernels/q4x_gdn_conv.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
+    # q4x_hc.cu / q4x_gdn_conv.cu / q4x_gdn_scan.cu reproduce ggml's hc-fuse.cu and ssm_conv + SiLU (built -use_fast_math) bit for bit
+    set_source_files_properties(src/kernels/q4x_hc.cu src/kernels/q4x_gdn_conv.cu src/kernels/q4x_gdn_scan.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
+    # q4x_fold.cu reproduces the fork's gdn_prep_kernel + gated_delta_net_cuda (built -use_fast_math) bit for bit
+    set_source_files_properties(src/kernels/q4x_fold.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
     set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     target_link_libraries(aicore PUBLIC ${AI_GGML_CPU})
     add_executable(ai-q4x-run tools/q4x_run.cpp)

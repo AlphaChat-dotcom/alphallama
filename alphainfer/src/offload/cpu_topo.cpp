@@ -72,6 +72,27 @@ int confine_threads_off(const std::vector<int> & pool) {
 #endif
 }
 
+int confine_threads_onto(const std::vector<int> & onto) {
+#if defined(__linux__)
+    if (onto.empty()) return 0;
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    for (int c : onto) CPU_SET(c, &cs);
+    int n = 0;
+    if (DIR * d = opendir("/proc/self/task")) {
+        while (dirent * e = readdir(d)) {
+            const int tid = atoi(e->d_name);
+            if (tid > 0 && sched_setaffinity(tid, sizeof(cs), &cs) == 0) ++n;
+        }
+        closedir(d);
+    }
+    return n;
+#else
+    (void) onto;
+    return 0;
+#endif
+}
+
 CpuPlan plan_cpus(int cap) {
     CpuPlan plan;
 #if defined(__linux__)
@@ -99,9 +120,26 @@ CpuPlan plan_cpus(int cap) {
     const Cpu &  first   = cpus.front();
     const bool   multi   = l3s.size() > 1;
     for (const auto & c : cpus) if (c.core == first.core) plan.launch.push_back(c.id);
+    // [AI_Q4X_RESERVE_CORES] host cores for everything but the launch thread and the pool: from the launch L3 when the
+    // pool skips it (multi-L3), else the next physical cores, which then leave the pool
+    const int reserve = getenv("AI_Q4X_RESERVE_CORES") ? std::max(0, atoi(getenv("AI_Q4X_RESERVE_CORES"))) : 1;
+    std::set<int> host_cores;
+    for (const auto & c : cpus) {
+        if ((int) host_cores.size() >= reserve) break;
+        if (c.core == first.core || host_cores.count(c.core)) continue;
+        if (multi && c.l3 != first.l3) continue;
+        host_cores.insert(c.core);
+    }
+    if (multi && (int) host_cores.size() < reserve) {   // the launch L3 is one core: take the next ones anywhere
+        for (const auto & c : cpus) {
+            if ((int) host_cores.size() >= reserve) break;
+            if (c.core != first.core) host_cores.insert(c.core);
+        }
+    }
+    for (const auto & c : cpus) if (host_cores.count(c.core)) plan.host.push_back(c.id);
     std::vector<Cpu> cand;
     for (const auto & c : cpus) {
-        if (c.core == first.core) continue;
+        if (c.core == first.core || host_cores.count(c.core)) continue;
         if (multi && c.l3 == first.l3) continue;
         cand.push_back(c);
     }
@@ -123,9 +161,10 @@ CpuPlan plan_cpus(int cap) {
     for (size_t i = 0; i < ordered.size() && (int) plan.pool.size() < cap; ++i) plan.pool.push_back(ordered[i].id);
     for (const auto & c : cand) plan.n_phys += c.sib == 0 ? 1 : 0;
     char buf[256];
-    snprintf(buf, sizeof buf, "%zu allowed cpus, %zu L3 domain(s): launch core %s, %s excluded, pool %zu of %zu candidates (cap %d)",
+    snprintf(buf, sizeof buf, "%zu allowed cpus, %zu L3 domain(s): launch core %s, %s excluded, host threads on %s, pool %zu of %zu "
+                              "candidates (cap %d)",
              cpus.size(), l3s.size(), cpu_list_str(plan.launch).c_str(), multi ? "its L3" : "only its core",
-             plan.pool.size(), cand.size(), cap);
+             plan.host.empty() ? "the launch core" : cpu_list_str(plan.host).c_str(), plan.pool.size(), cand.size(), cap);
     plan.why = buf;
 #else
     (void) cap;

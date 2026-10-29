@@ -135,7 +135,6 @@ void MissPool::compute_share(int part, int n_parts) {
     static const bool k_gsq = [] { const char * e = getenv("AI_GSQ_CPU"); return !e || atoi(e) != 0; }();
     const int           l = job_layer_;
     const ExpertBanks & L = layers_[(size_t) l];
-    const Bell &        b = bells_[(size_t) l];
     const int64_t K = L.gate.ne[0], F = L.gate.ne[1];
     const auto *  cg = ggml_get_type_traits_cpu((ggml_type) L.gate.type);
     const auto *  cd = ggml_get_type_traits_cpu((ggml_type) L.down.type);
@@ -168,14 +167,14 @@ void MissPool::compute_share(int part, int n_parts) {
         ++tl_items;
         const Group & gr = groups_[(size_t) (it / (int) per_grp)];
         const int64_t ch = it % per_grp;
-        const int32_t e  = b.miss[cols_[(size_t) gr.c0]];
+        const int32_t e  = jmiss_[cols_[(size_t) gr.c0]];
         if (ph == 0) {
             const char *  G  = (const char *) L.gate.data + (size_t) e * L.gate.nb[2];
             const char *  U  = (const char *) L.up.data + (size_t) e * L.up.nb[2];
             const int64_t r0 = ch * kGuRows, r1 = std::min(F, (ch + 1) * kGuRows);
             if (k_gsq && gsq_dot_preferred(L.gate.type, gr.n) && gsq_dot_preferred(L.up.type, gr.n)) {
                 const void * y[4];
-                for (int i = 0; i < gr.n; ++i) y[i] = xq_.data() + (size_t) (cols_[(size_t) (gr.c0 + i)] / k_) * xq_row;
+                for (int i = 0; i < gr.n; ++i) y[i] = xq_.data() + (size_t) jtok(cols_[(size_t) (gr.c0 + i)]) * xq_row;
                 // the group's columns are consecutive in cols_, so their h rows are 2*F_ apart
                 float * gu = h_.data() + (size_t) gr.c0 * 2 * F_;
                 gsq_dot(L.gate.type, (int) K, G, rg, r0, r1, y, gr.n, gu, 2 * F_);
@@ -183,7 +182,7 @@ void MissPool::compute_share(int part, int n_parts) {
             } else {
                 for (int i = 0; i < gr.n; ++i) {
                     const int    ci = gr.c0 + i;
-                    const char * xq = xq_.data() + (size_t) (cols_[(size_t) ci] / k_) * xq_row;
+                    const char * xq = xq_.data() + (size_t) jtok(cols_[(size_t) ci]) * xq_row;
                     float *      gu = h_.data() + (size_t) ci * 2 * F_;
                     for (int64_t r = r0; r < r1; ++r) {
                         cg->vec_dot((int) K, &gu[r], 0, G + (size_t) r * rg, 0, xq, 0, 1);
@@ -204,14 +203,14 @@ void MissPool::compute_share(int part, int n_parts) {
                 float tmp[4 * kDownRows];   // the columns' y rows are not evenly spaced: compute, then scatter
                 gsq_dot(L.down.type, (int) F, D + (size_t) r0 * rd, rd, 0, r1 - r0, y, gr.n, tmp, kDownRows);
                 for (int i = 0; i < gr.n; ++i) {
-                    memcpy(b.y + (size_t) cols_[(size_t) (gr.c0 + i)] * N_ + r0, tmp + (size_t) i * kDownRows,
+                    memcpy(jy_ + (size_t) cols_[(size_t) (gr.c0 + i)] * N_ + r0, tmp + (size_t) i * kDownRows,
                            (size_t) (r1 - r0) * sizeof(float));
                 }
             } else {
                 for (int i = 0; i < gr.n; ++i) {
                     const int    ci = gr.c0 + i;
                     const char * hq = hq_.data() + (size_t) ci * hq_row;
-                    float *      y  = b.y + (size_t) cols_[(size_t) ci] * N_;
+                    float *      y  = jy_ + (size_t) cols_[(size_t) ci] * N_;
                     for (int64_t r = r0; r < r1; ++r) {
                         cd->vec_dot((int) F, &y[r], 0, D + (size_t) r * rd, 0, hq, 0, 1);
                     }
@@ -265,7 +264,60 @@ void MissPool::poll_loop() {
             for (auto & w : hs_wstart_) hs_lag = std::max(hs_lag, w.load(std::memory_order_relaxed) - pub);
         }
     };
+    // Prefill CPU share: a host job: the columns the caller lists, all computed (no fast-mode tail rules: the prompt
+    // path stays exact), outputs one compact row per listed column, then one weighted sum per token into hj_yp_
+    auto serve_host_job = [&]() {
+        const auto          hj_t0 = std::chrono::steady_clock::now();
+        const int           l  = hj_layer_, nc = hj_ncols_, T = hj_T_;
+        const ExpertBanks & L  = layers_[(size_t) l];
+        const int64_t       K  = L.gate.ne[0], F = L.gate.ne[1];
+        const auto *        cg = ggml_get_type_traits_cpu((ggml_type) L.gate.type);
+        const auto *        cd = ggml_get_type_traits_cpu((ggml_type) L.down.type);
+        const auto *        tx = ggml_get_type_traits_cpu(cg->vec_dot_type);
+        const size_t        xq_row = ggml_row_size(cg->vec_dot_type, K), hq_row = ggml_row_size(cd->vec_dot_type, F);
+        (void) F;
+        if (xq_.size() < (size_t) T * xq_row + 1024) xq_.resize((size_t) T * xq_row + 1024);
+        if (h_.size() < (size_t) nc * 2 * (size_t) F_) h_.resize((size_t) nc * 2 * (size_t) F_);
+        if (hq_.size() < (size_t) nc * hq_row + 1024) hq_.resize((size_t) nc * hq_row + 1024);
+        if (prep_.size() < (size_t) nc * prep_row_ + 64) prep_.resize((size_t) nc * prep_row_ + 64);
+        if (hy_.size() < (size_t) nc * (size_t) N_) hy_.resize((size_t) nc * (size_t) N_);
+        hneed_.assign((size_t) T, 0);
+        for (int i = 0; i < nc; ++i) hneed_[(size_t) hj_tok_[i]] = 1;
+        for (int t = 0; t < T; ++t)
+            if (hneed_[(size_t) t]) tx->from_float(hj_x_ + (size_t) t * N_, xq_.data() + (size_t) t * xq_row, K);
+        cols_.resize((size_t) nc);
+        for (int i = 0; i < nc; ++i) cols_[(size_t) i] = i;
+        std::stable_sort(cols_.begin(), cols_.end(), [&](int x, int y) { return hj_ids_[x] < hj_ids_[y]; });
+        groups_.clear();
+        for (int c = 0; c < nc;) {
+            int n = 1;
+            while (c + n < nc && n < 4 && hj_ids_[cols_[(size_t) (c + n)]] == hj_ids_[cols_[(size_t) c]]) ++n;
+            groups_.push_back({ c, n });
+            c += n;
+        }
+        jmiss_ = hj_ids_; jtok_ = hj_tok_; jy_ = hy_.data();
+        const int ng = (int) groups_.size();
+        if (nc > 0) {
+            run_phase(l, 0, ng * (int) ((L.gate.ne[1] + kGuRows - 1) / kGuRows));
+            run_phase(l, 2, nc);
+            run_phase(l, 1, ng * (int) ((N_ + kDownRows - 1) / kDownRows));
+        }
+        memset(hj_yp_, 0, (size_t) T * (size_t) N_ * sizeof(float));
+        for (int i = 0; i < nc; ++i) {   // listed order (ascending t * k + j from the caller): a token's columns in slot order
+            float *       yp = hj_yp_ + (size_t) hj_tok_[i] * N_;
+            const float * yc = hy_.data() + (size_t) i * N_;
+            const float   wc = hj_w_[i];
+            for (int64_t n = 0; n < N_; ++n) yp[n] += wc * yc[n];
+        }
+        stats_.misses.fetch_add((unsigned long long) nc, std::memory_order_relaxed);
+        hj_ns_ = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - hj_t0).count();
+    };
     while (!stop_.load(std::memory_order_relaxed)) {
+        if (hj_pending_.load(std::memory_order_acquire)) {
+            serve_host_job();
+            hj_pending_.store(false, std::memory_order_relaxed);
+            hj_done_.store(true, std::memory_order_release);
+        }
         bool any = false;
         for (size_t l = 0; l < layers_.size(); ++l) {
             const Bell &   b = bells_[l];
@@ -375,6 +427,7 @@ void MissPool::poll_loop() {
                     return (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
                 };
                 const auto p0 = clk::now();
+                jmiss_ = b.miss; jy_ = b.y; jtok_ = nullptr;
                 for (int t = 0; t < T; ++t) tx->from_float(b.x + (size_t) t * N_, xq_.data() + (size_t) t * xq_row, K);
                 const int nc = (int) cols_.size();
                 const int ng = (int) groups_.size();
@@ -456,6 +509,17 @@ void MissPool::poll_loop() {
         }
         if (!any) cpu_relax();
     }
+}
+
+void MissPool::host_job_begin(int layer, const float * x, int T, const int32_t * tok, const int32_t * ids, const float * w,
+                              int ncols, float * yp) {
+    hj_layer_ = layer; hj_x_ = x; hj_T_ = T; hj_tok_ = tok; hj_ids_ = ids; hj_w_ = w; hj_ncols_ = ncols; hj_yp_ = yp;
+    hj_done_.store(false, std::memory_order_relaxed);
+    hj_pending_.store(true, std::memory_order_release);
+}
+
+void MissPool::host_job_wait() {
+    while (!hj_done_.load(std::memory_order_acquire)) cpu_relax();
 }
 
 // AI_Q4X_HANDOFF_STATS: distributions over the rings since the last reset_stats (decode only when the caller resets

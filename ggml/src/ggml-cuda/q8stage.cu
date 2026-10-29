@@ -4,7 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#define ALPHA_Q8_STAGE_MAX 16
+// A round registers one entry per producer (the 35B's decode round alone overflows 16); entries are ~64 bytes
+#define ALPHA_Q8_STAGE_MAX 256
 
 static alpha_q8_staged g_stage[ALPHA_Q8_STAGE_MAX];
 static int             g_stage_n = 0;
@@ -48,19 +49,24 @@ void ggml_cuda_q8_stage_clear() {
 }
 
 void ggml_cuda_q8_stage_put(const alpha_q8_staged & e) {
-    if (g_stage_n >= ALPHA_Q8_STAGE_MAX || e.src1_data == nullptr || e.q8 == nullptr) {
+    if (e.src1_data == nullptr || e.q8 == nullptr) {
         return;
     }
     // An allocator that reuses addresses (ggml's graph allocator across layers, a bump arena reset per
     // layer) will hand a later activation the same pointer as an earlier one, with identical geometry
     // because every layer has the same shapes. A stale entry would then validate perfectly and the
     // consumer would read the previous layer's activation. So the newest registration for an address
-    // always replaces the older one; never keep both.
+    // always replaces the older one; never keep both. The older entry goes first, before the capacity
+    // check: on a full table the new copy is not staged (its consumers quantise for themselves), but the
+    // stale one must not survive either.
     for (int i = 0; i < g_stage_n; ++i) {
         if (g_stage[i].src1_data == e.src1_data) {
             g_stage[i] = g_stage[--g_stage_n];
             break;
         }
+    }
+    if (g_stage_n >= ALPHA_Q8_STAGE_MAX) {
+        return;
     }
     g_stage[g_stage_n++] = e;
     g_staged++;

@@ -31,6 +31,9 @@ namespace ai {
 
 static constexpr int64_t kDoorbellT = 16;  // max rows per doorbell window (decode / verify widths)
 
+// [AI_Q4X_ROUND_TIMING] GPU event marks of the decode cycle (qwen4exp_run.cpp): 0/1 around the MTP chain
+void q4x_rt_mark(int which, void * stream);
+
 class Qwen4ExpRun {
 public:
     // max_ctx cells of attention KV (one stream); expert_slots per MoE layer in the v1 pool (>= n_expert_used).
@@ -94,7 +97,8 @@ private:
     void   dump(const char * name, int il, const Tensor & t);
     void   keep_record(int il, op::GdnRecord * gr, const Tensor * ple_padded);   // copy a layer's record out of the scope
     void    mtp_flush();                                   // run the pending head-K/V fill (after the caller read logits)
-    int32_t mtp_layer(const Tensor & H, const int32_t * toks, int64_t p0, int64_t T, bool full, float * p_top = nullptr);
+    int32_t mtp_layer(const Tensor & H, const int32_t * toks, int64_t p0, int64_t T, bool full, float * p_top = nullptr,
+                              bool dev_mask = false);
     void    mtp_ingress(int64_t p0, int64_t T, int64_t n_kv, int32_t * pos4, int64_t * cells, uint16_t * mask) const;
     bool    mtp_mapped() const;
     Tensor  mtp_build(const Tensor & H, const Tensor & ids_t, const Tensor & pos4_t, const Tensor & cells_t,
@@ -125,6 +129,28 @@ private:
     std::vector<op::GdnRecord> grec_[kDoorbellT + 1];
     std::vector<Tensor>        prec_[kDoorbellT + 1];
     std::vector<size_t>        rec_off_;         // per layer: offset of its record area in rec_buf_
+    // [AI_Q4X_FOLD_BATCH] per verify width T: every layer's fold as device tables (kern::FoldGdn / FoldCopy), built on
+    // the first commit of that width; state 1 = usable, -1 = a layer the batch does not take (per-layer path)
+    bool fold_batch_commit(int64_t m1);
+    int     fold_buf_ = -1;
+    char *  fold_base_ = nullptr;
+    float * fold_scr_ = nullptr;
+    int     fold_state_[kDoorbellT + 1] = {};
+    int     fold_ng_[kDoorbellT + 1] = {}, fold_nc_[kDoorbellT + 1] = {};
+    size_t  fold_off_[kDoorbellT + 1] = {};
+    // [AI_Q4X_FOLD_SIDE] the batched fold on its own stream, overlapping the next MTP draft chain (which reads no GDN /
+    // PLE state); everything that next touches that state joins it first (fold_join: the device waits; host = true:
+    // the host waits too, for host reads / uploads of the state)
+    void   fold_join(bool host = false);
+    // [AI_Q4X_RESERVE_CORES] the launch core goes to the thread that decodes (first round / chunk / prefill call of a
+    // new thread), the other host threads to host_cpus_
+    void                 pin_launch_thread();
+    std::vector<int>     launch_cpus_, host_cpus_;
+    std::thread::id      pinned_thread_{};
+    void * fold_stream_ = nullptr;
+    void * fold_ev_fork_ = nullptr;
+    void * fold_ev_join_ = nullptr;
+    bool   fold_pending_ = false;
 
     Qwen4Exp &   prog_;
     Device &     dev_;
@@ -201,18 +227,35 @@ private:
     int64_t              pf_S_ = 0, pf_sub_ = 0;
     size_t               pf_off_R_ = 0, pf_off_ple_ = 0, pf_off_ids_ = 0, pf_off_pos4_ = 0, pf_off_cell_ = 0, pf_off_mask_ = 0;
     std::vector<int32_t> pf_slot_of_;
-    uint64_t             pf_streamed_ = 0;
+    // AI_Q4X_PF_SHARE: the CPU share's cost model in seconds (A per CPU decode pass, G0 + C per copied expert on the
+    // GPU), and timing events around the last shared batch's GPU part (read at the next batch)
+    double               pf_share_A_ = 5e-5, pf_share_G0_ = -1.0, pf_share_C_ = 0.0;
+    int                  pf_share_ngpu_ = 0, pf_share_il_ = 0;
+    std::vector<double>  pf_share_Al_, pf_share_G0l_;   // per layer (-1 = no sample yet)
+    bool                 pf_share_pending_ = false;
+    void *               pf_ev_s0_ = nullptr, * pf_ev_s1_ = nullptr;
+    uint64_t             pf_streamed_ = 0, pf_shared_cols_ = 0;   // expert copies streamed / columns the CPU share took
     // AI_Q4X_PF_STREAM: every non-resident expert of layer l+1 copied on a copy stream into the second scratch bank
     // while layer l computes (double-buffered; buffer il % 2 holds layer il)
     int                  pf_scr2_ = -1;
     bool                 pf_stream_on_ = false, pf_stream_now_ = false;   // available / used for this super-chunk
-    void                 pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd) const;
+    void                 pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd, int n = 0) const;
+    // AI_Q4X_PF_SPARE: two spare buffers of pf_spare_P_ experts (when a second full scratch does not fit)
+    int                  pf_spare_[2] = { -1, -1 }, pf_spare_P_ = 0, pf_spare_layer_[2] = { -1, -1 };
+    void *               pf_ev_spfree_[3] = { nullptr, nullptr, nullptr };
+    std::vector<int32_t> pf_spare_of_;
+    void                 pf_stream_part(int il, int part);
     void *               pf_cstream_ = nullptr;
     void *               pf_ev_ready_[2] = { nullptr, nullptr }, * pf_ev_free_[2] = { nullptr, nullptr };
     int                  pf_buf_layer_[2] = { -1, -1 };   // the layer each scratch buffer holds (or is being filled with)
     void                 pf_stream_layer(int il);         // queue layer il's non-resident experts into its buffer
     void                 pf_layer_begin(int il);          // the copies to queue at the start of layer il
     Tensor               moe_prefill_big(int il, const Tensor & fm, int64_t slice);   // AI_Q4X_PF_MOE_BIG
+    // AI_Q4X_PF_ROUTE_OVERLAP: the routing read-back on its own stream into pinned memory while the shared expert runs;
+    // the owner plans go up as ordered async copies from a pinned staging buffer
+    void *               pf_rstream_ = nullptr, * pf_ev_route_ = nullptr;
+    int32_t *            pf_sel_pin_ = nullptr, * pf_plan_pin_ = nullptr, * pf_plan_dev_ = nullptr;   // plan staging: mapped
+    size_t               pf_sel_cap_ = 0, pf_plan_cap_ = 0;
     std::vector<std::vector<int32_t>> pf_nonres_;          // per layer: the non-resident experts, in scratch order
     std::unique_ptr<offload::MissPool>      miss_;
     Tensor                                  win_base_;   // u32 [1] device: the window sequence base

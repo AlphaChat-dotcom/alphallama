@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 #include "kernels/kernels.h"
+#include "kernels/q4x_fold.h"
 #include "ops/adapter.h"
 
 #include <cuda_runtime.h>
@@ -25,11 +26,53 @@ struct RoundTiming {
     bool   on = getenv("AI_Q4X_ROUND_TIMING") && atoi(getenv("AI_Q4X_ROUND_TIMING")) != 0;
     double admit = 0, flush = 0, sync = 0, ple = 0, upload = 0, launch = 0, kick = 0;
     long   n = 0;
+    // GPU side, from events (q4x_rt_mark): per cycle c = (draft c, verify c), read at round c + 1's sync. Marks 0/1 bracket
+    // the MTP chain, 2/3 the verify launch; parity c & 1 holds cycle c's events.
+    cudaEvent_t ev[2][4] = {};
+    bool        drafted[2] = {}, v_ok[2] = {};
+    long        cyc = 0, nv = 0, nd = 0, ni = 0;
+    double      vg = 0, dg = 0, d2v = 0, idle = 0;
+    // the commit (state folds) after verify c, bracketed by its own pair; read at the same sync (it completed before it)
+    cudaEvent_t cev[2] = {};
+    bool        c_ok = false;
+    long        nc = 0;
+    double      cg = 0, ch = 0;
+    void cmark(int which, void * stream) {
+        if (!cev[which]) cudaEventCreate(&cev[which]);
+        cudaEventRecord(cev[which], (cudaStream_t) stream);
+        if (which == 1) c_ok = true;
+    }
+    void mark(int which, void * stream) {
+        const int p = (int) (cyc & 1);
+        if (!ev[p][which]) cudaEventCreate(&ev[p][which]);
+        cudaEventRecord(ev[p][which], (cudaStream_t) stream);
+        if (which == 0) drafted[p] = true;
+        if (which == 3) { v_ok[p] = true; ++cyc; drafted[cyc & 1] = false; }
+    }
+    void gpu_eval() {   // all queued work is complete (called right after a device synchronize)
+        if (cyc < 1) return;
+        const int p = (int) ((cyc - 1) & 1), q = (int) (cyc & 1);
+        auto el = [](cudaEvent_t a, cudaEvent_t b) { float ms = 0; return cudaEventElapsedTime(&ms, a, b) == cudaSuccess ? (double) ms : -1.0; };
+        const double v = el(ev[p][2], ev[p][3]);
+        if (v < 0) { (void) cudaGetLastError(); return; }
+        vg += v; ++nv;
+        double d = 0;
+        if (drafted[p]) { d = el(ev[p][0], ev[p][1]); dg += d; d2v += el(ev[p][1], ev[p][2]); ++nd; }
+        if (cyc >= 2 && v_ok[q]) { const double span = el(ev[q][3], ev[p][3]); if (span > 0) { idle += span - v - d; ++ni; } }
+        if (c_ok) { const double c = el(cev[0], cev[1]); if (c >= 0) { cg += c; ++nc; } c_ok = false; }
+        (void) cudaGetLastError();
+    }
     ~RoundTiming() {
         if (on && n > 0)
             fprintf(stderr, "[q4x-round-timing] %ld rounds, host ms/round: admit %.3f | mtp fill %.3f | sync %.3f | ingress+mask %.3f | "
                             "ple rows %.3f | launch %.3f | admit kick %.3f%c", n, admit / n, flush / n, sync / n, upload / n, ple / n,
                     launch / n, kick / n, 10);
+        if (on && nv > 0)
+            fprintf(stderr, "[q4x-round-timing] GPU ms per cycle (events): verify %.3f (%ld) | draft %.3f (%ld) | draft end -> verify "
+                            "start %.3f | cycle idle (span - verify - draft) %.3f (%ld)%c", vg / nv, nv, nd ? dg / nd : 0.0, nd,
+                    nd ? d2v / nd : 0.0, ni ? idle / ni : 0.0, ni, 10);
+        if (on && nc > 0)
+            fprintf(stderr, "[q4x-round-timing] commit (state folds) per cycle: host %.3f ms, GPU span %.3f ms (%ld)%c", ch / nc, cg / nc, nc, 10);
     }
 };
 RoundTiming g_rt;
@@ -39,7 +82,13 @@ inline double rt_ms_since(std::chrono::steady_clock::time_point & t) {
     t = now;
     return ms;
 }
+
 }  // namespace
+
+// AI_Q4X_ROUND_TIMING: the MTP chain's GPU bracket (0 = before, 1 = after), recorded on its stream
+void q4x_rt_mark(int which, void * stream) {
+    if (g_rt.on) g_rt.mark(which, stream);
+}
 
 // GPU miss share: a GPU-taken missed expert e arrives on the bell as -(e + 2) - kGpuTagH (= kernels/offload.cu kGpuTag)
 static constexpr int32_t kGpuTagH = 1 << 20;
@@ -94,6 +143,9 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
     // prefill graph has none, so the tier would switch on for the dense projections and change their numerics. This
     // is an MoE: pin the MoE default before the first graph. ALPHA_SMALLM_MMQ=-1 restores the probe.
     setenv("ALPHA_SMALLM_MMQ", "0", 0);
+    // ggml's chunked GDN prompt scan (prefill only; decode takes the sequential kernel) in plain TF32 instead of
+    // 3xTF32: slightly faster, and paired NLL is unchanged within noise. ALPHA_GDN_TF32_1X=0 restores 3xTF32.
+    setenv("ALPHA_GDN_TF32_1X", "1", 0);
 
     // one device buffer for every layer's KV, indexer caches and recurrent state
     const int64_t D = s.hc_dim(), kvw = (int64_t) s.head_dim * s.n_head_kv;
@@ -109,7 +161,7 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
         if (L.attn) {
             bytes += 2 * (size_t) (kvw * max_ctx * 2) + 1024;
             bytes += (size_t) (s.idx_head_dim * max_ctx * kes) + 512;
-            if (L.qsa_p.ratio > 0) bytes += (size_t) (s.idx_head_dim * (max_ctx / L.qsa_p.ratio + 1) * 2) + 512;
+            if (L.qsa_p.ratio > 0) bytes += (size_t) (s.idx_head_dim * (max_ctx / L.qsa_p.ratio + 2) * 4) + 512;
         } else {
             bytes += (size_t) ((s.conv_k - 1) * gp_.channels * 4) + 512;
             bytes += (size_t) (Sv * Sv * gp_.v_heads * 4) + 512;
@@ -131,7 +183,9 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
             kv_[il].v = carve(state_buf_, base, off, F16, kvw, max_ctx);
             qsa_[il].keys = carve(state_buf_, base, off, kt, s.idx_head_dim, max_ctx);
             if (L.qsa_p.ratio > 0) {
-                qsa_[il].pooled = carve(state_buf_, base, off, F16, s.idx_head_dim, max_ctx / L.qsa_p.ratio + 1);
+                // f32: the pooled block keys as the graph computes them (attn_qsa_block's cache: complete blocks are
+                // pooled once; the last row is the dump for the fixed-size dirty set's unused entries)
+                qsa_[il].pooled = carve(state_buf_, base, off, F32, s.idx_head_dim, max_ctx / L.qsa_p.ratio + 2);
             }
         } else {
             gdn_[il].conv = carve(state_buf_, base, off, F32, (int64_t) (s.conv_k - 1) * gp_.channels, 1);
@@ -153,6 +207,7 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
 }
 
 void Qwen4ExpRun::reset() {
+    fold_join(true);
     hist_.clear();
     ck_len_ = -1;
     if (mtp_on_) {   // no pending fill, no carried H (the head's K/V is masked by position)
@@ -184,6 +239,7 @@ std::vector<Tensor *> Qwen4ExpRun::recurrent_tensors() {
 }
 
 void Qwen4ExpRun::checkpoint() {
+    fold_join(true);
     dev_.synchronize();
     const std::vector<Tensor *> ts = recurrent_tensors();
     ck_buf_.resize(ts.size());
@@ -198,6 +254,7 @@ void Qwen4ExpRun::checkpoint() {
 
 bool Qwen4ExpRun::restore_checkpoint() {
     if (ck_len_ < 0 || ck_len_ > (int64_t) hist_.size()) return false;
+    fold_join(true);
     dev_.synchronize();
     const std::vector<Tensor *> ts = recurrent_tensors();
     if (ts.size() != ck_buf_.size()) return false;
@@ -612,7 +669,13 @@ void Qwen4ExpRun::init_doorbell(int slots) {
     if (cpus.empty()) {   // default placement from the topology (offload/cpu_topo.h); AI_Q4X_CPU_LIST overrides it
         const offload::CpuPlan plan = offload::plan_cpus(getenv("AI_Q4X_CPU_THREADS") ? threads : 0);
         if (!plan.pool.empty()) {
-            offload::pin_this_thread(plan.launch);   // the launch thread owns its physical core
+            // the launch thread owns its physical core. [AI_Q4X_RESERVE_CORES] it is pinned at its first decode or
+            // prefill call (pin_launch_thread), not here: in a server the thread that builds the engine is not the one
+            // that decodes, and pinning the builder while the decoder was confined with ~38 other server threads onto
+            // the launch core lost ~1/3 of decode (4080 AlphaServe 2026-10-28, MoLE: set A 71.9 vs ai-api-gen 110.3)
+            launch_cpus_ = plan.launch;
+            host_cpus_   = plan.host;
+            if (plan.host.empty()) offload::pin_this_thread(plan.launch);   // the old rule
             cpus = plan.pool;
         }
         fprintf(stderr, "[q4x] cpu placement: %s -> launch %s, pool %s\n", plan.why.c_str(),
@@ -621,8 +684,9 @@ void Qwen4ExpRun::init_doorbell(int slots) {
     // every other thread (CUDA runtime, admission worker) off the spinning pool cpus: one landing there straggles every
     // pool phase for the whole run (offload/cpu_topo.h). AI_Q4X_CONFINE=0 turns it off.
     if (!cpus.empty() && (!getenv("AI_Q4X_CONFINE") || atoi(getenv("AI_Q4X_CONFINE")) != 0)) {
-        const int n = offload::confine_threads_off(cpus);
-        fprintf(stderr, "[q4x] confined %d other threads off the pool cpus\n", n);
+        const int n = host_cpus_.empty() ? offload::confine_threads_off(cpus) : offload::confine_threads_onto(host_cpus_);
+        fprintf(stderr, "[q4x] confined %d other threads %s\n", n,
+                host_cpus_.empty() ? "off the pool cpus" : ("onto the host cpus " + offload::cpu_list_str(host_cpus_)).c_str());
     }
     kern::offload_wait_stats_init();
     miss_ = std::make_unique<offload::MissPool>(host, s.n_embd, k, kDoorbellT, threads, cpus);
@@ -900,8 +964,19 @@ Tensor Qwen4ExpRun::verify(const int32_t * tokens, int64_t T) {
 
 void Qwen4ExpRun::commit(int64_t m1) {
     if (rec_T_ <= 0 || m1 < 1 || m1 > rec_T_) throw std::runtime_error("Qwen4ExpRun::commit: no verify, or m1 out of range");
+    auto tc = std::chrono::steady_clock::now();
+    if (g_rt.on) g_rt.cmark(0, adapter::stream(dev_));
+    struct CommitDone {   // the closing mark + host time on every exit of the folds below
+        std::chrono::steady_clock::time_point & t; Device & d;
+        ~CommitDone() { if (g_rt.on) { g_rt.cmark(1, adapter::stream(d)); g_rt.ch += rt_ms_since(t); } }
+    } commit_done{ tc, dev_ };
     const auto & layers = prog_.layers();
-    for (size_t il = 0; il < layers.size(); ++il) {
+    static const int  rec_mask_all = getenv("AI_Q4X_REC_MASK") ? atoi(getenv("AI_Q4X_REC_MASK")) : 3;
+    // [AI_Q4X_FOLD_BATCH, default 1] every layer's fold in 3 launches (kernels/q4x_fold.cu). 3090 2026-10-28, 4K card:
+    // commit GPU 0.70 -> 0.34 ms per cycle, fixed-T=3 decode 103.8 -> 105.8 tok/s, output md5 identical (2 reps x 2 configs)
+    static const bool fold_batch   = !getenv("AI_Q4X_FOLD_BATCH") || atoi(getenv("AI_Q4X_FOLD_BATCH")) != 0;
+    const bool batched = fold_batch && rec_mask_all == 3 && fold_batch_commit(m1);
+    for (size_t il = 0; il < layers.size() && !batched; ++il) {
         Device::Scope sc(dev_);
         static const int rec_mask = getenv("AI_Q4X_REC_MASK") ? atoi(getenv("AI_Q4X_REC_MASK")) : 3;
         if (!layers[il].attn && (rec_mask & 1)) op::gdn_fold(dev_, layers[il].gdn, gp_, gdn_[il], grec_[rec_T_][il], m1);
@@ -927,7 +1002,126 @@ void Qwen4ExpRun::commit(int64_t m1) {
     }
 }
 
+bool Qwen4ExpRun::fold_batch_commit(int64_t m1) {
+    const int64_t T = rec_T_;
+    if (T < 1 || T > kDoorbellT || fold_state_[T] < 0) return false;
+    const auto & layers = prog_.layers();
+    const int    nl = (int) layers.size();
+    const int    Sk = gp_.head_k, Hk = gp_.k_heads, Sv = gp_.head_v, Hv = gp_.v_heads, C = gp_.channels, K1 = gp_.conv_k - 1;
+    const size_t tsz = (size_t) nl * (sizeof(kern::FoldGdn) + sizeof(kern::FoldCopy)) + 256;
+    if (fold_buf_ < 0) {
+        int ng = 0;
+        for (const auto & L : layers) ng += L.attn ? 0 : 1;
+        const size_t scr = kern::q4x_fold_scratch_floats(ng, Sk, Hk, Hv, (int) kDoorbellT) * 4;
+        fold_buf_  = dev_.alloc_buffer(tsz * (kDoorbellT + 1) + scr + 256, "q4x.fold_tables");
+        fold_base_ = (char *) dev_.buffer_base(fold_buf_);
+        fold_scr_  = (float *) (fold_base_ + (tsz * (kDoorbellT + 1) + 255) / 256 * 256);
+    }
+    if (fold_state_[T] == 0) {
+        std::vector<kern::FoldGdn>  g;
+        std::vector<kern::FoldCopy> cp;
+        bool ok = Sv == 128;
+        for (int il = 0; il < nl && ok; ++il) {
+            const auto & L = layers[(size_t) il];
+            if (!L.attn) {
+                const op::GdnRecord & r = grec_[T][(size_t) il];
+                const op::GdnState &  s = gdn_[(size_t) il];
+                ok = r.conv_out.valid() && r.conv_out.type == F32 && r.conv_input.valid() && r.conv_input.type == F32 && r.B == 1 &&
+                     s.ssm.valid() && s.conv.valid() && L.gdn.dt_bias.type == F32 && L.gdn.a.type == F32 &&
+                     (size_t) r.conv_out.nb[1] == (size_t) C * 4;
+                if (!ok) break;
+                kern::FoldGdn e{};
+                e.co = (const float *) r.conv_out.data;
+                if (r.ba.valid()) {
+                    ok = r.ba.type == F32;
+                    e.beta = (const float *) r.ba.data;
+                    e.alpha = (const float *) r.ba.data + Hv;
+                    e.sb1 = 1;
+                    e.sb2 = (int64_t) (r.ba.nb[1] / 4);
+                } else {
+                    ok = r.beta.valid() && r.alpha.valid() && r.beta.type == F32 && r.alpha.type == F32 && r.beta.nb[1] == r.alpha.nb[1] &&
+                         r.beta.nb[2] == r.alpha.nb[2];
+                    e.beta = (const float *) r.beta.data;
+                    e.alpha = (const float *) r.alpha.data;
+                    e.sb1 = (int64_t) (r.beta.nb[1] / 4);
+                    e.sb2 = (int64_t) (r.beta.nb[2] / 4);
+                }
+                e.ssm = (float *) s.ssm.data;
+                e.dt  = (const float *) L.gdn.dt_bias.data;
+                e.a   = (const float *) L.gdn.a.data;
+                g.push_back(e);
+                cp.push_back({ (const float *) r.conv_input.data, (int64_t) (r.conv_input.nb[1] / 4), (float *) s.conv.data, K1, C });
+            }
+            if (L.ple) {
+                const Tensor & pd = prec_[T][(size_t) il];
+                const int hist = (pp_.conv_k - 1) * pp_.ngram;
+                ok = ok && pd.valid() && pd.type == F32 && ple_[(size_t) il].hist.valid();
+                if (ok) cp.push_back({ (const float *) pd.data, (int64_t) (pd.nb[1] / 4), (float *) ple_[(size_t) il].hist.data, hist, (int) pd.ne[1] });
+            }
+        }
+        if (!ok) {
+            fold_state_[T] = -1;
+            fprintf(stderr, "[q4x] AI_Q4X_FOLD_BATCH: width %lld not batchable, per-layer folds\n", (long long) T);
+            return false;
+        }
+        fold_off_[T] = tsz * (size_t) T;
+        dev_.synchronize();   // a plain copy into memory the stream does not use yet
+        cudaMemcpy(fold_base_ + fold_off_[T], g.data(), g.size() * sizeof(kern::FoldGdn), cudaMemcpyHostToDevice);
+        cudaMemcpy(fold_base_ + fold_off_[T] + (size_t) nl * sizeof(kern::FoldGdn), cp.data(), cp.size() * sizeof(kern::FoldCopy),
+                   cudaMemcpyHostToDevice);
+        fold_ng_[T] = (int) g.size();
+        fold_nc_[T] = (int) cp.size();
+        fold_state_[T] = 1;
+    }
+    const kern::FoldGdn *  dg = (const kern::FoldGdn *) (fold_base_ + fold_off_[T]);
+    const kern::FoldCopy * dc = (const kern::FoldCopy *) (fold_base_ + fold_off_[T] + (size_t) nl * sizeof(kern::FoldGdn));
+    const int ng = fold_ng_[T], nc = fold_nc_[T], mi = (int) m1;
+    float *   scr = fold_scr_;
+    const float eps = gp_.eps;
+    Device *  dev = &dev_;
+    // [AI_Q4X_FOLD_SIDE, default 1] on a side stream forked after the verify, joined by the next state user (fold_join)
+    static const bool side = !getenv("AI_Q4X_FOLD_SIDE") || atoi(getenv("AI_Q4X_FOLD_SIDE")) != 0;
+    if (side && !fold_stream_) {
+        cudaStream_t fs0 = nullptr;
+        cudaStreamCreateWithFlags(&fs0, cudaStreamNonBlocking);
+        fold_stream_  = fs0;
+        fold_ev_fork_ = kern::event_create();
+        fold_ev_join_ = kern::event_create();
+    }
+    fold_join();   // a still-pending fold (normally none: the round in between joined it) before this one forks
+    void * fs = side ? fold_stream_ : nullptr, * ef = fold_ev_fork_, * ej = fold_ev_join_;
+    adapter::native(dev_, [=]() {
+        void * mainst = adapter::stream(*dev);
+        void * st     = mainst;
+        if (fs) { kern::event_record(ef, mainst); kern::stream_wait_event(fs, ef); st = fs; }
+        if (!kern::q4x_fold_batch(st, dg, ng, dc, nc, scr, mi, (int) kDoorbellT, C, Sk, Hk, Sv, Hv, eps)) {
+            fprintf(stderr, "[q4x] AI_Q4X_FOLD_BATCH: launch failed\n");
+            abort();
+        }
+        if (fs) kern::event_record(ej, fs);
+    });
+    fold_pending_ = fs != nullptr;
+    return true;
+}
+
+void Qwen4ExpRun::fold_join(bool host) {
+    if (!fold_pending_) return;
+    fold_pending_ = false;
+    kern::stream_wait_event(adapter::stream(dev_), fold_ev_join_);
+    if (host) cudaEventSynchronize((cudaEvent_t) fold_ev_join_);
+}
+
+void Qwen4ExpRun::pin_launch_thread() {
+    if (launch_cpus_.empty()) return;
+    const std::thread::id me = std::this_thread::get_id();
+    if (me == pinned_thread_) return;
+    offload::pin_this_thread(launch_cpus_);
+    pinned_thread_ = me;
+}
+
 Tensor Qwen4ExpRun::chunk(const int32_t * tokens, int64_t T) {
+    pin_launch_thread();
+    fold_join();
     const Qwen4ExpSpec & s = prog_.spec();
     mtp_flush();
     const int64_t pos0 = (int64_t) hist_.size();
@@ -1022,16 +1216,32 @@ Tensor Qwen4ExpRun::forward(const Tensor & ids_t, const Tensor & pos4_t, const T
             ? op::q4x::attn_qsa_block(dev_, r.mixed, L.at, ap_, kv_[(size_t) il], ain, L.qsa, L.qsa_p, qsa_[(size_t) il])
             : op::q4x::gdn_block_sigz(dev_, r.mixed, L.gdn, gp_, gdn_[(size_t) il], rg ? &grec : nullptr);
         if (rg || rp) keep_record(il, (L.attn || !rg) ? nullptr : &grec, (L.ple && rp) ? &ple_pad : nullptr);
-        R = op::q4x::hc_scatter(dev_, R, out, r.inject);
+        // [AI_Q4X_HC_INPLACE, default 1] both scatters write R in place (q4x_hc_combine_into: the fork's hc_combine_f32
+        // float ops in the same order, bit-identical; prefill 7880328) and a non-PLE layer's R stays in Rbuf[cur]: no fresh
+        // R per scatter and no per-layer copy (48 copy launches per round). A PLE layer's R is the block's own output, so
+        // it is copied into Rbuf[cur] first.
+        static const bool inplace = !getenv("AI_Q4X_HC_INPLACE") || atoi(getenv("AI_Q4X_HC_INPLACE")) != 0;
+        const bool ip = inplace && R.contiguous() && out.contiguous();
+        if (ip) {
+            if (R.data != Rbuf[cur].data) { op::copy_into(dev_, R, Rbuf[cur], "q4x ple out"); R = Rbuf[cur]; }
+            op::q4x::hc_scatter_into(dev_, R, out, r.inject);
+        } else {
+            R = op::q4x::hc_scatter(dev_, R, out, r.inject);
+        }
         op::q4x::HcRead f = op::q4x::hc_read(dev_, R, L.hc_ffn, s.rms_eps);
         Tensor y = (del & 2) ? f.mixed
                  : (del & 4) ? op::moe_shared(dev_, f.mixed, L.moe)
                  : doorbell_ && T <= kDoorbellT ? moe_doorbell(il, f.mixed) : moe_streamed(il, f.mixed);
         dump("ffn_out", il, y);
-        R = op::q4x::hc_scatter(dev_, R, y, f.inject);
-        dump("l_last", il, R);
-        op::copy_into(dev_, R, Rbuf[cur ^ 1], "q4x layer out");
-        cur ^= 1;
+        if (ip && y.contiguous()) {
+            op::q4x::hc_scatter_into(dev_, R, y, f.inject);
+            dump("l_last", il, R);
+        } else {
+            R = op::q4x::hc_scatter(dev_, R, y, f.inject);
+            dump("l_last", il, R);
+            op::copy_into(dev_, R, Rbuf[cur ^ 1], "q4x layer out");
+            cur ^= 1;
+        }
     }
     const Tensor & R = Rbuf[cur];
     if (mtp_on_) {   // the trunk streams (before the final mixer) of every row -> MTP H slots 1..T
@@ -1052,6 +1262,7 @@ Tensor Qwen4ExpRun::forward(const Tensor & ids_t, const Tensor & pos4_t, const T
 
 // Stops the admission worker, then releases the RAM tier.
 Qwen4ExpRun::~Qwen4ExpRun() {
+    fold_join(true);
     if (admit_thr_.joinable()) {
         {
             std::lock_guard<std::mutex> lk(admit_mu_);
@@ -1306,7 +1517,7 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
     }
     if (g_rt.on) rt_ms_since(tr);
     dev_.synchronize();   // the ingress uploads below are unordered against the stream (see chunk())
-    if (g_rt.on) g_rt.sync += rt_ms_since(tr);
+    if (g_rt.on) { g_rt.sync += rt_ms_since(tr); g_rt.gpu_eval(); rt_ms_since(tr); }
     std::vector<int32_t>  pos4((size_t) (4 * T));
     std::vector<int64_t>  cells((size_t) T);
     std::vector<uint16_t> mask((size_t) (F * T));
@@ -1338,6 +1549,9 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
     const std::string dd = dump_dir_;
     dump_dir_.clear();   // no host reads inside a captured round
     const int64_t key = (F << 6) | (T << 1) | (rec_ ? 1 : 0);
+    pin_launch_thread();
+    fold_join();   // AI_Q4X_FOLD_SIDE: outside any capture: the round reads the folded state
+    if (g_rt.on) g_rt.mark(2, adapter::stream(dev_));
     const Tensor & lg = rounds_.launch(dev_, key, [&]() {
         return forward(ids_v, pos4_v, cells_v, mask_v, s.ple_layers.empty() ? Tensor{} : ple_v, T, F);
     }, &warm, true, [&](const int64_t & k2, const auto & e) {
@@ -1345,7 +1559,7 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
                 (k2 & 1) ? " (verify)" : "", e.round->n_nodes());
     });
     dump_dir_ = dd;
-    if (g_rt.on) g_rt.launch += rt_ms_since(tr);
+    if (g_rt.on) { g_rt.mark(3, adapter::stream(dev_)); g_rt.launch += rt_ms_since(tr); }
     if (mtp_on_ && !rec_) { mtp_fill_p0_ = pos0; mtp_fill_m_ = T; }
     admit_kick();   // the round is launched: the admission copies may start now
     if (g_rt.on) { g_rt.kick += rt_ms_since(tr); g_rt.n++; }

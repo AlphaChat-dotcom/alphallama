@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 namespace ai {
 
@@ -52,12 +53,13 @@ static Tensor pf_wsum(Device & d, const Tensor & exps, const Tensor & w, const T
 namespace {
 struct PfTiming {
     bool   on = getenv("AI_Q4X_PF_TIMING") && atoi(getenv("AI_Q4X_PF_TIMING")) != 0;
-    double inputs = 0, ple = 0, embed = 0, mixer = 0, route_sync = 0, plan = 0, copies = 0, moe_enq = 0, tail = 0, mtp = 0, logits = 0;
+    double inputs = 0, ple = 0, embed = 0, mixer = 0, route_sync = 0, plan = 0, copies = 0, moe_enq = 0, tail = 0, mtp = 0, logits = 0, share_wait = 0;
     ~PfTiming() {
         if (!on) return;
         fprintf(stderr, "[q4x-pf-timing] s: inputs %.3f | ple %.3f | embed %.3f | mixer enqueue %.3f | route sync %.3f | "
-                        "plan+uploads %.3f | copy issue %.3f | moe enqueue %.3f | scatter+copy %.3f | mtp fill %.3f | logits %.3f%c",
-                inputs, ple, embed, mixer, route_sync, plan, copies, moe_enq, tail, mtp, logits, 10);
+                        "plan+uploads %.3f | copy issue %.3f | moe enqueue %.3f | scatter+copy %.3f | mtp fill %.3f | logits %.3f | "
+                        "cpu share wait %.3f%c",
+                inputs, ple, embed, mixer, route_sync, plan, copies, moe_enq, tail, mtp, logits, share_wait, 10);
     }
 };
 PfTiming g_pf;
@@ -90,10 +92,9 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
     pf_off_mask_ = take((size_t) max_ctx_ * sub * 2 + 256);
     (void) nsub;
     size_t scr = 0;
-    const int E = s.n_expert;
     for (size_t il = 0; il < banks_.size(); ++il) {
         const auto & m = prog_.layers()[il].moe;
-        const int    cap = E - banks_[il].n_slots;
+        const int    cap = s.n_expert - banks_[il].n_slots;
         scr = std::max(scr, (size_t) cap * (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]) + 3 * 256);
     }
     int b1 = -1, b2 = -1;   // Device::alloc_buffer throws on OOM: catch it so the fallback below is real
@@ -106,16 +107,61 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
         return false;
     }
     pf_buf_ = b1; pf_scr_ = b2; pf_S_ = S; pf_sub_ = sub;
+    dev_.mem_report("prefill_alloc");
     cudaMemset(dev_.buffer_base(b2), 0, scr);   // never-written scratch slots read as zero weights (finite, masked)
     // AI_Q4X_PF_STREAM (default 1): copy each layer's whole non-resident set on a separate copy stream, overlapping the
     // mixer phase. AI_Q4X_PF_STREAM2=1 adds a second scratch buffer for double buffering; without room, one buffer.
     static const bool want_stream = !getenv("AI_Q4X_PF_STREAM") || atoi(getenv("AI_Q4X_PF_STREAM")) != 0;
-    static const bool want_double = getenv("AI_Q4X_PF_STREAM2") && atoi(getenv("AI_Q4X_PF_STREAM2")) != 0;
-    if (want_stream && pf_cstream_ == nullptr) {
-        if (want_double) {
+    // AI_Q4X_PF_STREAM2 (default 1): the second scratch buffer, allocated per prefill and only when it fits with
+    // AI_Q4X_PF_STREAM2_MARGIN_MB (default 768) of VRAM left. The auto slot count does not reserve it, so a long prompt's
+    // bigger state can leave no room (one buffer then). With the plans pulled from mapped memory, the next layer's
+    // copies run under this layer's MoE; the output bits do not change.
+    static const bool    want_double = !getenv("AI_Q4X_PF_STREAM2") || atoi(getenv("AI_Q4X_PF_STREAM2")) != 0;
+    static const int64_t s2_margin   = env_i64("AI_Q4X_PF_STREAM2_MARGIN_MB", 768) << 20;
+    // (the staged walk, below the stream minimum, never reads it)
+    const int64_t s2_min = env_i64("AI_Q4X_PF_STREAM_MIN", env_i64("AI_Q4X_PF_SHARE", 1) != 0 && miss_ ? 3072 : 1024);
+    const int     E = s.n_expert;
+    if (want_stream && want_double && pf_scr2_ < 0 && pf_spare_P_ == 0 && S >= s2_min) {
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        if ((int64_t) fb >= (int64_t) scr + s2_margin) {
             try { pf_scr2_ = dev_.alloc_buffer(scr, "q4x.prefill_scratch2"); } catch (const std::exception &) { pf_scr2_ = -1; }
-            if (pf_scr2_ < 0) fprintf(stderr, "[q4x-prefill] no room for the second expert scratch (%.0f MiB): one buffer%c", scr / 1048576.0, 10);
         }
+        if (pf_scr2_ < 0) {
+            // AI_Q4X_PF_SPARE (default 1): no room for a second full buffer, so two spare buffers of P experts each (P
+            // from the free VRAM, leaving AI_Q4X_PF_SPARE_MARGIN_MB, default 256). A layer's first P non-resident experts go to spare
+            // il % 2, copied while the previous layer's MoE runs; the rest to the main buffer after it (the link is idle
+            // under the MoE otherwise). The MoE reads three banks: resident, main, spare.
+            static const bool    want_spare = !getenv("AI_Q4X_PF_SPARE") || atoi(getenv("AI_Q4X_PF_SPARE")) != 0;
+            static const int64_t sp_margin  = env_i64("AI_Q4X_PF_SPARE_MARGIN_MB", 256) << 20;
+            size_t per = 0;
+            for (size_t il = 0; il < banks_.size(); ++il) {
+                const auto & m = prog_.layers()[il].moe;
+                per = std::max(per, (size_t) (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]));
+            }
+            cudaMemGetInfo(&fb, &tb);
+            const int64_t room = (int64_t) fb - sp_margin;
+            int P = room > 0 && per > 0 ? (int) std::min<int64_t>(room / (int64_t) (2 * per + 2048), E) : 0;
+            if (want_spare && P >= 16) {
+                const size_t sb = (size_t) P * per + 3 * 256;
+                try {
+                    pf_spare_[0] = dev_.alloc_buffer(sb, "q4x.prefill_spare0");
+                    pf_spare_[1] = dev_.alloc_buffer(sb, "q4x.prefill_spare1");
+                    pf_spare_P_  = P;
+                    cudaMemset(dev_.buffer_base(pf_spare_[0]), 0, sb);
+                    cudaMemset(dev_.buffer_base(pf_spare_[1]), 0, sb);
+                } catch (const std::exception &) {
+                    dev_.free_buffer(pf_spare_[0]); dev_.free_buffer(pf_spare_[1]);
+                    pf_spare_[0] = pf_spare_[1] = -1; pf_spare_P_ = 0;
+                }
+            }
+            fprintf(stderr, "[q4x-prefill] no room for the second expert scratch (%.0f MiB, %.0f MiB free): %s%c", scr / 1048576.0,
+                    fb / 1048576.0, pf_spare_P_ > 0 ? "two spare buffers instead" : "one buffer", 10);
+            if (pf_spare_P_ > 0) fprintf(stderr, "[q4x-prefill] spare buffers: %d experts each (%.0f MiB)%c", pf_spare_P_,
+                                         (double) pf_spare_P_ * per / 1048576.0, 10);
+        }
+    }
+    if (want_stream && pf_cstream_ == nullptr) {
         {
             cudaStream_t cs;
             cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking);
@@ -127,19 +173,22 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
                 pf_ev_ready_[i] = a;
                 pf_ev_free_[i]  = f;
             }
+            for (int i = 0; i < 3; ++i) cudaEventCreateWithFlags((cudaEvent_t *) &pf_ev_spfree_[i], cudaEventDisableTiming);
             pf_stream_on_ = true;
         }
     }
     fprintf(stderr, "[q4x-prefill] layer-major prefill: super-chunk %lld rows, sub-chunk %lld; %.0f MiB state + %.0f MiB "
                     "expert scratch%s%c", (long long) S, (long long) sub, bytes / 1048576.0, scr / 1048576.0,
-            pf_stream_on_ ? (pf_scr2_ >= 0 ? " x2 (layer stream, double buffer)" : " (layer stream under the mixer phase)") : "", 10);
+            pf_stream_on_ ? (pf_scr2_ >= 0 ? " x2 (layer stream, double buffer)" : pf_spare_P_ > 0 ? " + 2 spares (layer stream)"
+                                                                     : " (layer stream under the mixer phase)") : "", 10);
     return true;
 }
 
-// The scratch bank of layer il over buffer `buf`: gate | up | down, (E - n_slots) experts each, 256-byte aligned.
-void Qwen4ExpRun::pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd) const {
+// The scratch bank of layer il over buffer `buf`: gate | up | down, (E - n_slots) experts each (n > 0: n experts),
+// 256-byte aligned.
+void Qwen4ExpRun::pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd, int n) const {
     const auto & m   = prog_.layers()[(size_t) il].moe;
-    const int    cap = prog_.spec().n_expert - banks_[(size_t) il].n_slots;
+    const int    cap = n > 0 ? n : prog_.spec().n_expert - banks_[(size_t) il].n_slots;
     char *       sb  = (char *) dev_.buffer_base(buf);
     size_t       off = 0;
     auto bank = [&](const Tensor & h) {
@@ -157,8 +206,54 @@ void Qwen4ExpRun::pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd
     sd = bank(m.down_exps);
 }
 
+// Queue experts nr[i0..i1) of the three tensors into destination slots 0..i1-i0 on cs. AI_Q4X_PF_COPY_RUNS (default 1)
+// makes one copy per run of consecutive expert ids (contiguous in the source and in the scratch), so the copy
+// stream's queue does not fill with one call per expert and block the host inside cudaMemcpyAsync.
+static void pf_copy_experts(const Tensor * const src[3], const Tensor * const dst[3], const std::vector<int32_t> & nr,
+                            size_t i0, size_t i1, cudaStream_t cs) {
+    static const bool runs = !getenv("AI_Q4X_PF_COPY_RUNS") || atoi(getenv("AI_Q4X_PF_COPY_RUNS")) != 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t eb = src[r]->nb[2];
+        const bool   merge = runs && dst[r]->nb[2] == eb;
+        for (size_t i = i0; i < i1;) {
+            size_t j = i + 1;
+            if (merge) while (j < i1 && nr[j] == nr[j - 1] + 1) ++j;
+            cudaMemcpyAsync((char *) dst[r]->data + (i - i0) * dst[r]->nb[2], (const char *) src[r]->data + (size_t) nr[i] * eb,
+                            (j - i) * eb, cudaMemcpyHostToDevice, cs);
+            i = j;
+        }
+    }
+}
+
 // Layer stream: queue every non-resident expert of layer il into scratch buffer il % 2 on the copy stream, after the
 // compute stream is done with that buffer's previous layer; ready[il % 2] marks the copies done.
+// AI_Q4X_PF_SPARE: part 0 = the layer's first P non-resident experts into spare il % 2 (free once layer il - 2's MoE,
+// queued before this call, has run); part 1 = the rest into the main buffer (free once layer il - 1's MoE has run);
+// ready[0] after part 1 (the copy stream is in order: part 0 was queued earlier).
+void Qwen4ExpRun::pf_stream_part(int il, int part) {
+    cudaStream_t cs = (cudaStream_t) pf_cstream_, st = (cudaStream_t) adapter::stream(dev_);
+    const int    e  = part == 0 ? 1 + (il & 1) : 0;   // free-event slot: 0 main, 1 / 2 spares
+    cudaEventRecord((cudaEvent_t) pf_ev_spfree_[e], st);
+    cudaStreamWaitEvent(cs, (cudaEvent_t) pf_ev_spfree_[e], 0);
+    Tensor sg, su, sd;
+    if (part == 0) pf_bank(il, pf_spare_[il & 1], sg, su, sd, pf_spare_P_);
+    else           pf_bank(il, pf_scr_, sg, su, sd);
+    const auto &   m = prog_.layers()[(size_t) il].moe;
+    const Tensor * src[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+    const Tensor * dst[3] = { &sg, &su, &sd };
+    const auto &   nr = pf_nonres_[(size_t) il];
+    const size_t   P  = std::min(nr.size(), (size_t) pf_spare_P_);
+    const size_t   i0 = part == 0 ? 0 : P, i1 = part == 0 ? P : nr.size();
+    pf_copy_experts(src, dst, nr, i0, i1, cs);
+    pf_streamed_ += i1 - i0;
+    if (part == 1) {
+        cudaEventRecord((cudaEvent_t) pf_ev_ready_[0], cs);
+        pf_buf_layer_[0] = il;
+    } else {
+        pf_spare_layer_[il & 1] = il;
+    }
+}
+
 void Qwen4ExpRun::pf_stream_layer(int il) {
     const int b = pf_scr2_ >= 0 ? (il & 1) : 0;
     cudaStream_t cs = (cudaStream_t) pf_cstream_, st = (cudaStream_t) adapter::stream(dev_);
@@ -171,10 +266,7 @@ void Qwen4ExpRun::pf_stream_layer(int il) {
     const Tensor * dst[3] = { &sg, &su, &sd };
     static const bool pf_nocopy = getenv("AI_Q4X_PF_NOCOPY") && atoi(getenv("AI_Q4X_PF_NOCOPY")) != 0;
     const auto & nr = pf_nonres_[(size_t) il];
-    for (size_t i = 0; i < nr.size() && !pf_nocopy; ++i)
-        for (int r = 0; r < 3; ++r)
-            cudaMemcpyAsync((char *) dst[r]->data + i * dst[r]->nb[2], (const char *) src[r]->data + (size_t) nr[i] * src[r]->nb[2],
-                            src[r]->nb[2], cudaMemcpyHostToDevice, cs);
+    if (!pf_nocopy) pf_copy_experts(src, dst, nr, 0, nr.size(), cs);
     pf_streamed_ += nr.size();
     cudaEventRecord((cudaEvent_t) pf_ev_ready_[b], cs);
     pf_buf_layer_[b] = il;
@@ -185,6 +277,12 @@ void Qwen4ExpRun::pf_stream_layer(int il) {
 // layer il - 1).
 void Qwen4ExpRun::pf_layer_begin(int il) {
     const int nl = (int) prog_.layers().size();
+    if (pf_spare_P_ > 0) {   // this layer's main part (its spare part went with the previous layer's), the next one's spare part
+        if (pf_spare_layer_[il & 1] != il) pf_stream_part(il, 0);
+        pf_stream_part(il, 1);
+        if (il + 1 < nl) pf_stream_part(il + 1, 0);
+        return;
+    }
     if (pf_scr2_ < 0) {
         pf_stream_layer(il);
         return;
@@ -205,18 +303,32 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
     const int64_t N = fm.ne[0], Tb = fm.ne[1], nsl = (Tb + slice - 1) / slice;
     op::MoeParams mp{ E, k };
     PfClock ck;
-    Tensor sg, su, sd;
-    const int b = pf_scr2_ >= 0 ? (il & 1) : 0;
+    Tensor sg, su, sd, pg, pu, pd;
+    const bool spare = pf_spare_P_ > 0;
+    const int  b     = pf_scr2_ >= 0 ? (il & 1) : 0;
     pf_bank(il, b ? pf_scr2_ : pf_scr_, sg, su, sd);
+    if (spare) pf_bank(il, pf_spare_[il & 1], pg, pu, pd, pf_spare_P_);
     void * st = adapter::stream(dev_);
     if (pf_layer_ != il) {
         pf_layer_ = il;
         pf_slot_of_.assign((size_t) E, -1);
+        pf_spare_of_.assign((size_t) E, -1);
         const auto & nr = pf_nonres_[(size_t) il];
-        for (size_t i = 0; i < nr.size(); ++i) pf_slot_of_[(size_t) nr[i]] = (int) i;
+        const size_t P  = spare ? std::min(nr.size(), (size_t) pf_spare_P_) : 0;
+        for (size_t i = 0; i < nr.size(); ++i) {
+            if (i < P) pf_spare_of_[(size_t) nr[i]] = (int) i;
+            else       pf_slot_of_[(size_t) nr[i]] = (int) (i - P);
+        }
         pf_n_ = (int) nr.size();
-        if (pf_buf_layer_[b] != il) pf_stream_layer(il);
-        cudaStreamWaitEvent((cudaStream_t) st, (cudaEvent_t) pf_ev_ready_[b], 0);
+        if (spare) {
+            if (pf_buf_layer_[0] != il) {
+                if (pf_spare_layer_[il & 1] != il) pf_stream_part(il, 0);
+                pf_stream_part(il, 1);
+            }
+        } else if (pf_buf_layer_[b] != il) {
+            pf_stream_layer(il);
+        }
+        cudaStreamWaitEvent((cudaStream_t) st, (cudaEvent_t) pf_ev_ready_[spare ? 0 : b], 0);
     }
     auto slice_of = [&](const Tensor & t, int64_t s0, int64_t Ts) {   // columns [s0, s0 + Ts) of a contiguous [N, Tb]
         return t.view(t.ne[0], Ts, 1, 1, t.nb[1], t.nb[1] * (size_t) Ts, t.nb[1] * (size_t) Ts, t.nb[1] * (size_t) s0);
@@ -226,18 +338,55 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
         routes.push_back(op::moe_route(dev_, slice_of(fm, s0, Ts), L.moe.router, mp));
     }
-    ck.lap(g_pf.moe_enq);
+    static const bool overlap = !getenv("AI_Q4X_PF_ROUTE_OVERLAP") || atoi(getenv("AI_Q4X_PF_ROUTE_OVERLAP")) != 0;
+    Tensor Y = dev_.ws_alloc(F32, N, Tb);
     std::vector<int32_t> sel((size_t) (k * Tb));
-    for (int64_t q = 0; q < nsl; ++q) {
-        const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
-        dev_.download(routes[(size_t) q].sel, sel.data() + (size_t) (s0 * k), 0, (size_t) (Ts * k) * 4);
+    if (overlap) {
+        // the routes are recorded; the shared expert (routing-independent) goes on the stream behind them, into Y, and
+        // the host reads the routes on a side stream as soon as they land, building the plans while the GPU computes.
+        // Greedy tokens are unchanged.
+        if (!pf_rstream_) {
+            cudaStream_t rs;
+            cudaStreamCreateWithFlags(&rs, cudaStreamNonBlocking);
+            pf_rstream_ = rs;
+            cudaEvent_t ev;
+            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            pf_ev_route_ = ev;
+        }
+        if (pf_sel_cap_ < sel.size()) {
+            if (pf_sel_pin_) cudaFreeHost(pf_sel_pin_);
+            cudaHostAlloc((void **) &pf_sel_pin_, sel.size() * 4, cudaHostAllocDefault);
+            pf_sel_cap_ = sel.size();
+        }
+        cudaEventRecord((cudaEvent_t) pf_ev_route_, (cudaStream_t) st);
+        cudaStreamWaitEvent((cudaStream_t) pf_rstream_, (cudaEvent_t) pf_ev_route_, 0);
+        for (int64_t q = 0; q < nsl; ++q) {
+            const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
+            cudaMemcpyAsync(pf_sel_pin_ + s0 * k, routes[(size_t) q].sel.data, (size_t) (Ts * k) * 4, cudaMemcpyDeviceToHost,
+                            (cudaStream_t) pf_rstream_);
+        }
+        for (int64_t q = 0; q < nsl; ++q) {
+            Device::Scope sc(dev_);
+            const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
+            op::copy_into(dev_, op::moe_shared(dev_, slice_of(fm, s0, Ts), L.moe), slice_of(Y, s0, Ts), "q4x pf big shared");
+        }
+        ck.lap(g_pf.moe_enq);
+        cudaStreamSynchronize((cudaStream_t) pf_rstream_);
+        memcpy(sel.data(), pf_sel_pin_, sel.size() * 4);
+    } else {
+        ck.lap(g_pf.moe_enq);
+        for (int64_t q = 0; q < nsl; ++q) {
+            const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
+            dev_.download(routes[(size_t) q].sel, sel.data() + (size_t) (s0 * k), 0, (size_t) (Ts * k) * 4);
+        }
     }
     ck.lap(g_pf.route_sync);
     // owner plans: gate/up over every column of the batch, down per slice (records split at the kernel's column cap)
     const int rec = kern::q4x_experts_wide_rec(), wcols = kern::q4x_experts_wide_cols();
     const int cap = E - B.n_slots;
-    auto build = [&](int64_t c0, int64_t c1, std::vector<int32_t> & pr, int & nr_, std::vector<int32_t> & ps, int & ns_) {
-        std::vector<int32_t> own_r((size_t) B.n_slots, -1), own_s((size_t) cap, -1);
+    auto build = [&](int64_t c0, int64_t c1, std::vector<int32_t> & pr, int & nr_, std::vector<int32_t> & ps, int & ns_,
+                     std::vector<int32_t> & pp, int & np_) {
+        std::vector<int32_t> own_r((size_t) B.n_slots, -1), own_s((size_t) cap, -1), own_p((size_t) std::max(1, pf_spare_P_), -1);
         auto add = [&](std::vector<int32_t> & plan, std::vector<int32_t> & own, int & n, int slot, int col) {
             if (own[(size_t) slot] >= 0 && plan[(size_t) own[(size_t) slot] * rec + 1] >= wcols) own[(size_t) slot] = -1;
             if (own[(size_t) slot] < 0) {
@@ -248,51 +397,82 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
             int32_t * r = plan.data() + (size_t) own[(size_t) slot] * rec;
             r[2 + r[1]++] = col;
         };
-        nr_ = ns_ = 0;
+        nr_ = ns_ = np_ = 0;
         for (int64_t cc = c0; cc < c1; ++cc) {
             const int32_t e = sel[(size_t) cc];
             const int32_t r = B.table_h[(size_t) e];
-            if (r >= 0) add(pr, own_r, nr_, r, (int) cc);
-            else        add(ps, own_s, ns_, pf_slot_of_[(size_t) e], (int) cc);
+            if (r >= 0)                                          add(pr, own_r, nr_, r, (int) cc);
+            else if (spare && pf_spare_of_[(size_t) e] >= 0)     add(pp, own_p, np_, pf_spare_of_[(size_t) e], (int) cc);
+            else                                                 add(ps, own_s, ns_, pf_slot_of_[(size_t) e], (int) cc);
         }
     };
-    std::vector<int32_t> gr, gs;
-    int ngr = 0, ngs = 0;
-    build(0, k * Tb, gr, ngr, gs, ngs);
-    std::vector<std::vector<int32_t>> dr((size_t) nsl), ds((size_t) nsl);
-    std::vector<int> ndr((size_t) nsl), nds((size_t) nsl);
+    std::vector<int32_t> gr, gs, gp;
+    int ngr = 0, ngs = 0, ngp = 0;
+    build(0, k * Tb, gr, ngr, gs, ngs, gp, ngp);
+    std::vector<std::vector<int32_t>> dr((size_t) nsl), ds((size_t) nsl), dp((size_t) nsl);
+    std::vector<int> ndr((size_t) nsl), nds((size_t) nsl), ndp((size_t) nsl);
     for (int64_t q = 0; q < nsl; ++q) {
         const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
-        build(s0 * k, (s0 + Ts) * k, dr[(size_t) q], ndr[(size_t) q], ds[(size_t) q], nds[(size_t) q]);
+        build(s0 * k, (s0 + Ts) * k, dr[(size_t) q], ndr[(size_t) q], ds[(size_t) q], nds[(size_t) q], dp[(size_t) q], ndp[(size_t) q]);
+    }
+    // with the overlap, kernels behind the routes are still running over workspace this call may reuse: the plans go up
+    // ordered on the stream (Device::upload is not), from pinned staging that the next call rewrites only after its own
+    // route event, i.e. after these copies ran. The staging is mapped and a kernel pulls it (kern::q4x_copy_i32): a
+    // cudaMemcpyAsync H2D would wait on the copy engine behind the stream's queued expert blobs, so the expert kernels
+    // would sit behind the next layer's copies.
+    size_t pin_need = 0, pin_at = 0;
+    if (overlap) {
+        pin_need = gr.size() + gs.size() + gp.size();
+        for (int64_t q = 0; q < nsl; ++q) pin_need += dr[(size_t) q].size() + ds[(size_t) q].size() + dp[(size_t) q].size();
+        if (pf_plan_cap_ < pin_need) {
+            cudaStreamSynchronize((cudaStream_t) st);
+            if (pf_plan_pin_) cudaFreeHost(pf_plan_pin_);
+            pf_plan_cap_ = pin_need + pin_need / 4 + 1024;
+            cudaHostAlloc((void **) &pf_plan_pin_, pf_plan_cap_ * 4, cudaHostAllocMapped);
+            cudaHostGetDevicePointer((void **) &pf_plan_dev_, pf_plan_pin_, 0);
+        }
     }
     auto up_plan = [&](const std::vector<int32_t> & v) {
         Tensor t = dev_.ws_alloc(I32, std::max<int64_t>(1, (int64_t) v.size()));
-        if (!v.empty()) dev_.upload(t, v.data(), 0, v.size() * 4);
+        if (v.empty()) return t;
+        if (overlap) {
+            memcpy(pf_plan_pin_ + pin_at, v.data(), v.size() * 4);
+            kern::q4x_copy_i32(st, pf_plan_dev_ + pin_at, (int32_t *) t.data, (int64_t) v.size());
+            pin_at += v.size();
+        } else {
+            dev_.upload(t, v.data(), 0, v.size() * 4);
+        }
         return t;
     };
-    const Tensor tgr = up_plan(gr), tgs = up_plan(gs);
-    std::vector<Tensor> tdr, tds;
-    for (int64_t q = 0; q < nsl; ++q) { tdr.push_back(up_plan(dr[(size_t) q])); tds.push_back(up_plan(ds[(size_t) q])); }
+    const Tensor tgr = up_plan(gr), tgs = up_plan(gs), tgp = up_plan(gp);
+    std::vector<Tensor> tdr, tds, tdp;
+    for (int64_t q = 0; q < nsl; ++q) {
+        tdr.push_back(up_plan(dr[(size_t) q])); tds.push_back(up_plan(ds[(size_t) q])); tdp.push_back(up_plan(dp[(size_t) q]));
+    }
     ck.lap(g_pf.plan);
     const int64_t K = fm.ne[0], F = B.up.ne[1];
     Tensor scr = dev_.ws_alloc(F32, (int64_t) (kern::q4x_experts_scratch_bytes(K, F, k, Tb) / 4) + 64, 1);
-    Tensor Y   = dev_.ws_alloc(F32, N, Tb);
     Tensor ex  = dev_.ws_alloc(F32, N, k, std::min(slice, Tb));
     struct Bank { int tg, td; const void * u, * g, * d; int64_t rbg, ebg, rbd, ebd; };
     const Bank br{ (int) B.up.type, (int) B.down.type, B.up.data, B.gate.data, B.down.data, (int64_t) B.up.nb[1],
                    (int64_t) B.up.nb[2], (int64_t) B.down.nb[1], (int64_t) B.down.nb[2] };
     const Bank bs{ (int) su.type, (int) sd.type, su.data, sg.data, sd.data, (int64_t) su.nb[1], (int64_t) su.nb[2],
                    (int64_t) sd.nb[1], (int64_t) sd.nb[2] };
+    const Bank bp = spare ? Bank{ (int) pu.type, (int) pd.type, pu.data, pg.data, pd.data, (int64_t) pu.nb[1], (int64_t) pu.nb[2],
+                                  (int64_t) pd.nb[1], (int64_t) pd.nb[2] }
+                          : bs;
+    const int     npass = spare ? 3 : 2;
     const float * px = (const float *) fm.data;
     void *        psc = scr.data;
     Device *      dv  = &dev_;
-    const int32_t * pgr = (const int32_t *) tgr.data, * pgs = (const int32_t *) tgs.data;
+    const int32_t * pgr = (const int32_t *) tgr.data, * pgs = (const int32_t *) tgs.data, * pgp = (const int32_t *) tgp.data;
     adapter::native(dev_, [=]() {
         void * stv = adapter::stream(*dv);
-        for (int pass = 0; pass < 2; ++pass) {
-            const Bank & bk = pass == 0 ? br : bs;
+        for (int pass = 0; pass < npass; ++pass) {
+            const Bank & bk = pass == 0 ? br : pass == 1 ? bs : bp;
             if (!kern::q4x_experts_wide_gu(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd, px, K, pass == 0,
-                                           pass == 0 ? pgr : pgs, pass == 0 ? ngr : ngs, K, F, N, k, Tb, psc)) {
+                                           pass == 0 ? pgr : pass == 1 ? pgs : pgp, pass == 0 ? ngr : pass == 1 ? ngs : ngp,
+                                           K, F, N, k, Tb, psc)) {
                 fprintf(stderr, "[q4x-prefill] big-batch gate/up declined a shape%c", 10);
                 abort();
             }
@@ -303,14 +483,16 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
     for (int64_t q = 0; q < nsl; ++q) {
         const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
         const int32_t * pdr = (const int32_t *) tdr[(size_t) q].data, * pds = (const int32_t *) tds[(size_t) q].data;
-        const int ndr_q = ndr[(size_t) q], nds_q = nds[(size_t) q];
+        const int32_t * pdp = (const int32_t *) tdp[(size_t) q].data;
+        const int ndr_q = ndr[(size_t) q], nds_q = nds[(size_t) q], ndp_q = ndp[(size_t) q];
         const int64_t col_lo = s0 * k;
         adapter::native(dev_, [=]() {
             void * stv = adapter::stream(*dv);
-            for (int pass = 0; pass < 2; ++pass) {
-                const Bank & bk = pass == 0 ? br : bs;
+            for (int pass = 0; pass < npass; ++pass) {
+                const Bank & bk = pass == 0 ? br : pass == 1 ? bs : bp;
                 if (!kern::q4x_experts_wide_dn(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd,
-                                               pass == 0 ? pdr : pds, pass == 0 ? ndr_q : nds_q, K, F, N, k, Tb, psc, pex, col_lo)) {
+                                               pass == 0 ? pdr : pass == 1 ? pds : pdp, pass == 0 ? ndr_q : pass == 1 ? nds_q : ndp_q,
+                                               K, F, N, k, Tb, psc, pex, col_lo)) {
                     fprintf(stderr, "[q4x-prefill] big-batch down declined a shape%c", 10);
                     abort();
                 }
@@ -319,7 +501,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         Device::Scope sc(dev_);   // the slice's temporaries end with it (Y, ex and the routes live outside)
         const Tensor xs  = slice_of(fm, s0, Ts);
         const Tensor exs = ex.view(N, k, Ts, 1, ex.nb[1], ex.nb[2], ex.nb[2] * (size_t) Ts, 0);
-        const Tensor sh  = op::moe_shared(dev_, xs, L.moe);
+        const Tensor sh  = overlap ? slice_of(Y, s0, Ts) : op::moe_shared(dev_, xs, L.moe);
         const Tensor y   = pf_wsum(dev_, exs, routes[(size_t) q].weights, sh, k);
         op::copy_into(dev_, y, slice_of(Y, s0, Ts), "q4x pf big moe out");
     }
@@ -341,6 +523,92 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     ck.lap(g_pf.moe_enq);
     std::vector<int32_t> sel((size_t) (k * T));
     dev_.download(route.sel, sel.data(), 0, sel.size() * 4);
+    // AI_Q4X_PF_SHARE (default 1 when the CPU pool exists; 0 = off): the CPU share of a staged (short-prompt, <= 3072
+    // rows) batch. The decode CPU pool, idle while a prompt is read, computes the non-resident experts that few of the
+    // batch's tokens route to instead of copying each over PCIe; the GPU copies and computes the rest, then adds the
+    // CPU's weighted rows. Every column is still computed: the same math in other kernels.
+    // The split is a cost model fitted online: the CPU costs A per decode pass (a pass serves up to 4 of an expert's
+    // columns; A from the pool's job times), the GPU G0 + C per copied expert (C = the expert's bytes over
+    // AI_Q4X_PF_SHARE_GBS, default 12 GB/s; G0 from timing events around the GPU part, read at the next batch, when they
+    // have completed). The non-resident experts sorted by column count, the CPU takes the prefix that minimises the
+    // larger of the two. AI_Q4X_PF_SHARE_CMAX = n: a fixed rule instead (the CPU takes every expert with <= n columns).
+    static const int    share_on  = env_i64("AI_Q4X_PF_SHARE", 1) != 0;
+    static const int    share_fix = (int) env_i64("AI_Q4X_PF_SHARE_CMAX", 0);
+    static const double share_bw  = (double) env_i64("AI_Q4X_PF_SHARE_GBS", 12) * 1e9;
+    const bool          share     = share_on && miss_ && !pf_stream_now_ && x.contiguous();
+    std::vector<char> cpu_e;
+    std::vector<int32_t> cj_tok, cj_ids;
+    std::vector<float>   cj_w, xh, yph, wh;
+    int                  n_gpu_copy = 0, cpu_groups = 0;
+    if (share) {
+        if (!pf_ev_s0_) {
+            cudaEventCreate((cudaEvent_t *) &pf_ev_s0_);
+            cudaEventCreate((cudaEvent_t *) &pf_ev_s1_);
+        }
+        const size_t nl = prog_.layers().size();
+        if (pf_share_Al_.size() != nl) { pf_share_Al_.assign(nl, -1.0); pf_share_G0l_.assign(nl, -1.0); }
+        if (pf_share_pending_) {   // the previous shared batch's GPU part (complete: the read-back above synced)
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, (cudaEvent_t) pf_ev_s0_, (cudaEvent_t) pf_ev_s1_) == cudaSuccess) {
+                const double g0 = std::max(0.0, ms * 1e-3 - pf_share_C_ * pf_share_ngpu_);
+                double &     gl = pf_share_G0l_[(size_t) pf_share_il_];
+                gl           = gl < 0 ? g0 : 0.6 * gl + 0.4 * g0;
+                pf_share_G0_ = pf_share_G0_ < 0 ? g0 : 0.8 * pf_share_G0_ + 0.2 * g0;
+            }
+            pf_share_pending_ = false;
+        }
+        const double C = (double) (L.moe.gate_exps.nb[2] + L.moe.up_exps.nb[2] + L.moe.down_exps.nb[2]) / share_bw;
+        pf_share_C_ = C;
+        std::vector<int> cnt((size_t) E, 0);
+        for (int32_t e : sel) ++cnt[(size_t) e];
+        std::vector<std::pair<int, int>> cand;   // (columns, expert) of the routed non-resident experts
+        for (int e = 0; e < E; ++e)
+            if (cnt[(size_t) e] > 0 && B.table_h[(size_t) e] < 0) cand.push_back({ cnt[(size_t) e], e });
+        std::sort(cand.begin(), cand.end());
+        size_t take = 0;
+        if (share_fix > 0) {
+            while (take < cand.size() && cand[take].first <= share_fix) ++take;
+        } else {
+            // per layer (the layers' expert types differ, IQ2 vs IQ3 decode ~1.5x), seeded from the running global ones;
+            // the CPU's estimate is biased up 15%: a CPU overrun idles the GPU at the add
+            const double G0 = pf_share_G0l_[(size_t) il] >= 0 ? pf_share_G0l_[(size_t) il] : pf_share_G0_ < 0 ? 0.004 : pf_share_G0_;
+            const double A  = 1.15 * (pf_share_Al_[(size_t) il] > 0 ? pf_share_Al_[(size_t) il] : pf_share_A_);
+            double best = G0 + C * (double) cand.size(), cpu = 0.0;
+            for (size_t i = 0; i < cand.size(); ++i) {
+                cpu += A * (double) ((cand[i].first + 3) / 4);
+                const double t = std::max(cpu, G0 + C * (double) (cand.size() - i - 1));
+                if (t < best) { best = t; take = i + 1; }
+            }
+        }
+        cpu_e.assign((size_t) E, 0);
+        for (size_t i = 0; i < take; ++i) {
+            cpu_e[(size_t) cand[i].second] = 1;
+            cpu_groups += (cand[i].first + 3) / 4;
+        }
+        n_gpu_copy = (int) (cand.size() - take);
+        wh.resize((size_t) (k * T));
+        dev_.download(route.weights, wh.data(), 0, wh.size() * 4);
+        for (int64_t c = 0; c < k * T; ++c) {
+            const int32_t e = sel[(size_t) c];
+            if (!cpu_e[(size_t) e]) continue;
+            cj_tok.push_back((int32_t) (c / k));
+            cj_ids.push_back(e);
+            cj_w.push_back(wh[(size_t) c]);
+            wh[(size_t) c] = 0.0f;   // the GPU's weighted sum leaves the CPU's columns out
+        }
+        if (cj_ids.empty()) {
+            cpu_e.clear();
+        } else {
+            xh.resize((size_t) (x.ne[0] * T));
+            yph.resize(xh.size());
+            dev_.download(x, xh.data(), 0, xh.size() * 4);
+            miss_->host_job_begin(il, xh.data(), (int) T, cj_tok.data(), cj_ids.data(), cj_w.data(), (int) cj_ids.size(),
+                                  yph.data());
+            pf_shared_cols_ += cj_ids.size();
+        }
+    }
+    const bool shared = !cpu_e.empty();
+    if (shared) cudaEventRecord((cudaEvent_t) pf_ev_s0_, (cudaStream_t) adapter::stream(dev_));
     ck.lap(g_pf.route_sync);
     // the scratch bank: this layer's tensors over pf_scr_ (stream mode: buffer il % 2), (E - n_slots) experts each
     const auto & m   = L.moe;
@@ -379,6 +647,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     for (int32_t e : sel) {
         if (pf_stream_now_) break;
         if (B.table_h[(size_t) e] >= 0 || pf_slot_of_[(size_t) e] >= 0) continue;
+        if (shared && cpu_e[(size_t) e]) continue;   // the CPU computes it
         if (pf_n_ >= cap) throw std::runtime_error("q4x prefill: scratch bank full");
         const int sl = pf_n_++;
         pf_slot_of_[(size_t) e] = sl;
@@ -470,6 +739,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     for (int64_t c = 0; c < k * T; ++c) {   // ascending columns: each owner's list comes out sorted
         const int32_t e = sel[(size_t) c];
         const int32_t r = B.table_h[(size_t) e];
+        if (shared && cpu_e[(size_t) e]) continue;   // the CPU's column: no GPU owner (its ex column is zeroed below)
         use_res[(size_t) c] = r >= 0 ? 1 : 0;
         if (r >= 0) add(plan_r, own_r, n_r, r, (int) c);
         else        add(plan_s, own_s, n_s, pf_slot_of_[(size_t) e], (int) c);
@@ -486,6 +756,12 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     ck.lap(g_pf.plan);
     // both passes write only their own columns of one buffer (no per-bank outputs + select: 3x the memory at big batches)
     Tensor ex = dev_.ws_alloc(F32, N, k, T);
+    Tensor wz;
+    if (shared) {   // the CPU's columns: zero outputs and zero weights in the GPU's sum (uploads are safe: the stream is idle)
+        cudaMemsetAsync(ex.data, 0, ex.nbytes(), (cudaStream_t) adapter::stream(dev_));
+        wz = dev_.ws_alloc(F32, k, T);
+        dev_.upload(wz, wh.data(), 0, wh.size() * 4);
+    }
     Tensor scr = dev_.ws_alloc(F32, (int64_t) (kern::q4x_experts_scratch_bytes(K, F, k, T) / 4) + 64, 1);
     struct Bank { int tg, td; const void * u, * g, * d; int64_t rbg, ebg, rbd, ebd; };
     const Bank br{ (int) B.up.type, (int) B.down.type, B.up.data, B.gate.data, B.down.data, (int64_t) B.up.nb[1],
@@ -511,19 +787,41 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     });
     (void) pu;
     const Tensor sh = op::moe_shared(dev_, x, L.moe);
-    Tensor ret = pf_wsum(dev_, ex, route.weights, sh, k);
+    Tensor ret = pf_wsum(dev_, ex, shared ? wz : route.weights, sh, k);
     ck.lap(g_pf.moe_enq);
+    if (shared) {   // the CPU's rows, added once its job is done (an ordered copy: kernels above may still run)
+        cudaEventRecord((cudaEvent_t) pf_ev_s1_, (cudaStream_t) adapter::stream(dev_));
+        pf_share_pending_ = true;
+        pf_share_ngpu_    = n_gpu_copy;
+        pf_share_il_      = il;
+        miss_->host_job_wait();
+        if (cpu_groups > 0) {   // the CPU's cost per decode pass, from this job's time
+            const double a  = (double) miss_->host_job_ns() * 1e-9 / (double) cpu_groups;
+            double &     al = pf_share_Al_[(size_t) il];
+            al          = al < 0 ? a : 0.6 * al + 0.4 * a;
+            pf_share_A_ = 0.8 * pf_share_A_ + 0.2 * a;
+        }
+        ck.lap(g_pf.share_wait);
+        Tensor yp = dev_.ws_alloc(F32, x.ne[0], T);
+        cudaMemcpyAsync(yp.data, yph.data(), yph.size() * 4, cudaMemcpyHostToDevice, (cudaStream_t) adapter::stream(dev_));
+        ret = op::add(dev_, ret, yp);
+    }
     return ret;
 }
 
 Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float> * all_logits) {
     const Qwen4ExpSpec & s = prog_.spec();
+    pin_launch_thread();   // [AI_Q4X_RESERVE_CORES] the thread that decodes owns the launch core
+    fold_join();     // [AI_Q4X_FOLD_SIDE] the last commit's fold before the prompt advances the state
     admit_drain();   // the previous request's last admissions: every slot mapped again before the scratch is sized
     // AI_Q4X_PREFILL_SUPER (default 16384): rows per super-chunk. Larger is better while it fits, since every
     // super-chunk streams the non-resident experts again. AI_Q4X_PREFILL_SUB (default 256): rows per mixer sub-chunk.
     // A super-chunk that does not fit halves (down to 1024) before falling back to kDoorbellT-row rounds.
     int64_t       S   = std::max<int64_t>(8, env_i64("AI_Q4X_PREFILL_SUPER", 16384));
     const int64_t sub = std::max<int64_t>(8, env_i64("AI_Q4X_PREFILL_SUB", 256));
+    // a prompt a little past the super-chunk takes one bigger chunk rather than a tiny second chunk that would walk
+    // every layer again and re-stream most of the non-resident experts
+    if (n > S && n <= S + S / 8) S = (n + sub - 1) / sub * sub;
     S = std::min<int64_t>(S, std::max<int64_t>(sub, (n + sub - 1) / sub * sub));   // no bigger than the prompt
     bool fit = doorbell_ && n > kDoorbellT && prefill_alloc(S, sub);
     while (!fit && doorbell_ && n > kDoorbellT && S > 1024 && pf_buf_ < 0) {
@@ -575,14 +873,45 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         }
         uint16_t * const mask_dev = (uint16_t *) (pb + pf_off_mask_);
         Device * const   dvm      = &dev_;
+        // A cudaMemcpy from PAGEABLE memory returns once the data is staged, before its DMA lands, and the backend stream
+        // that reads these buffers next is a non-blocking stream, not ordered against the default stream the copy runs on:
+        // the first kernels could read stale cells. An event recorded on the default stream after the copies, and waited on
+        // by the backend stream, orders them with no host stall. (Found by AI_Q4X_PF_HASH on the PLE rows, 4080 2026-10-28:
+        // fresh starts diverged in layer 1, the first PLE layer, until a download between the upload and its reader.)
+        static cudaEvent_t pf_up_ev = [] { cudaEvent_t e; cudaEventCreateWithFlags(&e, cudaEventDisableTiming); return e; }();
+        auto order_uploads = [&]() {
+            cudaEventRecord(pf_up_ev, 0);
+            cudaStreamWaitEvent((cudaStream_t) adapter::stream(dev_), pf_up_ev, 0);
+        };
         cudaMemcpy(pb + pf_off_ids_, tokens + s0, (size_t) SC * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(pb + pf_off_pos4_, pos4.data(), pos4.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(pb + pf_off_cell_, cells.data(), cells.size() * 8, cudaMemcpyHostToDevice);
+        order_uploads();
         pc.lap(g_pf.inputs);
+        // AI_Q4X_PLE_OVERLAP (default 1): the super-chunk's PLE rows are gathered on a helper thread while the GPU embeds
+        // and runs the layers before the first PLE layer (layer 1 here); joined and uploaded just before that layer
+        // reads them. The PLE region of pf_buf_ is read by no earlier layer, so the synchronous upload cannot race the
+        // queued kernels. Done serially, the gather leaves the GPU idle (AI_Q4X_PF_TIMING reports it as "ple").
+        static const bool  ple_overlap = !getenv("AI_Q4X_PLE_OVERLAP") || atoi(getenv("AI_Q4X_PLE_OVERLAP")) != 0;
+        std::vector<float> ple_host;
+        std::thread        ple_th;
+        struct Joiner {   // an exception between the start and the join must not leave a joinable thread behind
+            std::thread & t;
+            ~Joiner() { if (t.joinable()) t.join(); }
+        } ple_joiner{ ple_th };
+        bool ple_pending = false;
+        auto ple_upload  = [&]() {
+            if (!ple_pending) return;
+            if (ple_th.joinable()) ple_th.join();
+            cudaMemcpy(pb + pf_off_ple_, ple_host.data(), ple_host.size() * 4, cudaMemcpyHostToDevice);
+            order_uploads();   // the PLE block's kernels on the backend stream must see the landed rows
+            ple_pending = false;
+        };
         if (!s.ple_layers.empty()) {
-            std::vector<float> rows((size_t) (s.n_embd * SC));
-            ple_rows(pos0, SC, rows.data());
-            cudaMemcpy(pb + pf_off_ple_, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice);
+            ple_host.resize((size_t) (s.n_embd * SC));
+            ple_pending = true;
+            if (ple_overlap) ple_th = std::thread([this, pos0, SC, &ple_host]() { ple_rows(pos0, SC, ple_host.data()); });
+            else { ple_rows(pos0, SC, ple_host.data()); ple_upload(); }
         }
         pc.lap(g_pf.ple);
         const Tensor R_all = raw(pf_off_R_, F32, s.n_embd, s.hc, SC);
@@ -600,7 +929,9 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         pc.lap(g_pf.embed);
         pf_layer_ = -1;
         // stream whole layers only for big chunks (a short one routes to few of the non-resident experts)
-        static const int64_t stream_min = env_i64("AI_Q4X_PF_STREAM_MIN", 1024);
+        // with the CPU share on, batches up to 3072 rows take the staged walk so they can hand the CPU its share;
+        // above that every expert streams
+        static const int64_t stream_min = env_i64("AI_Q4X_PF_STREAM_MIN", env_i64("AI_Q4X_PF_SHARE", 1) != 0 && miss_ ? 3072 : 1024);
         pf_stream_now_ = pf_stream_on_ && SC >= stream_min;
         if (pf_stream_now_) {
             pf_nonres_.assign(layers.size(), {});
@@ -610,6 +941,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                 if ((int) pf_nonres_[l].size() > s.n_expert - banks_[l].n_slots) pf_stream_now_ = false;   // scratch too small
             }
             pf_buf_layer_[0] = pf_buf_layer_[1] = -1;
+            pf_spare_layer_[0] = pf_spare_layer_[1] = -1;
             if (pf_stream_now_ && pf_scr2_ >= 0) pf_stream_layer(0);
         }
         // Debug: AI_Q4X_PF_NANCHK=1 on sub-chunk 0 of each layer, report the first stage whose output is non-finite
@@ -627,14 +959,94 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                         layers[(size_t) il].attn ? "attn" : "gdn", what, bad, h.size(), (long long) t.ne[t.ne[2] > 1 ? 2 : 1]);
             }
         };
+        // [debug] AI_Q4X_PF_HASH=1: FNV-1a of the whole residual R after the embedding and after each layer's mixer and MoE
+        // phases (synchronising downloads: slow), for finding where two starts' prefills first differ
+        static const bool pf_hash = getenv("AI_Q4X_PF_HASH") && atoi(getenv("AI_Q4X_PF_HASH")) != 0;
+        auto hash_R = [&](const char * what, int il) {
+            if (!pf_hash) return;
+            std::vector<uint32_t> h((size_t) (HW * SC));
+            dev_.download(R_all, h.data(), 0, h.size() * 4);
+            uint64_t x = 1469598103934665603ull;
+            for (uint32_t v : h) { x ^= v; x *= 1099511628211ull; }
+            fprintf(stderr, "[q4x-pf-hash] L%02d %-5s %016llx\n", il, what, (unsigned long long) x);
+        };
+        auto hash_t = [&](const char * what, int il, const Tensor & t) {   // any contiguous f32 tensor
+            if (!pf_hash || !t.contiguous()) return;
+            std::vector<uint32_t> h((size_t) t.numel());
+            dev_.download(t, h.data(), 0, h.size() * 4);
+            uint64_t x = 1469598103934665603ull;
+            for (uint32_t v : h) { x ^= v; x *= 1099511628211ull; }
+            fprintf(stderr, "[q4x-pf-hash] L%02d %-5s %016llx\n", il, what, (unsigned long long) x);
+        };
+        hash_R("embed", -1);
         for (int il = 0; il < (int) layers.size(); ++il) {
             const Qwen4ExpLayer & L = layers[(size_t) il];
+            if (L.ple) ple_upload();   // the helper's rows, before the first layer that reads them
             // Layer stream: the layer's non-resident experts start copying now (single buffer: after the previous
             // layer's MoE; double: the next layer as well) -- under the mixer phase below
             if (pf_stream_now_) pf_layer_begin(il);
             // phase A: the mixer of every sub-chunk (attention / GDN state advances in token order; the MoE of this
             // layer reads none of it until phase B)
-            for (int64_t c = 0; c < nsub; ++c) {
+            // AI_Q4X_PF_HC_GROUP (default 2048 rows; 0 = per sub-chunk): the attention-side HC read and scatter over
+            // groups of sub-chunks. A token's read needs only the layer's input (after its PLE), and its scatter only its
+            // own mixer output, so the low-rank GEMMs run on G-row batches instead of small stream-k MMQ tiles. The mixer
+            // itself still runs per sub-chunk in token order.
+            static const int64_t hc_group = env_i64("AI_Q4X_PF_HC_GROUP", 2048);
+            const int64_t        G        = hc_group >= 2 * sub ? hc_group / sub * sub : 0;
+            for (int64_t g0 = 0; G > 0 && g0 < SC; g0 += G) {
+                Device::Scope sg(dev_);
+                const int64_t Gb = std::min(G, SC - g0), c_lo = g0 / sub, c_hi = (g0 + Gb + sub - 1) / sub;
+                const Tensor  Rg = R_all.view(s.n_embd, s.hc, Gb, 1, (size_t) s.n_embd * 4, (size_t) HW * 4, (size_t) HW * 4 * Gb,
+                                              (size_t) (HW * g0) * 4);
+                if (L.ple) {   // the PLE in token order, written back: the read and the scatter both start from it
+                    if (pf_hash) {
+                        uint64_t x = 1469598103934665603ull;
+                        for (float f : ple_host) { uint32_t v; memcpy(&v, &f, 4); x ^= v; x *= 1099511628211ull; }
+                        fprintf(stderr, "[q4x-pf-hash] L%02d plhst %016llx\n", il, (unsigned long long) x);
+                        hash_t("pldev", il, raw(pf_off_ple_, F32, s.n_embd, SC));
+                    }
+                    for (int64_t c = c_lo; c < c_hi; ++c) {
+                        Device::Scope sc(dev_);
+                        const int64_t c0 = c * sub, T = std::min(sub, SC - c0);
+                        const Tensor  ple_t = raw(pf_off_ple_ + (size_t) (s.n_embd * c0) * 4, F32, s.n_embd, T);
+                        const Tensor  R = op::q4x::ple_block(dev_, R_of(c), ple_t, L.plew, pp_, ple_[(size_t) il], false, nullptr);
+                        op::copy_into(dev_, R, R_of(c), "q4x pf ple");
+                    }
+                }
+                if (L.ple) hash_R("ple", il);
+                const op::q4x::HcRead r = op::q4x::hc_read(dev_, Rg, L.hc_attn, s.rms_eps);
+                hash_t("hcmix", il, r.mixed);
+                Tensor                outg = dev_.ws_alloc(F32, s.n_embd, Gb);
+                for (int64_t c = c_lo; c < c_hi; ++c) {
+                    Device::Scope sc(dev_);
+                    const int64_t c0 = c * sub, T = std::min(sub, SC - c0), n_kv = pos0 + c0 + T, o0 = c0 - g0;
+                    op::AttnInputs ain;
+                    ain.write_cells  = raw(pf_off_cell_ + (size_t) c0 * 8, I64, T);
+                    ain.pos4         = raw(pf_off_pos4_ + (size_t) (4 * c0) * 4, I32, 4 * T);
+                    if (L.attn) {
+                        const int64_t mp0 = pos0 + c0;
+                        adapter::native(dev_, [=]() { kern::q4x_causal_mask(adapter::stream(*dvm), mask_dev, n_kv, T, mp0); });
+                    }
+                    ain.mask         = raw(pf_off_mask_, F16, n_kv, T).reshape(n_kv, T, 1, 1);
+                    ain.n_kv         = n_kv;
+                    ain.B            = 1;
+                    ain.region_cells = max_ctx_;
+                    ain.first_cell   = 0;
+                    const Tensor mx  = r.mixed.view(s.n_embd, T, 1, 1, r.mixed.nb[1], r.mixed.nb[1] * (size_t) T,
+                                                    r.mixed.nb[1] * (size_t) T, r.mixed.nb[1] * (size_t) o0);
+                    // the mixers take contiguous rows: mixed is [N, Gb] contiguous, so a column range is contiguous too
+                    const Tensor out = L.attn
+                        ? op::q4x::attn_qsa_block(dev_, mx, L.at, ap_, kv_[(size_t) il], ain, L.qsa, L.qsa_p, qsa_[(size_t) il])
+                        : op::q4x::gdn_block_sigz(dev_, mx, L.gdn, gp_, gdn_[(size_t) il], nullptr);
+                    op::copy_into(dev_, out, outg.view(s.n_embd, T, 1, 1, outg.nb[1], outg.nb[1] * (size_t) T,
+                                                       outg.nb[1] * (size_t) T, outg.nb[1] * (size_t) o0), "q4x pf mixer out");
+                    pc.lap(g_pf.mixer);
+                }
+                hash_t("mixer", il, outg);
+                op::q4x::hc_scatter_into(dev_, Rg, outg, r.inject);
+                pc.lap(g_pf.mixer);
+            }
+            for (int64_t c = 0; G == 0 && c < nsub; ++c) {
                 Device::Scope sc(dev_);
                 const int64_t c0 = c * sub, T = std::min(sub, SC - c0), n_kv = pos0 + c0 + T;
                 op::AttnInputs ain;
@@ -667,6 +1079,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                 op::copy_into(dev_, R, R_of(c), "q4x pf layer mid");
                 pc.lap(g_pf.mixer);
             }
+            hash_R("mix", il);
             // phase B: the MoE over batches of AI_Q4X_PF_MOE_ROWS rows (default 1024), independent of the mixer's
             // sub-chunk: each expert's weight tiles are decoded once per batch, and a small sub-chunk gives each expert
             // only ~k * T / E rows, so its weights would be decoded many times per layer
@@ -707,8 +1120,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                     Device::Scope sh(dev_);
                     const int64_t Th = std::min(moe_rows, Tb - h0);
                     const Tensor Rb = Rrows(m0 + h0, Th);
-                    const Tensor R  = op::q4x::hc_scatter(dev_, Rb, col(Y, h0, Th), col(ijb, h0, Th));
-                    op::copy_into(dev_, R, Rb, "q4x pf layer out");
+                    op::q4x::hc_scatter_into(dev_, Rb, col(Y, h0, Th), col(ijb, h0, Th));
                 }
                 pc.lap(g_pf.tail);
             }
@@ -724,11 +1136,11 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                 Tensor y = moe_prefill(il, f.mixed);
                 pc.t = std::chrono::steady_clock::now();
                 chk("moe out", il, c, y);
-                R = op::q4x::hc_scatter(dev_, R, y, f.inject);
-                chk("hc_scatter(ffn)", il, c, R);
-                op::copy_into(dev_, R, Rb, "q4x pf layer out");
+                op::q4x::hc_scatter_into(dev_, Rb, y, f.inject);
+                chk("hc_scatter(ffn)", il, c, Rb);
                 pc.lap(g_pf.tail);
             }
+            hash_R("moe", il);
         }
         pc.t = std::chrono::steady_clock::now();
         // logits: the last sub-chunk always (the caller reads its last row); every sub-chunk when scoring
@@ -750,7 +1162,33 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
             dev_.download(l, all_logits->data() + o, 0, (size_t) (V * T) * 4);
         }
         pc.lap(g_pf.logits);
-        if (mtp_on_) {   // the MTP head's K/V for every prompt row, in kDoorbellT-row fills (mtp_H_ holds 1 + kDoorbellT rows)
+        // AI_Q4X_MTP_FILL_ROWS (default 256): the MTP head's K/V for the prompt. The first rows go through the pending
+        // fill (its H comes from the carried slot), the rest in wide chunks straight from R_all (row r's H is R_all row
+        // r - 1) on the prefill-width attention with a device mask, instead of one call per kDoorbellT rows.
+        static const int64_t fill_rows = env_i64("AI_Q4X_MTP_FILL_ROWS", 256);
+        if (mtp_on_ && fill_rows > kDoorbellT && SC > kDoorbellT) {
+            mtp_flush();
+            const int64_t m0 = kDoorbellT;
+            {
+                const Tensor src = R_all.view(HW, m0, 1, 1, (size_t) HW * 4, (size_t) (HW * m0) * 4, (size_t) (HW * m0) * 4, 0);
+                const Tensor dst = mtp_H_.view(HW, m0, 1, 1, (size_t) HW * 4, (size_t) (HW * m0) * 4, (size_t) (HW * m0) * 4,
+                                               (size_t) HW * 4);
+                op::copy_into(dev_, src, dst, "q4x pf mtp H");
+                mtp_fill_p0_ = pos0;
+                mtp_fill_m_  = m0;
+                mtp_flush();
+            }
+            for (int64_t r0 = m0; r0 < SC; r0 += fill_rows) {
+                const int64_t m = std::min<int64_t>(fill_rows, SC - r0);
+                const Tensor  H = R_all.view(HW, m, 1, 1, (size_t) HW * 4, (size_t) (HW * m) * 4, (size_t) (HW * m) * 4,
+                                             (size_t) (HW * (r0 - 1)) * 4);
+                mtp_layer(H, hist_.data() + pos0 + r0, pos0 + r0, m, false, nullptr, true);
+            }
+            const Tensor last  = R_all.view(HW, 1, 1, 1, (size_t) HW * 4, (size_t) HW * 4, (size_t) HW * 4, (size_t) (HW * (SC - 1)) * 4);
+            const Tensor slot0 = mtp_H_.view(HW, 1, 1, 1, (size_t) HW * 4, (size_t) HW * 4, (size_t) HW * 4, 0);
+            op::copy_into(dev_, last, slot0, "q4x pf mtp Hcarry");
+            mtp_fill_m_ = 0;
+        } else if (mtp_on_) {   // the MTP head's K/V for every prompt row, in kDoorbellT-row fills (mtp_H_ holds 1 + kDoorbellT rows)
             for (int64_t r0 = 0; r0 < SC; r0 += kDoorbellT) {
                 mtp_flush();
                 const int64_t m = std::min<int64_t>(kDoorbellT, SC - r0);
@@ -768,8 +1206,8 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
     static bool said = false;
     if (!said) {
         said = true;
-        fprintf(stderr, "[q4x-prefill] %lld rows layer-major; %llu expert copies streamed into scratch\n", (long long) n,
-                (unsigned long long) pf_streamed_);
+        fprintf(stderr, "[q4x-prefill] %lld rows layer-major; %llu expert copies streamed into scratch; %llu columns on the CPU share\n",
+                (long long) n, (unsigned long long) pf_streamed_, (unsigned long long) pf_shared_cols_);
     }
     // The prefill's device buffers (state, masks, expert scratch: around a GB) are released before decode allocates its
     // own (verify records, round graphs), since with the MTP head and its draft rows resident both may not fit. The
@@ -779,7 +1217,12 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         dev_.free_buffer(pf_buf_);
         dev_.free_buffer(pf_scr_);
         dev_.free_buffer(pf_scr2_);
+        dev_.free_buffer(pf_spare_[0]);
+        dev_.free_buffer(pf_spare_[1]);
         pf_buf_ = pf_scr_ = pf_scr2_ = -1;
+        pf_spare_[0] = pf_spare_[1] = -1;
+        pf_spare_P_ = 0;
+        pf_spare_layer_[0] = pf_spare_layer_[1] = -1;
         pf_S_ = 0;
         pf_buf_layer_[0] = pf_buf_layer_[1] = -1;
     }

@@ -189,6 +189,27 @@ __global__ static void causal_mask_k(uint16_t * m, int64_t n_kv, int64_t T, int6
         m[x] = j <= p0 + i ? (uint16_t) 0x0000 : (uint16_t) 0xFC00;
     }
 }
+// Prefill plans: a copy by a kernel from mapped pinned host memory. A cudaMemcpyAsync H2D would queue on the copy engine
+// behind the expert stream's queued blobs (a layer's ~1200 copies), so the expert kernels would wait for their own plan.
+__global__ static void copy_i32_k(const int32_t * __restrict__ src, int32_t * __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void q4x_copy_i32(void * stream, const int32_t * src, int32_t * dst, int64_t n) {
+    if (n <= 0) return;
+    const int blocks = (int) (n < 256 * 256 ? (n + 255) / 256 : 256);
+    copy_i32_k<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, n);
+}
+
+// MTP fill: the draft layer's mask is the causal one except column 0 (no H_{-1}): masked for every row past position 0
+__global__ static void mtp_mask_col0_k(uint16_t * m, int64_t n_kv, int64_t T, int64_t p0) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < T && p0 + i >= 1) m[i * n_kv] = 0xFC00;
+}
+void q4x_mtp_mask_col0(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int64_t p0) {
+    if (T <= 0) return;
+    mtp_mask_col0_k<<<(unsigned) ((T + 255) / 256), 256, 0, (cudaStream_t) stream>>>(m, n_kv, T, p0);
+}
+
 void q4x_causal_mask(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int64_t p0) {
     const int64_t n      = n_kv * T;
     const int     blocks = (int) (n < 4096 * 256 ? (n + 255) / 256 : 4096);

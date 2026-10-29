@@ -75,8 +75,12 @@ bool Device::init(int device_index) {
 
 void Device::finalize() {
     finalized_ = true;
-    // AI_MEM_REPORT: per-tag device footprint. Every buffer is already tagged, so this is a report
-    // and not an estimate. Aggregated by tag prefix: the
+    mem_report("finalize");
+}
+
+void Device::mem_report(const char * when) {
+    // AI_MEM_REPORT: per-tag device footprint (=1: by tag prefix; =2: by full tag). Every buffer is
+    // already tagged, so this is a report and not an estimate. Aggregated by tag prefix: the
     // per-buffer list is noise, the per-role totals are the answer.
     if (getenv("AI_MEM_REPORT") != nullptr) {
         std::vector<std::pair<std::string, size_t>> roll;
@@ -86,7 +90,7 @@ void Device::finalize() {
             sum += b;
             std::string k = tags_[i];
             const size_t dot = k.find('.');
-            if (dot != std::string::npos) { k = k.substr(0, dot); }
+            if (dot != std::string::npos && atoi(getenv("AI_MEM_REPORT")) < 2) { k = k.substr(0, dot); }
             bool hit = false;
             for (auto & e : roll) { if (e.first == k) { e.second += b; hit = true; break; } }
             if (!hit) { roll.emplace_back(k, b); }
@@ -94,7 +98,7 @@ void Device::finalize() {
         std::sort(roll.begin(), roll.end(),
                   [](const std::pair<std::string, size_t> & a,
                      const std::pair<std::string, size_t> & b) { return a.second > b.second; });
-        fprintf(stderr, "[ai-mem] device buffers by role (%zu buffers, tracked total %.1f MiB):\n",
+        fprintf(stderr, "[ai-mem] %s: device buffers by role (%zu buffers, tracked total %.1f MiB):\n", when,
                 bufs_.size(), (double) sum / 1048576.0);
         for (const auto & e : roll) {
             fprintf(stderr, "[ai-mem]   %-14s %9.1f MiB  %5.1f%%\n", e.first.c_str(),
