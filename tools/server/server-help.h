@@ -35,7 +35,3 @@ std::string alpha_error_explain(const std::string & error_msg,
                                 const std::string & command_line = "",
                                 const std::string & extra_context = "");
 
-// Generate a friendly registration prompt when no license is found.
-// Uses oracle if available, otherwise returns a static message.
-// Prints to stderr and returns the message.
-std::string alpha_registration_message();

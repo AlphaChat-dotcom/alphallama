@@ -409,34 +409,3 @@ std::string alpha_error_explain(const std::string & error_msg,
     return error_msg + "\n\n" + result;
 }
 
-// Registration prompt (oracle-powered)
-
-std::string alpha_registration_message() {
-    static const char * STATIC_MSG =
-        "\n"
-        "Welcome! Please register at https://www.alphachat.com to get started.\n"
-        "\n"
-        "  - Free tier: 2M token context on all models, unlimited queries, no credit card\n"
-        "  - After registering, run: alphallama register\n"
-        "\n";
-
-    alpha_error_assistant assistant;
-    std::string result = assistant.explain(
-        "No license found. The user needs to register.",
-        "",
-        "Tell the user to visit https://www.alphachat.com to create a free account. "
-        "Mention that the free tier gives them 2M token context on all supported models "
-        "with unlimited queries and no credit card required. "
-        "After registering on the website, they run 'alphallama register' to activate. "
-        "Keep it friendly and brief — 2-3 sentences max.");
-
-    std::string msg;
-    if (!result.empty()) {
-        msg = "\n" + result + "\n\n";
-    } else {
-        msg = STATIC_MSG;
-    }
-
-    fprintf(stderr, "%s", msg.c_str());
-    return msg;
-}

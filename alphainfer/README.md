@@ -54,3 +54,8 @@ environment variables and documented where they are read.
 - `src/kernels`: CUDA kernels
 - `src/api`: C API (`ai_engine.h`) used by `alphallama-serve`
 - `apps`, `tools`: the command-line tool, kernel checks and benchmarks
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). This covers all of `alphainfer/`, including AlphaInfer 2 (the qwen4exp
+Flash-Next engine and expert offload v2). Every source file carries an `SPDX-License-Identifier: Apache-2.0` header.

@@ -933,6 +933,64 @@ static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_p
     return nullptr;
 #endif
 }
+
+// Flash-Next (architecture qwen4exp) runs at full speed only on AlphaInfer 2, so it is routed by architecture rather
+// than by a per-file row (a row would hash a 47 GB shard at every start). Needs a CUDA GPU of compute capability 8.0
+// or newer. The defaults below are the configuration measured on the RTX 4080 and RTX 3090 (2026-10-28):
+// one stream at 32768 cells, routed experts in host memory with the slots sized from the VRAM left, MTP depth 2 with
+// the draft head from <model dir>/MTP/ (fast verify: output is not token-identical to plain greedy;
+// ALPHA_AI_MTP_K=0 serves plain decode), and a routing profile (dre-profile*.bin beside the model or in MTP/) that
+// seeds the expert pool. Every setting is a default: an explicit env or flag wins.
+static bool alpha_auto_qwen4exp(const char * model_path) {
+    const char * ae = getenv("ALPHA_AUTO");
+    if ((ae && atoi(ae) == 0) || !model_path) return false;
+    struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * gc = gguf_init_from_file(model_path, gp);
+    if (!gc) return false;
+    const int64_t ak = gguf_find_key(gc, "general.architecture");
+    const bool qwen4exp = ak >= 0 && strcmp(gguf_get_val_str(gc, ak), "qwen4exp") == 0;
+    gguf_free(gc);
+    if (!qwen4exp) return false;
+#ifndef GGML_USE_CUDA
+    return false;
+#else
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) { cudaGetLastError(); return false; }
+    if (prop.major < 8) {
+        fprintf(stderr, "[auto] Flash-Next needs compute capability 8.0+ for AlphaInfer 2 (this GPU: %d.%d); using the built-in engine\n",
+                prop.major, prop.minor);
+        return false;
+    }
+    return true;
+#endif
+}
+
+// <model dir>/MTP/ holds exactly one .gguf (the draft head AlphaInfer 2 loads for MTP), and the first dre-profile*.bin
+// in <model dir> or <model dir>/MTP/ ("" when there is none).
+static std::string alpha_q4x_find(const char * model_path, bool profile) {
+#if defined(_WIN32)
+    (void) model_path; (void) profile;
+    return "";
+#else
+    const std::string mp(model_path);
+    const size_t sl = mp.find_last_of('/');
+    const std::string dir = sl == std::string::npos ? std::string(".") : mp.substr(0, sl);
+    std::vector<std::string> found;
+    for (const std::string & d : profile ? std::vector<std::string>{ dir, dir + "/MTP" } : std::vector<std::string>{ dir + "/MTP" }) {
+        DIR * dd = opendir(d.c_str());
+        if (!dd) continue;
+        while (struct dirent * e = readdir(dd)) {
+            const std::string n = e->d_name;
+            const bool hit = profile ? (n.rfind("dre-profile", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".bin") == 0)
+                                     : (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0);
+            if (hit) found.push_back(d + "/" + n);
+        }
+        closedir(dd);
+        if (profile && !found.empty()) return found[0];
+    }
+    return !profile && found.size() == 1 ? found[0] : "";
+#endif
+}
 #endif // ALPHA_HAS_ALPHAINFER
 
 int main(int argc, char ** argv) {
@@ -1246,6 +1304,23 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[auto] validated for AlphaInfer: %s\n", air->what);
         fprintf(stderr, "[auto] AlphaInfer-validated model on this GPU -> AlphaInfer backend, %d streams x %d cells%s (--backend local or ALPHA_AUTO=0 keeps the built-in engine)\n",
                 n_slots, n_ctx / (n_slots > 0 ? n_slots : 1), getenv("AI_DFLASH2") ? ", DFlash2 drafter" : "");
+    }
+    else if (!(explicit_backend && mode != MODE_ALPHAINFER) && alpha_auto_qwen4exp(model_path)) {
+        mode = MODE_ALPHAINFER;
+        if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
+        if (!ctx_explicit) n_ctx   = 32768;
+        setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
+        const std::string sidecar = alpha_q4x_find(model_path, /*profile=*/ false);
+        if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : "2", 1);
+        if (!getenv("ALPHA_DRE_PROFILE") && !getenv("AI_Q4X_PROFILE")) {
+            const std::string prof = alpha_q4x_find(model_path, /*profile=*/ true);
+            if (!prof.empty()) setenv("ALPHA_DRE_PROFILE", prof.c_str(), 1);
+        }
+        const bool mtp = atoi(getenv("ALPHA_AI_MTP_K")) > 0;
+        fprintf(stderr, "[auto] Flash-Next (qwen4exp) -> AlphaInfer 2, 1 stream x %d cells, experts offloaded (slots auto), %s, routing profile %s\n",
+                n_ctx, mtp ? "MTP depth 2 (fast verify; ALPHA_AI_MTP_K=0 for plain decode)" : "plain decode (no MTP head in <model dir>/MTP/)",
+                getenv("ALPHA_DRE_PROFILE") ? getenv("ALPHA_DRE_PROFILE") : (getenv("AI_Q4X_PROFILE") ? getenv("AI_Q4X_PROFILE") : "none"));
+        fprintf(stderr, "[auto] (--backend local or ALPHA_AUTO=0 keeps the built-in engine)\n");
     }
 #endif
     // `--backend auto` with no remote URL resolves to the smart local/FI selection below.

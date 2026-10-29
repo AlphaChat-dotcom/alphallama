@@ -1,4 +1,4 @@
-# Release binaries of AlphaLlama v2 Flash.
+# Release binaries of AlphaLlama v2.
 #
 # Run it from the Actions tab (workflow_dispatch) to get the packages as workflow artifacts, or push a tag v* to
 # also attach them to a draft GitHub release. Every package carries BUILD_INFO (commit, toolkit, architectures,
@@ -24,7 +24,7 @@ permissions:
   contents: write
 
 env:
-  PKG: alphallama-v2-flash
+  PKG: alphallama-v2
 
 jobs:
   linux-cuda:
@@ -70,7 +70,7 @@ jobs:
           cp tools/serve/LICENSE "$R/licenses/LICENSE-alphaserve"
           [ -f /usr/local/cuda/EULA.txt ] && cp /usr/local/cuda/EULA.txt "$R/licenses/NVIDIA-CUDA-EULA.txt"
           {
-            echo "AlphaLlama v2 Flash, $N"
+            echo "AlphaLlama v2, $N"
             echo "source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY commit $GITHUB_SHA"
             echo "toolkit: CUDA $(nvcc --version | grep -o 'release [0-9.]*' | cut -d' ' -f2), image nvidia/cuda:12.8.1-devel-ubuntu22.04"
             echo "cuda architectures: $ARCHS (AlphaInfer: 80 and newer)"
@@ -142,7 +142,7 @@ jobs:
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
           if (Test-Path "$env:CUDA_PATH\LICENSE") { Copy-Item "$env:CUDA_PATH\LICENSE" "$r\licenses\NVIDIA-CUDA-LICENSE.txt" }
           @(
-            "AlphaLlama v2 Flash, $n"
+            "AlphaLlama v2, $n"
             "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
             "toolkit: CUDA ${{ matrix.cuda }}, MSVC $($redist.Name)"
             "cuda architectures: ${{ matrix.archs }}"
@@ -224,7 +224,7 @@ jobs:
           Copy-Item licenses\* "$r\licenses" -Recurse
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
           @(
-            "AlphaLlama v2 Flash, $n"
+            "AlphaLlama v2, $n"
             "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
             "toolkit: MSVC $($redist.Name)"
             "build options: GGML_CUDA=OFF ${{ matrix.defines }} (no AlphaInfer on Windows)"
@@ -254,4 +254,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft \
-            --title "AlphaLlama v2 Flash ($GITHUB_REF_NAME)" --notes "Binaries built by the AlphaLlama release workflow from $GITHUB_SHA."
+            --title "AlphaLlama v2 ($GITHUB_REF_NAME)" --notes "Binaries built by the AlphaLlama release workflow from $GITHUB_SHA."

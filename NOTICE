@@ -5,7 +5,9 @@ This product is licensed under the MIT License (see LICENSE), except for the par
 licensed under the Apache License, Version 2.0 (see licenses/LICENSE-apache-2.0). Each of their source
 files carries an "SPDX-License-Identifier: Apache-2.0" header.
 
-- alphainfer/                  the AlphaInfer engine (alphainfer/LICENSE)
+- alphainfer/                  the AlphaInfer engine, including AlphaInfer 2 (the Qwen3.8 Flash-Next
+                               engine with expert offload v2: src/models/qwen4exp*, src/kernels/q4x_*,
+                               src/offload/, src/api/q4x_serve.*) (alphainfer/LICENSE)
 - tools/serve/                 the AlphaServe server (tools/serve/LICENSE)
 - ggml/src/ggml-cuda/dre.cu, dre.cuh, dre_pfcpu.inc, moe-merge.cu, moe-merge.cuh,
   moe-down9.cu, moe-down9.cuh  fused-infer expert offload kernels

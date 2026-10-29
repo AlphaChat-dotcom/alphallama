@@ -21,6 +21,38 @@
 
 #if !defined(_WIN32)
 #include <unistd.h> // execv / access for the MoE auto-route to AlphaServe
+#include <climits>
+#include <cstdlib>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h> // _NSGetExecutablePath
+#endif
+
+// Directory of this executable, for finding alphallama-serve beside it. argv[0] alone is not enough: started from
+// PATH it has no directory, and through a symlink it names the link's directory. Resolves the real file (Linux
+// /proc/self/exe, macOS _NSGetExecutablePath + realpath), else argv[0]'s directory.
+static std::string alpha_self_dir(const char * argv0) {
+    std::string self;
+#if defined(__linux__)
+    char buf[PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        self = buf;
+    }
+#elif defined(__APPLE__)
+    char     buf[PATH_MAX];
+    uint32_t sz = sizeof(buf);
+    char     real[PATH_MAX];
+    if (_NSGetExecutablePath(buf, &sz) == 0 && realpath(buf, real)) {
+        self = real;
+    }
+#endif
+    if (self.empty()) {
+        self = argv0 ? argv0 : "";
+    }
+    const size_t slash = self.find_last_of('/');
+    return slash == std::string::npos ? std::string(".") : self.substr(0, slash);
+}
 #endif
 
 #include "../../src/alpha_hw_planner.h" // alpha_hw_plan_create: detect MoE-won't-fit for auto-route
@@ -135,9 +167,7 @@ int main(int argc, char ** argv) {
                 plan.strategy == ALPHA_HW_SELF_SPEC  ||
                 plan.strategy == ALPHA_HW_CPU_MOE;
             if (moe_offload) {
-                std::string self = argv[0];
-                size_t slash = self.find_last_of("/\\");
-                std::string dir = (slash == std::string::npos) ? std::string(".") : self.substr(0, slash);
+                const std::string dir = alpha_self_dir(argv[0]);
                 std::string serve = dir + "/alphallama-serve";
                 if (access(serve.c_str(), X_OK) == 0) {
                     fprintf(stderr,
