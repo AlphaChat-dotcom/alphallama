@@ -182,6 +182,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // No model given: print how to start a model instead of starting llama.cpp's router mode, which would listen
+    // with no model loaded. The router still starts when it is asked for (--models-dir / --models-preset).
+    if (params.model.path.empty() && params.model.hf_repo.empty() && params.model.url.empty() &&
+        params.models_dir.empty() && params.models_preset.empty()) {
+        fprintf(stderr,
+            "\nUsage:\n"
+            "  alphallama -m model.gguf                 OpenAI-compatible server, retrieval and dev endpoints\n"
+            "  alphallama-serve -m model.gguf           the fast serving engine (MoE offload, AlphaInfer, multi-user)\n"
+            "  alphallama -hf <user>/<repo>[:quant]     download a GGUF from Hugging Face and serve it\n"
+            "  alphallama --models-dir DIR              llama.cpp router mode: serve the models in DIR on demand\n"
+            "  alphallama --help                        all options\n\n");
+        return 1;
+    }
+
     // Auto-route to AlphaServe for MoE models that don't fit VRAM.
     // This engine serves a MoE that spills VRAM through the slow LUT_DIRECT offload path, while
     // AlphaServe's fused-infer / pool-direct path is several times faster on the same model. When
