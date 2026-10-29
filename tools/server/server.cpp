@@ -60,6 +60,46 @@ static std::string alpha_self_dir(const char * argv0) {
 
 #if defined(_WIN32)
 #include <windows.h>
+
+// Directory of this executable (GetModuleFileNameW), for finding alphallama-serve.exe beside it.
+static std::wstring alpha_self_dir_w() {
+    wchar_t buf[4 * MAX_PATH];
+    const DWORD cap = (DWORD) (sizeof(buf) / sizeof(buf[0]));
+    const DWORD n = GetModuleFileNameW(nullptr, buf, cap);
+    const std::wstring self = (n > 0 && n < cap) ? std::wstring(buf, n) : std::wstring();
+    const size_t slash = self.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring(L".") : self.substr(0, slash);
+}
+
+// Windows has no execv: run alphallama-serve.exe with this process's own arguments (the command line after the
+// program name, so the user's quoting is kept), wait for it, and hand back its exit code. Ctrl+C reaches the child
+// through the shared console; this process ignores it while it waits. False if the child could not be started.
+static bool alpha_win_run_serve(const std::wstring & serve, int & rc) {
+    const wchar_t * cl = GetCommandLineW();
+    // skip the program name: a quoted one runs to the closing quote, an unquoted one to the first space or tab
+    if (*cl == L'"') {
+        cl++;
+        while (*cl && *cl != L'"') cl++;
+        if (*cl) cl++;
+    } else {
+        while (*cl && *cl != L' ' && *cl != L'\t') cl++;
+    }
+    std::wstring cmd = L"\"" + serve + L"\"" + cl;
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(serve.c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    SetConsoleCtrlHandler(nullptr, TRUE);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    rc = (int) code;
+    return true;
+}
 #endif
 
 static std::function<void(int)> shutdown_handler;
@@ -142,14 +182,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-#if !defined(_WIN32)
     // Auto-route to AlphaServe for MoE models that don't fit VRAM.
     // This engine serves a MoE that spills VRAM through the slow LUT_DIRECT offload path, while
     // AlphaServe's fused-infer / pool-direct path is several times faster on the same model. When
     // the HW planner classifies the run as MoE offload (LUT_DIRECT / SELF_SPEC / CPU_MOE) and the
     // invocation uses none of the corpus/RAG/dev features this engine owns, exec the
     // alphallama-serve binary next to this one. Its arg parser ignores unknown flags, so argv
-    // passes through unchanged. ALPHA_NO_AUTOROUTE=1 forces this engine.
+    // passes through unchanged (on Windows, which has no exec, it runs as a child and its exit code is returned).
+    // ALPHA_NO_AUTOROUTE=1 forces this engine.
     if (!getenv("ALPHA_NO_AUTOROUTE") && !params.model.path.empty()) {
         bool corpus_or_dev = false;
         for (int i = 1; i < argc; i++) {
@@ -167,9 +207,15 @@ int main(int argc, char ** argv) {
                 plan.strategy == ALPHA_HW_SELF_SPEC  ||
                 plan.strategy == ALPHA_HW_CPU_MOE;
             if (moe_offload) {
+#if defined(_WIN32)
+                const std::wstring serve = alpha_self_dir_w() + L"\\alphallama-serve.exe";
+                const bool have_serve = GetFileAttributesW(serve.c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
                 const std::string dir = alpha_self_dir(argv[0]);
                 std::string serve = dir + "/alphallama-serve";
-                if (access(serve.c_str(), X_OK) == 0) {
+                const bool have_serve = access(serve.c_str(), X_OK) == 0;
+#endif
+                if (have_serve) {
                     fprintf(stderr,
                         "==================================================================\n"
                         "[alphallama] MoE model does not fit VRAM (HW planner strategy: %s).\n"
@@ -180,16 +226,24 @@ int main(int argc, char ** argv) {
                         "==================================================================\n",
                         plan.strategy_name ? plan.strategy_name : "MoE-offload");
                     fflush(stderr);
+#if defined(_WIN32)
+                    int rc = 0;
+                    if (alpha_win_run_serve(serve, rc)) {
+                        return rc;
+                    }
+                    fprintf(stderr, "[alphallama] could not start alphallama-serve.exe (error %lu) — continuing in this engine.\n",
+                            (unsigned long) GetLastError());
+#else
                     argv[0] = const_cast<char *>(serve.c_str());
                     execv(serve.c_str(), argv);
                     // execv only returns on failure; fall through and run in-process.
                     fprintf(stderr, "[alphallama] exec of '%s' failed (%s) — continuing in this engine.\n",
                             serve.c_str(), strerror(errno));
+#endif
                 }
             }
         }
     }
-#endif
 
     // validate batch size for embeddings
     // embeddings require all tokens to be processed in a single ubatch
