@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // GDN prefill short convolution without the history concat (AI_GDN_CONV_PF, default on).
 //
 // The unfused prefill path builds conv_input = concat(conv history [K-1, C], qkv^T [L, C]) and runs ggml's SSM_CONV

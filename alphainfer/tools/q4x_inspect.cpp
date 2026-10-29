@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-inspect: a qwen4exp (Qwen3.8-Flash-Next) GGUF's spec and byte budget, from metadata only.
 //
 //   ai-q4x-inspect <model.gguf | model-00001-of-0000N.gguf>   (a split GGUF's first shard opens every shard)

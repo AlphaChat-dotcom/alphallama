@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Kernel-level check for ALPHA_SMALLM_TC: ggml_mul_mat on CUDA for real 27B shapes at small M, dumped to a file.
 // Run once with ALPHA_SMALLM_TC=0 (ggml's MMQ/MMVQ) and once with ALPHA_SMALLM_TC=1, then compare the dumps:
 //   ai-smallm-check <out.bin> [--time]

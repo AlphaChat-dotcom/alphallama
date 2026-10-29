@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Prompt-lookup drafting core, shared by every Program's engine (also used by the Flash-Next suffix drafter).
 // A stream type S provides: hist (std::vector<int32_t>), lk (std::vector<std::unordered_map<uint64_t, int32_t>>)
 // and lk_done (int64_t).

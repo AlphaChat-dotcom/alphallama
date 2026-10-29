@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The qwen4exp hyper-connection read on fp16 tensor cores, flat in T. Enabled by AI_Q4X_HC_TC=1.
 //
 // The scalar read (q4x_hc.cu: down6 + down4_fin + up_mix9) moves ~7 MB of Q8_0 weights per call, but every weight is

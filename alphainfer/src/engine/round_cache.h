@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // RoundCache: decode rounds recorded once per profile, captured on their second launch and replayed after that, under
 // a graph budget. Model-agnostic: every Program's engine keeps its rounds here, and the caller still decides when a
 // round runs eagerly instead (offload, --eager).

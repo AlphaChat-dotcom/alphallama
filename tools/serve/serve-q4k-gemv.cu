@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused Q4_K x FP16 GEMV kernels
 //
 // W4A16: Weight Q4_K (4-bit quantized), Activation FP16

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "ops/dflash2.h"
 
 #include "ops/adapter.h"

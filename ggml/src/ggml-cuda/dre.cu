@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Device-resolved experts for offloaded-MoE decode. Enabled by ALPHA_DRE=1 (default off).
 //
 // The fused-infer expert cache resolves expert placement on the host: for every MoE layer of every decode

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Small F16-weight GEMV for the router|score and GDN beta|alpha spans (AI_SMALL_GEMV).
 //
 // ggml's mul_mat_vec_f<half, half, T, 256> runs these small (~1 MB) matrices latency-bound, and it

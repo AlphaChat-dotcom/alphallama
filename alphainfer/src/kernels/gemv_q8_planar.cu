@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Q8_0 decode GEMV with no activation quantisation: f32 activations, weights dequantised in
 // registers, fp32 FMA.
 //

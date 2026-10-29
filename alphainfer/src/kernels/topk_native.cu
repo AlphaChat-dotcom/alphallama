@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MoE top-8 routing as a native kernel (AI_TOPK_NATIVE), reading the router logits the add+norm launch made.
 //
 // Replaces ggml's topk_moe_cuda: softmax over 256 experts, then eight sequential warp-argmax rounds

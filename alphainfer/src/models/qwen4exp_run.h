@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Qwen4ExpRun: the runtime of Program<Qwen4Exp>. The eager path (one stream, no rounds) streams routed experts
 // through the ExpertPool with a host routing read per MoE layer and is the reference checked against the
 // alphallama oracle (tools/ref_oracle.cpp, --cpu-experts); the doorbell path runs decode as captured rounds.

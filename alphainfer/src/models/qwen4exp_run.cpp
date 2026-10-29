@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "models/qwen4exp_run.h"
 #include "core/host_mem.h"
 #include "offload/cpu_topo.h"

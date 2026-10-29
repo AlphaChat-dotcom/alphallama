@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // exact.cuh -- device primitives that reproduce ggml's CUDA arithmetic by construction.
 //
 // A fused kernel replaces a chain of ggml ops and must produce the same bits. Three things can make

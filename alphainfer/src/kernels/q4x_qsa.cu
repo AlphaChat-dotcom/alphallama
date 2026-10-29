@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The QSA (qwen4exp indexer sparse attention) block inputs built on the device, for one stream whose
 // cell j holds position j and whose used cells are a prefix -- alphallama's ALPHA_QSA_FAST rule
 // (llama-memory-hybrid-idx.cpp set_input_qsa), which is the layout Qwen4ExpRun keeps. Built from the round's positions

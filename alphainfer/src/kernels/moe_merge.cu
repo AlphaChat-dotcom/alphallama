@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native MoE merge: weighted expert sum + shared expert + residual in one kernel.
 // Compiled with FMA disabled so every product and sum is the same IEEE operation, in the same
 // order, as the separate elementwise ops it replaces.

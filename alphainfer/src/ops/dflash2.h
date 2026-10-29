@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DFlash2 block-diffusion drafter, as closed Ops. Reference: z-lab/dflash dflash/model.py @ 07ebd93.
 //
 // ggml expressions on the adapter, eager or recorded like every other Op.

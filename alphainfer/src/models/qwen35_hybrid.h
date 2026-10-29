@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Program<Qwen35Hybrid>: the hand-written forward for Qwen3.5 / 3.6 hybrid models
 // (gated DeltaNet + gated full attention, sparse MoE with a shared expert).
 //

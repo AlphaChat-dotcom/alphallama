@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-run: correctness harness for Qwen4ExpRun. Prefills a token file through Qwen4ExpRun (one chunk or --chunk N)
 // and writes teacher-forced logits in ai-ref's --score format (i64 n, i64 V, then n x V f32), plus per-layer dumps
 // under the oracle's names (--dump-dir), so tools/q4x_compare.py and layerdiff.py compare against the alphallama

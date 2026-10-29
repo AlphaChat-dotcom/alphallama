@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Acceptance gate for ai_engine_prefill / ai_engine_decode / ai_engine_reset_stream.
  *
  * Pure C, so the "C so the ABI does not depend on either side's flags" promise is exercised rather

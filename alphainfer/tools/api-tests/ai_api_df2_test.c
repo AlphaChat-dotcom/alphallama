@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Acceptance test for DFlash2 through the C API (AI_DFLASH2=<drafter.gguf> at create).
  *
  *   AI_DFLASH2=<drafter.gguf> ai_api_df2_test <model.gguf> <prompt.i32> <cli.i32>

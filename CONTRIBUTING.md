@@ -30,7 +30,8 @@ first; we merge from upstream regularly.
 
 ## Developer Certificate of Origin
 
-Contributions are accepted under the Apache License 2.0. Each commit must be signed off to certify the
+Contributions are accepted under the license of the files they change: the MIT License, or the Apache License 2.0
+for the parts listed in [NOTICE](NOTICE) (their files carry an SPDX header). Each commit must be signed off to certify the
 [Developer Certificate of Origin](https://developercertificate.org/):
 
 ```sh

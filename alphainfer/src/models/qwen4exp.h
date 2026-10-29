@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Program<Qwen4Exp>: GGUF arch "qwen4exp".
 //
 // The model, as the llama path builds it (src/models/qwen4exp.cpp; llama-model.cpp LLM_ARCH_QWEN4EXP):

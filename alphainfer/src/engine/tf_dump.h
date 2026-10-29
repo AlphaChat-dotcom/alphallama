@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The decode-level teacher-forced comparator (AI_TF_*), shared by every Program's engine; the dumps are diffed by
 // tools/tf_compare.py.
 #pragma once

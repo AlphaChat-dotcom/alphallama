@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-bench-head-ncols: is the LM head amortised across verify rows, or paid per row?
 //
 // op::head is a single ggml_mul_mat over [E, n], so the op is batched; the question is whether the kernel

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native chunked Gated DeltaNet prefill with 16-token chunks. Enabled by AI_GDN16.
 //
 // Replaces ggml's chunked scan (gated_delta_net_chunked.cuh: 64-token chunks, 32-column state slices in shared

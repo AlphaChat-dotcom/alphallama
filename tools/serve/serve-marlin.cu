@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Marlin W4A16 Matmul - ported from IST-DASLab/vLLM
 // Standalone: no PyTorch dependency. Uses Tensor Core mma.sync m16n8k16.
 //

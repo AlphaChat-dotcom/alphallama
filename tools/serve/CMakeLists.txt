@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # AlphaServe: Multi-Backend Intelligence Server
 # Backends: ggml (default) + FlashInfer (opt-in) + SGLang proxy
 # Intelligence layer: BM25 + NER retrieval, backend-agnostic

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-ref: the reference forward of this repository's libllama, used as the correctness oracle for alphainfer.
 //
 //   ai-ref -m M.gguf --tokens-in prompt.i32 -n 64 --gen-out ref_gen.i32

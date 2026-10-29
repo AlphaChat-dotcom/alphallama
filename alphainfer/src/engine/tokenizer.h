@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tokenizer shim: llama.cpp's vocabulary code, loaded vocab-only and reused as-is.
 #pragma once
 

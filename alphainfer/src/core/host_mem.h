@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Pinned + mapped host memory for the offload path (RAM tier, admission staging, doorbells).
 //
 // Compaction caveat (seen on Linux 5.15 with proactive compaction on): pinned host memory of any kind -- cudaHostAlloc,

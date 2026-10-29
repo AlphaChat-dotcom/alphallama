@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Prefill-width y[N, T] = W[N, K] (F16, row-major) x[K, T] (f32) on fp16 tensor cores with fp32 accumulation.
 // Enabled by AI_GEMM_F16_PF (default off).
 //

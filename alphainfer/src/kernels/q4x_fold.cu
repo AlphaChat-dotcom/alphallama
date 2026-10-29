@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // [AI_Q4X_FOLD_BATCH] the speculative commit's state folds for EVERY layer in three launches (Qwen4ExpRun::commit):
 //   1. prep: the vendored gdn_prep_kernel's k_hat (L2-normalised k rows), g = softplus(alpha + dt) * a and
 //      beta = sigmoid(beta), per (layer, accepted column);

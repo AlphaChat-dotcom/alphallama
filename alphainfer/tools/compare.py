@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Correctness gate: AlphaInfer vs the llama.cpp forward on the same tokens.
 
   compare.py logits REF.logits AI.logits        teacher-forced top-1 agreement, KL, max |dlogit|

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DFlash2 isolation test: AlphaInfer's drafter forward against the z-lab reference, on identical inputs.
 //
 //   ai-dflash2-check <dflash2.gguf> <target-io.gguf> <oracle prompt dir> [rounds]

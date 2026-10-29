@@ -279,6 +279,7 @@ int main(int argc, char ** argv) {
     ctx_http.post("/api/kv_cache/save",               ex_wrapper(routes.post_kv_save));
     ctx_http.post("/api/kv_cache/load",               ex_wrapper(routes.post_kv_load));
     ctx_http.post("/api/corpus/index",                ex_wrapper(routes.post_kv_index));
+    ctx_http.post("/api/corpus/finalize",             ex_wrapper(routes.post_corpus_finalize));
     ctx_http.post("/api/corpus/query",                ex_wrapper(routes.post_kv_route));
     ctx_http.post("/api/kv_chunk/index",              ex_wrapper(routes.post_kv_index));  // legacy alias
     ctx_http.post("/api/kv_chunk/route",              ex_wrapper(routes.post_kv_route));  // legacy alias

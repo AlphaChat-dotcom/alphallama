@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The device half of the offloaded MoE: resolve routed experts against a device residency table, ring the layer's
 // doorbell for the CPU with the misses, and later wait for the CPU's rows and splice them in. No host
 // synchronisation: the CPU worker polls mapped memory (src/offload/miss_pool.cpp) and these kernels spin on it, so the

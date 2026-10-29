@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Absolute anchor for the caller-driven decode path.
  *
  * The C acceptance test compares a reused slot against a fresh engine, which is a relative test: if

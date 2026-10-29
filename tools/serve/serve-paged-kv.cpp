@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "serve-paged-kv.h"
 #include <algorithm>
 #include <numeric>

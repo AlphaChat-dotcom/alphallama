@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // KV store and recurrent-state slot pool.
 //
 // PagedKv: f16 cells per attention layer, laid out as fixed per-stream regions: stream r owns

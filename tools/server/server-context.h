@@ -160,6 +160,7 @@ struct server_routes {
     server_http_context::handler_t post_kv_save;
     server_http_context::handler_t post_kv_load;
     server_http_context::handler_t post_kv_index;   // BM25 chunk indexing
+    server_http_context::handler_t post_corpus_finalize; // pack df + optionally build inverted postings
     server_http_context::handler_t post_kv_route;   // BM25 query routing
     server_http_context::handler_t post_expert_routing; // Expert routing data for profiling
     server_http_context::handler_t post_oracle;          // 0.8B error oracle for user help

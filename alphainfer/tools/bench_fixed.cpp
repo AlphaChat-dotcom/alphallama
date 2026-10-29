@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-bench-fixed - per-call cost and read rate of the one-token paths, by weight type.
 //
 // Two questions it answers:

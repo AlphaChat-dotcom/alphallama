@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MoE merge + residual + the next layer's input RMS norm, with the merge's full grid kept.
 //
 // Opt-in (AI_FUSE_MERGENORM=3) and slower than the two separate kernels: the lone last block runs the

@@ -9878,6 +9878,54 @@ void server_routes::init_kv_chunk_routes() {
         return res;
     };
 
+    // POST /api/corpus/finalize {} -> pack df, and with ALPHA_BM25_INVERTED=1 build the inverted
+    // postings. Mirrors the tail of the --corpus-dir auto-ingest path, which was the only place this
+    // sequence ran; HTTP ingest is incremental and has no end-of-ingest signal, so the caller signals
+    // it here. Idempotent: finalize_df() and build_inverted() both early-return once done. Documents
+    // indexed afterwards stay searchable via the post-finalize overlay.
+    this->post_corpus_finalize = [this](const server_http_req & req) {
+        (void) req;
+        auto res = std::make_unique<server_http_res>();
+        const bool   want_inverted = bm25_index::bm25_inverted();
+        const size_t n_before      = ctx_server.chunk_bm25.N;
+        auto t0 = std::chrono::steady_clock::now();
+
+        ctx_server.chunk_bm25.finalize_text_store();
+        ctx_server.chunk_bm25.finalize_text_offsets();
+        ctx_server.chunk_bm25.finalize_df();
+
+        float build_ms = 0.0f;
+        if (want_inverted) {
+            const char * td = getenv("TMPDIR");
+            std::string tmpdir = (td && *td) ? td : "/tmp";
+            std::string ppath = tmpdir + "/alpha_bm25_" + std::to_string((long) getpid()) + ".post.bin";
+            auto iv0 = std::chrono::steady_clock::now();
+            const bool was_spill = ctx_server.chunk_bm25.spill_active;
+            ctx_server.chunk_bm25.build_inverted(ppath);
+            build_ms = (float) std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - iv0).count();
+            SRV_INF("BM25 INVERTED (%s, http-finalize): %s - %zu postings bytes, built in %.1fs\n",
+                    was_spill ? "external/spill" : "resident",
+                    ctx_server.chunk_bm25.inverted_active ? "active" : "FAILED (stayed on forward path)",
+                    ctx_server.chunk_bm25.post_mm_len, build_ms / 1000.0f);
+        }
+        ctx_server.chunk_metadata.finalize();
+
+        json result = {
+            {"finalized",          true},
+            {"n_chunks",           ctx_server.chunk_bm25.N},
+            {"n_chunks_before",    (int) n_before},
+            {"inverted_requested", want_inverted},
+            {"inverted_active",    ctx_server.chunk_bm25.inverted_active},
+            {"build_ms",           build_ms},
+            {"total_ms",           (float) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t0).count()},
+        };
+        res->status = 200;
+        res->data = safe_json_to_str(result);
+        return res;
+    };
+
     // /api/kv_chunk/route - BM25 query routing with context filling
     // Supports multi-hop entity expansion when entity index is populated.
     this->post_kv_route = [this](const server_http_req & req) {

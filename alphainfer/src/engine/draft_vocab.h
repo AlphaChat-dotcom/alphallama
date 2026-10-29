@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Script-adaptive MTP draft vocabulary (AI_DRAFT_VOCAB).
 //
 // The draft head holds a fixed number of rows (131072). By default they are the first 131072 ids in merge

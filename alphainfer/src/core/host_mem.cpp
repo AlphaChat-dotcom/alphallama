@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "core/host_mem.h"
 
 #include <cuda_runtime.h>

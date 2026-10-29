@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // qwen4exp (Qwen3.8-Flash-Next) Op bodies over ggml. Contracts and the alphallama code each Op mirrors: q4x_ops.h.
 // Every body here follows the alphallama graph (src/models/qwen4exp.cpp) primitive for primitive; none of op::'s
 // qwen35 fast paths are reused where they would change the math (the GDN output gate is sigmoid here, silu there).

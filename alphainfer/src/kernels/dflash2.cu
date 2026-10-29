@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DFlash2 drafter device helpers: per-round inputs computed from the verify's accept count, and the
 // coherent selector. Both exist so the drafter can sit inside the captured decode round with no host trip.
 #include "kernels/kernels.h"

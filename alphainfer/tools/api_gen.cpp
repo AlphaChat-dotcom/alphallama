@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-api-gen: greedy generation through the C API only (api/ai_engine.h), the calls AlphaServe's adapter makes:
 // create -> per request { prefill (or prefill_chunk pieces) -> decode_mtp / decode rounds -> reset_stream } -> destroy.
 // Writes each request's tokens (the first token included, as ai-q4x-run --gen-out) so a served stream can be checked

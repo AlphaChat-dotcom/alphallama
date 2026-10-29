@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Residual add fused into the RMS norm that always follows it.
 //
 // Every layer does `r = mix + res` then `p = rms_norm(r) * w`, which is two launches: the ADD

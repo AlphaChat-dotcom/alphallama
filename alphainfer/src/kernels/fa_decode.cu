@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native split-K decode attention over a q4_0 KV cache (AI_FA_NATIVE).
 //
 // Attention is the largest part of what an MTP verify round costs over a plain one. ggml's

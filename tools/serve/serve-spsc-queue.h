@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 // Lock-Free Single-Producer Single-Consumer Ring Buffer

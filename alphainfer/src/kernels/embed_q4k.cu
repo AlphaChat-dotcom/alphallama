@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Token-embedding gather from a Q4_K table (some artifacts store token_embd.weight as Q4_K; ggml's CUDA
 // get_rows has no Q4_K path -- llama.cpp gathers it on the CPU). One block per (token, 256-value super-block),
 // one thread per value, the CPU reference's arithmetic (ggml-quants.c dequantize_row_q4_K): d1 = d*sc,

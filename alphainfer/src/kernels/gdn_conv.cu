@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused DeltaNet decode prologue: conv window + depthwise conv + SiLU + q/k L2-norm + gate/beta.
 //
 // Replaces CONCAT (history ++ new columns), SSM_CONV(+SiLU) and ggml's gdn_prep_kernel with one

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Requantise the 2-D matrices of a GGUF (any arch) to one ggml type, keeping every other tensor and all metadata:
 //   ai-requant <in.gguf> <out.gguf> <type: q4_K|q5_K|q6_K|q8_0|q4_0> [skip-substring ...]
 // A matrix is requantised when it is 2-D, its row length is a multiple of the target block, and its name contains

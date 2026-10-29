@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "serve-backend.h"
 
 #define CPPHTTPLIB_NO_EXCEPTIONS

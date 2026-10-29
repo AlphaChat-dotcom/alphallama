@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // CPU kernels for the GSQ-RCO expert types (Flash-Next misses), decoding each weight block once for
 // up to 4 tokens. ggml-cpu's vec_dot decodes a row per (row, token) call; with T tokens of a round sharing a missed
 // expert, the decode (grid lookups, sign tables, scales) is the dominant cost and is amortised T ways here.

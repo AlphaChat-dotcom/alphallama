@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // CpuFfn: dense FFN layers whose weights stay in host memory, for a dense model that misses the card by a little
 // (Qwen3.8-27B UD-Q4_K_M on a 16 GB card). No weight is changed.
 //

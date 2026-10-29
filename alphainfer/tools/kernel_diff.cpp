@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-kernel-diff -- per-kernel differential test: every native fused kernel against the ggml op
 // chain it replaces, byte for byte, on the same inputs.
 //

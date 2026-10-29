@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """q4x_compare.py: correctness check -- teacher-forced logits of ai-q4x-run vs the alphallama oracle (ai-ref --score).
 
     python3 q4x_compare.py ref.logits ours.logits [--tokens p.i32]

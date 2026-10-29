@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tiled split-K decode attention over a q8_0 or q4_0 KV cache (AI_FA_Q).
 //
 // ggml's flash_attn_ext_vec reads a quantised cache far below its f16 bandwidth, so quantised KV reads fewer bytes

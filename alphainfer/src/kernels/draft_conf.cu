@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Draft confidence for AI_MTP_GATE: the max-softmax of a draft head's logits row, 1 / sum_j exp(x_j - max).
 // The confidence-gated verify width reads it (engine.cpp). It only decides how many drafts the next round verifies;
 // it never changes a draft or a verify row, so it has no bearing on exactness. It is well calibrated:

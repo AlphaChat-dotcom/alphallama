@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Take the next layer's input norm off the critical path (AI_FUSE_MERGENORM=4).
 //
 // Under graph replay, removing launches is worth little; what the norm costs is its own serial execution

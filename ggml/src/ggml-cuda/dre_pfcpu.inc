@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ALPHA_DRE_PF_CPU=K (included at the end of dre.cu): for prompt chunks under ALPHA_DRE_PF_PIPE, a non-resident routed
 // expert that only K or fewer of the chunk's tokens route to is not copied over PCIe; the CPU computes it from RAM
 // instead, in parallel with the GPU's resident and copied experts. For so few tokens the CPU work is cheaper than

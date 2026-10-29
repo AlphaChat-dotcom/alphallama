@@ -1,14 +1,25 @@
 AlphaLlama
 Copyright 2026 The AlphaLlama authors
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+This product is licensed under the MIT License (see LICENSE), except for the parts below, which are
+licensed under the Apache License, Version 2.0 (see licenses/LICENSE-apache-2.0). Each of their source
+files carries an "SPDX-License-Identifier: Apache-2.0" header.
+
+- alphainfer/                  the AlphaInfer engine (alphainfer/LICENSE)
+- tools/serve/                 the AlphaServe server (tools/serve/LICENSE)
+- ggml/src/ggml-cuda/dre.cu, dre.cuh, dre_pfcpu.inc, moe-merge.cu, moe-merge.cuh,
+  moe-down9.cu, moe-down9.cuh  fused-infer expert offload kernels
+- src/alpha_mole_expert_cache.*, src/alpha_mole_moe_optimizer*, src/alpha_mole_expert_stacker.*,
+  src/alpha_hw_planner.*       fused-infer expert cache, offload planning and hardware detection
+
+Fused-infer code that lives inside files from llama.cpp / ggml (for example ggml-cuda.cu, mmvq.cu)
+stays under the MIT License with the rest of those files.
 
 It is a fork of llama.cpp and ggml and includes or adapts code from the projects below. Their
 license texts are in licenses/.
 
 - llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT License.
   Copyright (c) 2023-2026 The ggml authors. See licenses/LICENSE-llama.cpp.
-  Files that come from llama.cpp keep the MIT License.
 
 - ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp), MIT License.
   Quantization types and dequantization kernels in ggml/src/ggml-quants-ik.*,
@@ -18,10 +29,11 @@ license texts are in licenses/.
   reference implementation. See licenses/LICENSE-strata.
 
 - Marlin (IST-DASLab, as modified in vLLM / Neural Magic), Apache License 2.0.
-  tools/serve/marlin/ and tools/serve/serve-marlin.cu.
+  tools/serve/marlin/ and tools/serve/serve-marlin.cu keep their Apache-2.0 headers.
+  See licenses/LICENSE-apache-2.0.
 
-- NInfer, Apache License 2.0. The shape of the MoE down-projection kernel in
-  ggml/src/ggml-cuda/moe-down9.cu follows its kernels; the code is original.
+- NInfer. The shape of the MoE down-projection kernel in ggml/src/ggml-cuda/moe-down9.cu
+  follows its kernels; the code is original.
 
 - nlohmann/json, MIT License. See licenses/LICENSE-jsonhpp.
 

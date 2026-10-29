@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DoorbellMoe: model-independent MoE expert offload, for any model whose MoE layers are op::MoeWeights (qwen35moe and
 // others).
 //

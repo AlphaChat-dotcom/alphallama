@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Acceptance gate for MTP through the C API: ai_engine_decode_mtp, ai_engine_max_tokens_per_round,
  * ai_engine_mtp_info, and the shared verify policy (engine/mtp_policy.cpp) applied by ai_engine_create.
  *

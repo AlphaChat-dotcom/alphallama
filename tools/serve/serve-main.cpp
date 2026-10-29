@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaServe Dual-Backend Intelligence Proxy
 //
 // Architecture:

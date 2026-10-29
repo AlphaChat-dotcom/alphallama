@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Attention prologue in one launch (AI_ATTN_PRO): q/k head RMS norms, multi-section RoPE, the K and V cache
 // writes and the gate's contiguous copy.
 //

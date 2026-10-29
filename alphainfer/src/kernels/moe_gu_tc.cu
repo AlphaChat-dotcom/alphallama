@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MTP/DFlash-verify MoE gate/up + SwiGLU on tensor cores for T = 2..8 tokens (AI_MOE_TC=1; fast verify only).
 //
 // The expert FFN is the largest term of a width-8 verify. moe_gu_verify (dp4a, owner dedup) is bit-exact but does

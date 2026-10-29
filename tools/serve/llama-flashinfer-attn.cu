@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // FlashInfer contiguous decode attention kernel
 // Called from ggml-cuda fattn.cu hook.
 // Uses FlashInfer BatchDecode with PAGE_SIZE=16 page table over contiguous KV.

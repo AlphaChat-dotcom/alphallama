@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused qwen4exp MoE routing for T <= 16 rows -- the router GEMV straight from BF16/F16 weights, then
 // softmax over the experts, top-k and the renormalised weights, in two launches (the ggml chain takes ~10: BF16 GEMM via
 // cutlass + 2 activation converts + softmax + 512-wide argsort + get_rows + sum_rows + clamp + div + cont).

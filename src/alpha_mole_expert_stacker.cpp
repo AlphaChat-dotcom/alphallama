@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "alpha_mole_expert_stacker.h"
 #include "llama-model.h"
 #include "ggml.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native qwen4exp hyper-connection read: see q4x_hc.h. Kernels down6 / down4_fin / up_mix5 are ggml's hc-fuse.cu
 // V4 kernels (ALPHA_HC_FUSE_V4, ALPHA_HC_DOWN_RR=2) verbatim; up_mix9 is up_mix5 with the warp's four weight rows
 // staged into shared memory by batched 4-byte loads (~10-15% faster with weights from DRAM, bitwise identical output).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Adapter: runs closed Ops as ggml expressions on ggml's CUDA kernels, interleaved with
 // AlphaInfer's own native kernels.
 //

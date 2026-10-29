@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-gsq-bench: decode-once multi-token GSQ CPU kernels (src/offload/gsq_cpu.cpp) vs ggml-cpu's own vec_dot, on the
 // real expert tensors of a qwen4exp GGUF. Single thread, page-warm, T tokens sharing one expert.
 // Prints per (layer, tensor, T): us per expert matrix for ggml (T separate row passes) and ours, GB/s of weights,

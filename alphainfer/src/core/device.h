@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer device: owns every byte of device memory the engine uses.
 //
 // Rules:

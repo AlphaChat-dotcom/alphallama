@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Bridge from AlphaInfer's MoE op to ggml's nine-way down kernel (ALPHA_MOE_DOWN9).
 //
 // The kernel uses one block per output row and one warp per expert path, with the codec chosen by

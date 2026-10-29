@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Parallel argmax over the vocabulary.
 //
 // ggml's argmax kernel uses one block per row, so a decode step reduces a ~248k-entry vocabulary row on

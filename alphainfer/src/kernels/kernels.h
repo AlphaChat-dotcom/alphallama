@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer native kernels and stream-capture primitives (CUDA TUs in src/kernels).
 //
 // Plain C++ interface: no CUDA or ggml types. Every kernel is launched on the stream the ggml

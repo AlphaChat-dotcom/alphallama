@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "serve-cuda-graph.h"
 #include <cstdlib>   // getenv
 #include <cstdio>    // snprintf, fprintf

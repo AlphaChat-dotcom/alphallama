@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Decode-once multi-token CPU kernels for the GSQ-RCO expert types. See gsq_cpu.h.
 // Tables and block layouts come from ggml-common.h (the same ones ggml-cpu uses).
 #define GGML_COMMON_DECL_CPP

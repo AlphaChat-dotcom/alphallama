@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-hcbench: the native hyper-connection read (kernels/q4x_hc.cu) at qwen4exp shapes on synthetic
 // weights: N = 2560 streams of H = 4, low rank LR = 320, Q8_0 down [HD -> LR] / up [LR -> HD], BF16 inject rows.
 // Times q4x_hc_read per call for each T and up-mix variant, and compares the variants' outputs (rel-L2, max |d|).

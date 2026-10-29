@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ExpertPool: device slots of routed-expert weights.
 //
 // The full expert banks live in registered host memory. Device slot banks have the same row layout

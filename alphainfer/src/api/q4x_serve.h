@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 // Q4xServe: the C API's backend for qwen4exp (Qwen3.8-Flash-Next) models -- one stream, doorbell expert offload,

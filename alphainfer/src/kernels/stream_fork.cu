@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Second compute stream for the ggml CUDA backend (AI_MOE_CONCURRENT).
 //
 // Small GEMVs lose a fixed few microseconds per kernel to ramp and drain, independent of grid size, which only

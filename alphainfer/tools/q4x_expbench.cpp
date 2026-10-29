@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-expbench: is the grouped expert kernel (kernels/q4x_experts.cu) byte-bound or issue-bound at verify width T,
 // and how does the wide (host-plan) kernel scale to 16..512 columns?
 //

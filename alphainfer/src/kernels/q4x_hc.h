@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native qwen4exp hyper-connection read (q4x::hc_read for <= 8 rows, Q8_0 low-rank down/up): ggml's
 // ggml_hc_mix_fused V4 kernels (hc-fuse.cu: down6 + down4_fin + up_mix5) moved into AlphaInfer, with the up-mix's
 // weight rows staged through shared memory by batched 4-byte loads (one DRAM latency per warp instead of a chain of

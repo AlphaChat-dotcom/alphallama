@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // GDN output gate in one kernel: fin = silu(z) * (rms_norm(out) * w), plus its q8_1 copy (AI_GDN_GATE).
 //
 // Every GDN layer ends with rms_norm_f32<256>, the SwiGLU-split gate and a quantize_q8_1 for the

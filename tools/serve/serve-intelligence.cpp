@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "serve-intelligence.h"
 #ifdef ALPHA_HAS_REDIS
 #include "server-redis.h"

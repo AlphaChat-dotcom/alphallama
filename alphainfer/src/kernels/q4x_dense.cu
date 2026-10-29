@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dense small-M GEMV on fp16 tensor cores with fp16 activations: out[t][n] = sum_k W[n][k] x[t][k], T <= 32.
 //
 // ggml's MMVQ quantises the activations to q8_1 and runs dp4a per column: on the qwen4exp dense projections

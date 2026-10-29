@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Draft-vocab delta gate: prefill cost and draft-head behaviour across a sequence of requests on one engine.
  *
  *   ai_api_draftvocab_test <model.gguf> <n_gen> <prompt1.i32> [<prompt2.i32> ...]

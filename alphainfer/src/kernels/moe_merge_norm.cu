@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MoE merge + residual + the next layer's input RMS norm, in one kernel.
 //
 // The merge already ends a layer with y = sum_j e_j*w_j + shared*sigmoid(score) + residual. The very

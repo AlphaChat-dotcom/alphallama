@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DFlash2 drafter (Qwen3.8-27B): weights, cyclic context KV and one draft round. Also DFlash v1
 // (z-lab/Qwen3.6-35B-A3B-DFlash, dflash2.variant = 1): no convs, no selector (drafts = argmax of the head),
 // causal sliding layers and full-attention layers, which keep a linear context KV (cell = position).

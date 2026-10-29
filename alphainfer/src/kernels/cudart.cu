@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Stream access and whole-round capture. Includes the ggml CUDA backend's context definition to
 // reach its compute stream.
 #include "kernels/kernels.h"

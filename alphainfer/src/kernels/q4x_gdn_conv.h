@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native GDN short conv (q4x_gdn_conv.cu): conv + SiLU over [history | new qkv columns] read in place.
 #pragma once
 

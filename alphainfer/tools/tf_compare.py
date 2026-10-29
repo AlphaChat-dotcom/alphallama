@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Compare two AI_TF_DUMP files (engine.cpp [AI_TF]) by decode position, bitwise.
 
     tf_compare.py plain.tf mtp.tf

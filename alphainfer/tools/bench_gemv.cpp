@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-bench-gemv - one-token projection latency on the model's real weights.
 //
 // Each case is one projection role across every layer that has it. Each (arm, layer) is recorded

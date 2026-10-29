@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 # DFlash2 drafter (z-lab, HF safetensors BF16) -> GGUF, arch "dflash2".
 #
 #   convert_dflash2.py <hf dir> <out.gguf> [--mat q8_0|bf16]

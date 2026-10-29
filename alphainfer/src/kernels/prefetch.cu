@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // L2 prefetch of expert weight spans.
 //
 // One kernel thread per (bank, slot) pair issues `prefetch.global.L2::evict_normal` on every

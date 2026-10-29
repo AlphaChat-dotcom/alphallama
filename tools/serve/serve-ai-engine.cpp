@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer engine adapter. See serve-ai-engine.h for why this shape and what it
 // deliberately does not support.
 

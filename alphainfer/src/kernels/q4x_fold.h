@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // [AI_Q4X_FOLD_BATCH] every layer's speculative-commit fold in three launches (q4x_fold.cu)
 #include <cstddef>

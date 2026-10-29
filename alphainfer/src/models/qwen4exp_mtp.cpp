@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The qwen4exp (Flash-Next) MTP draft block -- sidecar load, head K/V fill and the draft chain.
 //
 // Reference: src/llama-context-mtp4.cpp. One trunk-shaped layer with

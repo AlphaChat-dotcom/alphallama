@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-densebench: the fp16 tensor-core dense GEMV (kernels/q4x_dense.cu) on synthetic rows.
 //   check: vs an fp64 reference built from ggml's own CPU dequantisation (type traits to_float) and the fp32 x;
 //   speed: us per call and the DRAM rate over the weight bytes, per T.

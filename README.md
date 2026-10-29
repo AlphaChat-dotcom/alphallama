@@ -1,6 +1,6 @@
 # AlphaLlama
 
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 AlphaLlama is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running large language models on
 consumer GPUs, with a focus on Mixture-of-Experts (MoE) models that do not fit in VRAM.
@@ -83,5 +83,7 @@ the MIT License; see [NOTICE](NOTICE). Documentation in [docs/](docs) is llama.c
 
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE). Third-party code and licenses are listed in [NOTICE](NOTICE) and
+MIT License, see [LICENSE](LICENSE), except the AlphaInfer engine ([alphainfer/](alphainfer)), the AlphaServe
+server ([tools/serve/](tools/serve)) and the fused-infer expert-offload code, which are Apache License 2.0. The
+exact file list is in [NOTICE](NOTICE). Third-party code and licenses are listed in [NOTICE](NOTICE) and
 [licenses/](licenses).

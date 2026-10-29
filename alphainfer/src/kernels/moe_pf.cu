@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Prefill-sized routed experts as grouped int8 tensor-core GEMMs. Enabled by AI_MOE_PF.
 //
 // ggml's MMQ MUL_MAT_ID streams expert weights at a fraction of DRAM bandwidth at prefill shapes (stream-k, one

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Check AlphaInfer's dtype table against ggml's own size functions.
  *
  * ggml_type_size() / ggml_blck_size() / ggml_row_size() are the values the kernels actually use, so

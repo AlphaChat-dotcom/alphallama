@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Device-side speculation kernels: everything that lets verify, accept, fold and the next
 // draft chain run as one captured round with one sync. All take B streams laid out
 // stream-major (row = b * L + t).

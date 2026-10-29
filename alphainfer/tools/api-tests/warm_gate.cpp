@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Test for eager profile instantiation.
  *
  * The property that matters is not that warm_profiles returns a number but that nothing

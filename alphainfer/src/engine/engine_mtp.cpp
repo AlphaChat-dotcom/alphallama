@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MTP self-speculative decoding.
 //
 // One decode step = one round (B streams, L = k_in + 1 rows each, stream-major):

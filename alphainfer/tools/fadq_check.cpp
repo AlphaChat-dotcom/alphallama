@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Kernel-level check for kernels/fa_decode_q.cu (AI_FA_Q) on the 35B attention shape (D 256, Hq 16, Hkv 2):
 //   1. accuracy vs an f64 reference on the dequantised cache with f32 Q (the kernel quantises Q per 32);
 //   2. MTP == plain: an L=4 verify row is bitwise equal to the same row run alone at L=1;

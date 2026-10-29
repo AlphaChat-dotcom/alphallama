@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Soak test for a 2-slot MTP server on the C API (the serving path: AlphaServe -> ai_engine_*).
  *
  *   ai_api_soak_test <model.gguf> <tokens_a.i32> [<tokens_b.i32> ...]

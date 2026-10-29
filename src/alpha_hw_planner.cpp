@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "alpha_hw_planner.h"
 #include "alpha_mole_moe_optimizer.h"  // for ALPHA_LOG_DBG
 #include "gguf.h"

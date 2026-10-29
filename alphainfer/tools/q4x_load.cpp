@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-q4x-load: load a qwen4exp (Flash-Next) model through Program<Qwen4Exp> -- device dense weights (hc projections
 // converted BF16 -> Q8_0), host-mapped experts and PLE table -- bind and shape-check every layer, report memory.
 //

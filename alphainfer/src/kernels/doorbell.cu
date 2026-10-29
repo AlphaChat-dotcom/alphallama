@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Generic doorbell offload kernels; see kernels/doorbell.h and offload/doorbell_moe.h.
 #include "kernels/doorbell.h"
 

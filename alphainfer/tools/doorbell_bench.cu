@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ai-doorbell-bench: the GPU <-> CPU handshake the offload window is built on.
 //
 // Per "layer": a kernel rings a doorbell in mapped host memory (seq = i), a CPU worker spinning on it answers

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // FlashInfer forward pass engine
 //
 // Reads weights from llama_model, runs inference via cuBLAS + FlashInfer.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ALPHA_MOE_MERGE: fused MoE output merge. See moe-merge.cuh.
 // Compiled with -fmad=false (CMakeLists.txt): the op chain it replaces multiplies in one kernel and adds in
 // another, so a contracted fma(e, w, s) here would not be bitwise equal to it.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaServe CUDA Kernels
 //
 // Lightweight kernels for the FlashInfer forward pass engine:

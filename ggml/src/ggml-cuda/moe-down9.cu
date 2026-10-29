@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused MoE down projection (ALPHA_MOE_DOWN9), see moe-down9.cuh
 #include "moe-down9.cuh"
 #include "quantize.cuh"

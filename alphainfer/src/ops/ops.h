@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer closed Op set.
 //
 // Each Op is a semantic unit of the forward pass: it owns every primitive inside it, reads only

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Bridge from AlphaInfer's native producers to ggml's q8_1 staging registry.
 //
 // The registry lives in the CUDA backend (ggml-cuda/q8stage.cuh) and its consumer side is the GEMV's

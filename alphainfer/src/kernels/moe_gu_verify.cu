@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MTP-verify MoE gate/up + SwiGLU in one launch, with expert dedup and activation reuse (AI_MOE_GU).
 //
 // At verify width T (2..8) ggml runs the routed experts' gate and up as two mul_mat_vec_q_moe launches (one

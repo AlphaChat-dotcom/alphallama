@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "serve-scheduler.h"
 #include "common.h"
 #include "build-info.h"   // llama_commit(): stamp every measurement with its source id

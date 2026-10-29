@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // qwen4exp routed experts at verify width, grouped by slot: gate + up + SwiGLU in one launch, then the down
 // projection, over the doorbell slot banks.
 //

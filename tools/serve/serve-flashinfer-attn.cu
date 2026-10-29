@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // FlashInfer Attention Kernel Integration
 //
 // Wraps FlashInfer's optimized BatchDecodeWithPagedKVCache kernel for use

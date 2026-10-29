@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // GDN prompt scan for prefill (q4x_gdn_scan.cu): a parallel short conv and the gated delta rule token by token with the
 // state in registers.
 #pragma once

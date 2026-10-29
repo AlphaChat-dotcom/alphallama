@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Layer-major prefill for long prompts in doorbell mode.
 //
 // The doorbell path runs rounds of <= kDoorbellT rows, so a long prompt takes thousands of rounds. Token-major large

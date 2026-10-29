@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Minimal cuda/cmath compatibility shim for CUDA 12.2
 // Provides cuda::fast_mod_div needed by FlashInfer's fastdiv.cuh
 #pragma once

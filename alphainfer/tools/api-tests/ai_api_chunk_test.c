@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* Test for ai_engine_prefill_chunk (AI_PREFILL_CHUNK): a prompt fed in pieces, with another stream decoding between
  * the pieces, must produce exactly the tokens of a one-shot prefill. References are the single-stream CLI's tokens
  * (--dump-tokens / --gen-out), as for ai_api_mtp_test; run the CLI at the same --ctx/--kv-type/--chunk 1024 and

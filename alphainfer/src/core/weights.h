@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // GGUF -> resident WeightSet. GGUF is the only artifact.
 //
 // Loads once, before finalize(): every tensor is packed into device buffers of at most

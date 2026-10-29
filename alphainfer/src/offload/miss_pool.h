@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The host half of the doorbell offload MoE: per-layer doorbells in mapped host memory and a CPU worker
 // pool that computes the routed experts the device residency table missed (gate/up -> SwiGLU -> down with ggml-cpu's
 // own vec_dot per type, activations quantised to each type's vec_dot_type). The device half is kernels/offload.cu.

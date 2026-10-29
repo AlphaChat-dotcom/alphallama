@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer core tensor view.
 //
 // A Tensor is a non-owning view: a device pointer, the buffer it lives in, a dtype and 4-D

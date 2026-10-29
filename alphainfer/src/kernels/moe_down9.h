@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The MoE block's tail in one kernel (ALPHA_MOE_DOWN9): the routed experts' down projection over k
 // slots, the shared expert's down under its own codec, the routing-weighted merge, the sigmoid gate
 // and the residual. One block per output row, one warp per path, codec chosen by warp index.

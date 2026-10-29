@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The qwen4exp Ops: contracts. Bodies are adapter Ops over ggml, in src/ops/q4x_ops.cpp.
 //
 // Every Op mirrors the llama graph builder function named next to it (src/models/qwen4exp.cpp), primitive for

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Native GDN short conv for <= 8 rows per stream (q4x::gdn_block_sigz): the history columns and the new qkv columns are
 // read in place -- no materialised concat (the transpose makes concat_f32_non_cont a slow strided gather), no separate
 // state copy -- and the conv + SiLU is ssm_conv_f32<true>'s arithmetic exactly (the same

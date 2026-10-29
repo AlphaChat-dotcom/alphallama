@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Router GEMV + top-k in one launch (AI_ROUTER_TOPK). Bit-exact against the two ggml kernels it replaces:
 //
 //   phase 1  every block = one router row: ggml's mul_mat_vec_f<half, half, T, 256> verbatim -- half2

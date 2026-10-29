@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Hand-Tuned Small-M GEMM Kernel
 //
 // Optimized for decode batches where M=1-8 (tall-and-skinny).

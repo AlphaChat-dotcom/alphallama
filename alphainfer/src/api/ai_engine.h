@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 // AlphaInfer C API: the contract AlphaServe's engine adapter links against.

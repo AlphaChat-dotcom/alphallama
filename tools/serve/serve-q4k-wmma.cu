@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Q4_K Tensor Core WMMA Matmul Kernel
 //
 // Marlin-style: dequant Q4_K in shared memory -> wmma Tensor Core matmul

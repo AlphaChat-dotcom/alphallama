@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The process-wide verify configuration for an AlphaInfer run: MTP exact/fast, the verify pins, the K clamp and the
 // confidence-gate default. Shared by every entry point (apps/alphainfer.cpp, the C API), so a default changed for
 // the CLI also applies to AlphaServe.

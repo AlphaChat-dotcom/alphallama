@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Generic doorbell offload kernels (offload/doorbell_moe.h): the device half of a model-independent MoE offload.
 // Unlike kernels/offload.cu (qwen4exp's window protocol), every bell keeps its own sequence counter in device memory:
 // a ring advances it, the wait reads it back, so a captured graph replays with fresh numbers and a bell may ring any

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // AlphaInfer C API implementation. See api/ai_engine.h for what is and is not implemented and why.
 
 #include "api/ai_engine.h"

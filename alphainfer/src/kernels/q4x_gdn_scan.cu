@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // GDN prompt scan for prefill (q4x::gdn_block_sigz, rows per call > 64): the gated delta rule token by token with the
 // state slice in registers. One block per (key head, 32-column group): 16 x 4 = 64 blocks
 // of 32 x 4 threads; a thread holds column `col` of the three value heads that share its key head (head kh + j * Hk, the

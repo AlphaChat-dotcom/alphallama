@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // MoE merge + residual + the next layer's input RMS norm, without losing the merge's parallelism.
 //
 // The straightforward fusion (moe_merge_norm.cu) is bit-identical but gains nothing: a row-wide

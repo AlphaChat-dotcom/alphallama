@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Prototype: Q8_0 weights x int8 activations, one token (GEMV).
 //
 //   quantize_act_q8: x (f32, n = 32*nb) -> q (int8, per-32 symmetric) and d (f32 per block)

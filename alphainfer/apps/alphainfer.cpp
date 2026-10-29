@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // alphainfer CLI.
 //
 //   generate:  alphainfer -m M.gguf -p "text" [--chat] [-n 64]
