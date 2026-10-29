@@ -85,8 +85,19 @@ static bool alpha_win_run_serve(const std::wstring & serve, int & rc) {
         while (*cl && *cl != L' ' && *cl != L'\t') cl++;
     }
     std::wstring cmd = L"\"" + serve + L"\"" + cl;
+    // pass this process's standard handles on explicitly: without STARTF_USESTDHANDLES a child of a process whose
+    // output is redirected (a log file, a service) writes to the console instead, and its output is lost
     STARTUPINFOW si = {};
-    si.cb = sizeof(si);
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    for (HANDLE h : { si.hStdInput, si.hStdOutput, si.hStdError }) {
+        if (h && h != INVALID_HANDLE_VALUE) {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
+    }
     PROCESS_INFORMATION pi = {};
     if (!CreateProcessW(serve.c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
         return false;

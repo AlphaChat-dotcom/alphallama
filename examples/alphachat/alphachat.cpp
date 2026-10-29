@@ -50,9 +50,11 @@
 
 #if defined(__linux__)
 #include <sys/prctl.h>
-#include <unistd.h>
-#elif defined(_WIN32)
+#endif
+#if defined(_WIN32)
 #include <io.h>
+#else
+#include <unistd.h>
 #endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -3524,8 +3526,11 @@ static bool daemon_start_backend(daemon_state & state, const std::string & model
 #else
         pid_t pid = fork();
         if (pid == 0) {
-            // Die when the parent exits so the engine process is not orphaned
+            // Die when the parent exits so the engine process is not orphaned (Linux only; elsewhere the check
+            // below catches a parent that already exited)
+#if defined(__linux__)
             prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
             // Re-check: parent may have died between fork and prctl
             if (getppid() == 1) _exit(0);
 

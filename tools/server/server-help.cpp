@@ -334,7 +334,7 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
     }
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     for (int start = 0; start < n; start += n_batch) {
-        const int cnt = std::min(n_batch, n - start);
+        const int cnt = (std::min)(n_batch, n - start);   // parenthesised: windows.h defines a min macro
         for (int i = 0; i < cnt; ++i) {
             batch.token[i]     = tokens[start + i];
             batch.pos[i]       = start + i;

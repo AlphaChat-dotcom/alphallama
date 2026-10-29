@@ -292,7 +292,8 @@ jobs:
             -DLLAMA_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR="$SSL" \
             -DOPENSSL_INCLUDE_DIR="$SSL/include" -DOPENSSL_CRYPTO_LIBRARY="$SSL/lib/libcrypto.a" \
             -DOPENSSL_SSL_LIBRARY="$SSL/lib/libssl.a"
-          cmake --build build -j "$(sysctl -n hw.ncpu)"
+          # -k: report every target that fails, not only the first
+          cmake --build build -j "$(sysctl -n hw.ncpu)" -- -k
 
       - name: Package
         run: |
