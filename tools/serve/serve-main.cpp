@@ -824,7 +824,13 @@ static std::string alpha_ai_find_drafter(const char * model_path, const char * r
     if (const char * e = getenv("ALPHA_AI_DRAFTER")) return e;
     if (!rel || !model_path) return "";
     struct stat st;
-    const std::string mp(model_path), r(rel);
+    // resolve the model path first: from a relative -m ("model.gguf" in the model's own directory) the directory is
+    // ".", and its parent, where the sibling drafter directory lives, would come out as "." instead of ".."
+    std::string mp(model_path);
+#if !defined(_WIN32)
+    if (char * abs = realpath(model_path, nullptr)) { mp = abs; free(abs); }
+#endif
+    const std::string r(rel);
     const size_t s1 = mp.rfind('/');
     const std::string dir = s1 == std::string::npos ? "." : mp.substr(0, s1);
     const size_t rs = r.rfind('/');
@@ -1313,15 +1319,26 @@ int main(int argc, char ** argv) {
         if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
         if (!ctx_explicit) n_ctx   = 32768;
         setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
+        // 16 GB-class cards (under 20 GB): the prefill borrows the last layers' slot banks (AI_Q4X_LEND), so the auto
+        // slot count can hold more experts through decode (4080: 92 -> 114 per layer), and MTP drafts 3 deep with min-p
+        // 0.5. Measured on the 4080 (sets A / V / R: 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1). Larger cards keep
+        // depth 2 without lending until measured there.
+        size_t vram_free = 0, vram_total = 0;
+        alpha_vram_info(&vram_free, &vram_total);
+        const bool card16 = vram_total > 0 && vram_total < (20ull << 30);
+        if (card16) setenv("AI_Q4X_LEND", "1", /*overwrite=*/ 0);
         const std::string sidecar = alpha_q4x_find(model_path, /*profile=*/ false);
-        if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : "2", 1);
+        if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : (card16 ? "3" : "2"), 1);
+        if (card16 && atoi(getenv("ALPHA_AI_MTP_K")) > 0) setenv("AI_Q4X_MTP_MINP", "0.5", /*overwrite=*/ 0);
         if (!getenv("ALPHA_DRE_PROFILE") && !getenv("AI_Q4X_PROFILE")) {
             const std::string prof = alpha_q4x_find(model_path, /*profile=*/ true);
             if (!prof.empty()) setenv("ALPHA_DRE_PROFILE", prof.c_str(), 1);
         }
         const bool mtp = atoi(getenv("ALPHA_AI_MTP_K")) > 0;
-        fprintf(stderr, "[auto] Flash-Next (qwen4exp) -> AlphaInfer 2, 1 stream x %d cells, experts offloaded (slots auto), %s, routing profile %s\n",
-                n_ctx, mtp ? "MTP depth 2 (fast verify; ALPHA_AI_MTP_K=0 for plain decode)" : "plain decode (no MTP head in <model dir>/MTP/)",
+        const std::string mtp_desc = std::string("MTP depth ") + getenv("ALPHA_AI_MTP_K") + " (fast verify; ALPHA_AI_MTP_K=0 for plain decode)";
+        fprintf(stderr, "[auto] Flash-Next (qwen4exp) -> AlphaInfer 2, 1 stream x %d cells, experts offloaded (slots auto%s), %s, routing profile %s\n",
+                n_ctx, getenv("AI_Q4X_LEND") && atoi(getenv("AI_Q4X_LEND")) ? ", prefill lends slot banks" : "",
+                mtp ? mtp_desc.c_str() : (sidecar.empty() ? "plain decode (no MTP head in <model dir>/MTP/)" : "plain decode (ALPHA_AI_MTP_K=0)"),
                 getenv("ALPHA_DRE_PROFILE") ? getenv("ALPHA_DRE_PROFILE") : (getenv("AI_Q4X_PROFILE") ? getenv("AI_Q4X_PROFILE") : "none"));
         fprintf(stderr, "[auto] (--backend local or ALPHA_AUTO=0 keeps the built-in engine)\n");
     }

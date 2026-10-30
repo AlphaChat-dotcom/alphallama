@@ -455,22 +455,55 @@ void Qwen4ExpRun::init_doorbell(int slots) {
     // VRAM. T = 1 then takes the grouped kernel too: same products, but not the chain's ncols_dst == 1 reduction order.
     fillers_ = getenv("AI_Q4X_FILLERS") && atoi(getenv("AI_Q4X_FILLERS")) != 0;
     const int nb = slots + (fillers_ ? k : 0);
-    size_t total = 0;
-    for (size_t il = 0; il < layers.size(); ++il) {
-        const auto & m = layers[il].moe;
-        total += (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]) * (size_t) nb + (size_t) E * 4 + 4096;
+    const int L  = (int) layers.size();
+    auto bank_bytes = [&](int il) {
+        const auto & m = layers[(size_t) il].moe;
+        return (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]) * (size_t) nb + 3 * 256;
+    };
+    // [AI_Q4X_LEND=1] the last layers' banks go into their own buffer, big enough for a prefill's state and expert
+    // scratch at the largest super-chunk (prefill() takes one chunk up to S + S/8): the prefill borrows it (lend_begin /
+    // lend_end) instead of the auto slot count keeping that memory free through decode. The lent layers' experts are
+    // non-resident during a prefill and copied back after it.
+    static const bool lend_on = getenv("AI_Q4X_LEND") && atoi(getenv("AI_Q4X_LEND")) != 0;
+    size_t lend_need = 0;
+    int    nl        = 0;
+    if (lend_on) {
+        const int64_t sub = std::max<int64_t>(8, getenv("AI_Q4X_PREFILL_SUB") ? atoll(getenv("AI_Q4X_PREFILL_SUB")) : 256);
+        int64_t       S   = std::max<int64_t>(8, getenv("AI_Q4X_PREFILL_SUPER") ? atoll(getenv("AI_Q4X_PREFILL_SUPER")) : 16384);
+        S = (S + S / 8 + sub - 1) / sub * sub;
+        size_t per_max = 0;
+        for (const auto & l : layers) per_max = std::max(per_max, (size_t) (l.moe.gate_exps.nb[2] + l.moe.up_exps.nb[2] + l.moe.down_exps.nb[2]));
+        lend_need = (pf_state_bytes(S, sub) + 255) / 256 * 256 + (size_t) E * per_max + 3 * 256;
+        size_t acc = 0;
+        while (nl < L - 1 && acc < lend_need) acc += bank_bytes(L - 1 - nl++);
+        if (acc < lend_need) nl = 0;
+    }
+    lend_from_ = nl > 0 ? L - nl : (1 << 30);
+    size_t total = 0, lend_total = 0;
+    for (int il = 0; il < L; ++il) {
+        total += (size_t) E * 4 + 4096;
+        (il >= lend_from_ ? lend_total : total) += bank_bytes(il);
     }
     const int buf  = dev_.alloc_buffer(total, "q4x.slots");
     char *    base = (char *) dev_.buffer_base(buf);
-    size_t    off  = 0;
-    auto bank = [&](const Tensor & h) {
+    size_t    off  = 0, loff = 0;
+    char *    lbase = nullptr;
+    if (nl > 0) {
+        lend_bytes_ = std::max(lend_total, lend_need);
+        lend_buf_   = dev_.alloc_buffer(lend_bytes_, "q4x.lend");
+        lbase       = (char *) dev_.buffer_base(lend_buf_);
+        fprintf(stderr, "[q4x] lend: layers %d..%d keep their banks in a %.0f MiB buffer a prefill borrows (needs %.0f MiB)%c",
+                lend_from_, L - 1, lend_bytes_ / 1048576.0, lend_need / 1048576.0, 10);
+    }
+    auto bank = [&](const Tensor & h, bool lent) {
         Tensor t = h;
-        t.buf    = buf;
+        t.buf    = lent ? lend_buf_ : buf;
         t.ne[2]  = nb;
         set_contiguous_strides(t);
-        off    = (off + 255) / 256 * 256;
-        t.data = base + off;
-        off   += t.nbytes();
+        size_t & o = lent ? loff : off;
+        o      = (o + 255) / 256 * 256;
+        t.data = (lent ? lbase : base) + o;
+        o     += t.nbytes();
         return t;
     };
     std::vector<offload::ExpertBanks> host;
@@ -479,9 +512,9 @@ void Qwen4ExpRun::init_doorbell(int slots) {
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto & m = layers[il].moe;
         SlotBank &   B = banks_[il];
-        B.gate    = bank(m.gate_exps);
-        B.up      = bank(m.up_exps);
-        B.down    = bank(m.down_exps);
+        B.gate    = bank(m.gate_exps, (int) il >= lend_from_);
+        B.up      = bank(m.up_exps, (int) il >= lend_from_);
+        B.down    = bank(m.down_exps, (int) il >= lend_from_);
         B.n_slots = slots;
         off       = (off + 255) / 256 * 256;
         B.table.buf  = buf;
@@ -1350,6 +1383,10 @@ void Qwen4ExpRun::admit_kick() {
 // round; a victim is unmapped in that copy, and its new expert is mapped only after its H2D copy has landed.
 void Qwen4ExpRun::admit_after_round() {
     static const int max_admit = getenv("AI_Q4X_ADMIT") ? atoi(getenv("AI_Q4X_ADMIT")) : 32;
+    // [AI_Q4X_ADMIT_THR, default 2] a missed expert's decayed use count needed to be admitted; [AI_Q4X_ADMIT_RATIO,
+    // default 1.5] and at least this times the coldest resident's (hysteresis)
+    static const float admit_thr   = getenv("AI_Q4X_ADMIT_THR") ? (float) atof(getenv("AI_Q4X_ADMIT_THR")) : 2.0f;
+    static const float admit_ratio = getenv("AI_Q4X_ADMIT_RATIO") ? (float) atof(getenv("AI_Q4X_ADMIT_RATIO")) : 1.5f;
     if (!doorbell_ || banks_.empty()) return;
     const Qwen4ExpSpec & s = prog_.spec();
     const int k = s.n_expert_used, E = s.n_expert;
@@ -1410,7 +1447,7 @@ void Qwen4ExpRun::admit_after_round() {
         std::sort(cand.begin(), cand.end(), [](const Cand & a, const Cand & b) { return a.score > b.score; });
         for (const Cand & cd : cand) {
             if (issued >= max_admit || pending_.size() >= staging_.size()) break;
-            if (cd.score < 2.0f) break;
+            if (cd.score < admit_thr) break;
             SlotBank & B = banks_[(size_t) cd.layer];
             if (B.table_h[(size_t) cd.expert] >= 0) continue;
             bool in_flight = false;
@@ -1423,7 +1460,7 @@ void Qwen4ExpRun::admit_after_round() {
                 if (e < 0) continue;   // pending
                 if (B.score[(size_t) e] < vs) { vs = B.score[(size_t) e]; victim = sl; }
             }
-            if (victim < 0 || cd.score < 1.5f * vs + 1e-6f) continue;
+            if (victim < 0 || cd.score < admit_ratio * vs + 1e-6f) continue;
             const int32_t old = B.owner[(size_t) victim];
             B.table_h[(size_t) old]  = -1;   // unmapped by this round's table copy, before the round launches
             B.owner[(size_t) victim] = -1;

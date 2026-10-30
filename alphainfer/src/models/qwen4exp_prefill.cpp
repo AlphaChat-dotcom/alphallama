@@ -77,6 +77,86 @@ struct PfClock {
 // Persistent device buffers for one super-chunk of up to S rows (allocated on first use): residual streams, PLE rows,
 // token ids, imrope positions, write cells and the per-sub-chunk causal masks; plus the expert scratch bank sized for
 // the largest layer's (E - n_slots) experts.
+// prefill_alloc's state buffer for a super-chunk of S rows (the same takes, in the same order)
+size_t Qwen4ExpRun::pf_state_bytes(int64_t S, int64_t sub) const {
+    const Qwen4ExpSpec & s = prog_.spec();
+    size_t bytes = 0;
+    auto take = [&](size_t b) { bytes = (bytes + b + 255) / 256 * 256; };
+    take((size_t) s.hc_dim() * S * 4);
+    take(s.ple_layers.empty() ? 0 : (size_t) s.n_embd * S * 4);
+    take((size_t) S * 4);
+    take((size_t) 4 * S * 4);
+    take((size_t) S * 8);
+    take((size_t) max_ctx_ * sub * 2 + 256);
+    return bytes;
+}
+
+int Qwen4ExpRun::pf_cap(int il) const {
+    const SlotBank & B = banks_[(size_t) il];
+    return prog_.spec().n_expert - (lent_ && il >= lend_from_ ? 0 : B.n_slots);
+}
+
+// [AI_Q4X_LEND] Lend: every lent layer's experts become non-resident (table -1, owners kept in lend_owner_) before the
+// prefill writes its state and scratch over their banks. Ordered on the compute stream after the decode work that read
+// them; admissions were drained by the caller (prefill's start), so no copy is landing in a lent bank.
+void Qwen4ExpRun::lend_begin() {
+    if (lent_ || lend_buf_ < 0) return;
+    admit_drain();
+    const int E  = prog_.spec().n_expert;
+    void *    st = adapter::stream(dev_);
+    lend_owner_.assign(banks_.size() - (size_t) lend_from_, {});
+    for (size_t il = (size_t) lend_from_; il < banks_.size(); ++il) {
+        SlotBank & B = banks_[il];
+        lend_owner_[il - (size_t) lend_from_] = B.owner;
+        std::fill(B.owner.begin(), B.owner.end(), -1);
+        std::fill(B.table_h.begin(), B.table_h.end(), -1);
+        std::fill(B.score.begin(), B.score.end(), 0.0f);
+        int32_t * pin = table_pin_ + il * (size_t) E;
+        memcpy(pin, B.table_h.data(), (size_t) E * 4);
+        cudaMemcpyAsync(B.table.data, pin, (size_t) E * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
+    }
+    lent_ = true;
+}
+
+// Give back: once every prefill kernel and scratch copy has finished, the lent banks get the same experts again (fillers
+// included: slots >= n_slots hold experts 0..k-1), then the tables. Ordered before the first decode round.
+void Qwen4ExpRun::lend_end() {
+    if (!lent_) return;
+    cudaDeviceSynchronize();   // the prefill's compute and copy streams are done with the lent memory
+    const auto & layers = prog_.layers();
+    const int    E  = prog_.spec().n_expert;
+    void *       st = adapter::stream(dev_);
+    size_t       moved = 0;
+    for (size_t il = (size_t) lend_from_; il < banks_.size(); ++il) {
+        SlotBank &                   B   = banks_[il];
+        const std::vector<int32_t> & own = lend_owner_[il - (size_t) lend_from_];
+        const auto &                 m   = layers[il].moe;
+        const Tensor * src[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+        const Tensor * dst[3] = { &B.gate, &B.up, &B.down };
+        const int      nb     = (int) B.gate.ne[2];
+        for (int sl = 0; sl < nb; ++sl) {
+            const int32_t e = sl < B.n_slots ? own[(size_t) sl] : sl - B.n_slots;
+            if (e < 0) continue;
+            for (int r = 0; r < 3; ++r) {
+                cudaMemcpyAsync((char *) dst[r]->data + (size_t) sl * dst[r]->nb[2], (const char *) src[r]->data + (size_t) e * src[r]->nb[2],
+                                src[r]->nb[2], cudaMemcpyHostToDevice, (cudaStream_t) st);
+                moved += src[r]->nb[2];
+            }
+            if (sl < B.n_slots) { B.owner[(size_t) sl] = e; B.table_h[(size_t) e] = sl; }
+        }
+        int32_t * pin = table_pin_ + il * (size_t) E;
+        memcpy(pin, B.table_h.data(), (size_t) E * 4);
+        cudaMemcpyAsync(B.table.data, pin, (size_t) E * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
+    }
+    lent_ = false;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "[q4x] lend: %zu layers' experts copied back after the prefill (%.0f MiB)%c", banks_.size() - (size_t) lend_from_,
+                moved / 1048576.0, 10);
+    }
+}
+
 bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
     if (pf_S_ >= S && pf_sub_ == sub) return true;
     const Qwen4ExpSpec & s = prog_.spec();
@@ -92,24 +172,35 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
     // mask per sub-chunk would cost max_ctx * sub * 2 B each, i.e. up to a GiB at long contexts.
     pf_off_mask_ = take((size_t) max_ctx_ * sub * 2 + 256);
     (void) nsub;
-    size_t scr = 0;
+    size_t scr = 0, lscr = 0;   // lscr: with the lent layers' experts all non-resident
     for (size_t il = 0; il < banks_.size(); ++il) {
-        const auto & m = prog_.layers()[il].moe;
-        const int    cap = s.n_expert - banks_[il].n_slots;
-        scr = std::max(scr, (size_t) cap * (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]) + 3 * 256);
+        const auto & m   = prog_.layers()[il].moe;
+        const size_t per = (size_t) (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]);
+        scr  = std::max(scr, (size_t) (s.n_expert - banks_[il].n_slots) * per + 3 * 256);
+        lscr = std::max(lscr, (size_t) ((int) il >= lend_from_ ? s.n_expert : s.n_expert - banks_[il].n_slots) * per + 3 * 256);
     }
-    int b1 = -1, b2 = -1;   // Device::alloc_buffer throws on OOM: catch it so the fallback below is real
-    try { b1 = dev_.alloc_buffer(bytes, "q4x.prefill"); } catch (const std::exception &) { b1 = -1; }
-    if (b1 >= 0) { try { b2 = dev_.alloc_buffer(scr, "q4x.prefill_scratch"); } catch (const std::exception &) { b2 = -1; } }
-    if (b1 < 0 || b2 < 0) {
-        dev_.free_buffer(b1);   // a half-made pair is released (the caller may retry with a smaller super-chunk)
-        fprintf(stderr, "[q4x-prefill] device buffers (%.0f + %.0f MiB) do not fit: a smaller super-chunk, else %lld-row rounds\n",
-                bytes / 1048576.0, scr / 1048576.0, (long long) kDoorbellT);
-        return false;
+    const size_t soff = (bytes + 255) / 256 * 256;
+    if (lend_buf_ >= 0 && soff + lscr <= lend_bytes_) {
+        // [AI_Q4X_LEND] the state and the scratch over the lent layers' banks (lend_end copies their experts back)
+        lend_begin();
+        pf_buf_ = pf_scr_ = lend_buf_; pf_buf_off_ = 0; pf_scr_off_ = soff; pf_S_ = S; pf_sub_ = sub;
+        scr = lscr;
+        dev_.mem_report("prefill_alloc (lent)");
+        cudaMemsetAsync((char *) dev_.buffer_base(lend_buf_) + soff, 0, scr, (cudaStream_t) adapter::stream(dev_));
+    } else {
+        int b1 = -1, b2 = -1;   // Device::alloc_buffer throws on OOM: catch it so the fallback below is real
+        try { b1 = dev_.alloc_buffer(bytes, "q4x.prefill"); } catch (const std::exception &) { b1 = -1; }
+        if (b1 >= 0) { try { b2 = dev_.alloc_buffer(scr, "q4x.prefill_scratch"); } catch (const std::exception &) { b2 = -1; } }
+        if (b1 < 0 || b2 < 0) {
+            dev_.free_buffer(b1);   // a half-made pair is released (the caller may retry with a smaller super-chunk)
+            fprintf(stderr, "[q4x-prefill] device buffers (%.0f + %.0f MiB) do not fit: a smaller super-chunk, else %lld-row rounds\n",
+                    bytes / 1048576.0, scr / 1048576.0, (long long) kDoorbellT);
+            return false;
+        }
+        pf_buf_ = b1; pf_scr_ = b2; pf_buf_off_ = pf_scr_off_ = 0; pf_S_ = S; pf_sub_ = sub;
+        dev_.mem_report("prefill_alloc");
+        cudaMemset(dev_.buffer_base(b2), 0, scr);   // never-written scratch slots read as zero weights (finite, masked)
     }
-    pf_buf_ = b1; pf_scr_ = b2; pf_S_ = S; pf_sub_ = sub;
-    dev_.mem_report("prefill_alloc");
-    cudaMemset(dev_.buffer_base(b2), 0, scr);   // never-written scratch slots read as zero weights (finite, masked)
     // AI_Q4X_PF_STREAM (default 1): copy each layer's whole non-resident set on a separate copy stream, overlapping the
     // mixer phase. AI_Q4X_PF_STREAM2=1 adds a second scratch buffer for double buffering; without room, one buffer.
     static const bool want_stream = !getenv("AI_Q4X_PF_STREAM") || atoi(getenv("AI_Q4X_PF_STREAM")) != 0;
@@ -189,8 +280,8 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
 // 256-byte aligned.
 void Qwen4ExpRun::pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd, int n) const {
     const auto & m   = prog_.layers()[(size_t) il].moe;
-    const int    cap = n > 0 ? n : prog_.spec().n_expert - banks_[(size_t) il].n_slots;
-    char *       sb  = (char *) dev_.buffer_base(buf);
+    const int    cap = n > 0 ? n : pf_cap(il);
+    char *       sb  = (char *) dev_.buffer_base(buf) + (buf >= 0 && buf == lend_buf_ ? pf_scr_off_ : 0);
     size_t       off = 0;
     auto bank = [&](const Tensor & h) {
         Tensor t = h;
@@ -384,7 +475,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
     ck.lap(g_pf.route_sync);
     // owner plans: gate/up over every column of the batch, down per slice (records split at the kernel's column cap)
     const int rec = kern::q4x_experts_wide_rec(), wcols = kern::q4x_experts_wide_cols();
-    const int cap = E - B.n_slots;
+    const int cap = pf_cap(il);
     auto build = [&](int64_t c0, int64_t c1, std::vector<int32_t> & pr, int & nr_, std::vector<int32_t> & ps, int & ns_,
                      std::vector<int32_t> & pp, int & np_) {
         std::vector<int32_t> own_r((size_t) B.n_slots, -1), own_s((size_t) cap, -1), own_p((size_t) std::max(1, pf_spare_P_), -1);
@@ -613,7 +704,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     ck.lap(g_pf.route_sync);
     // the scratch bank: this layer's tensors over pf_scr_ (stream mode: buffer il % 2), (E - n_slots) experts each
     const auto & m   = L.moe;
-    const int    cap = E - B.n_slots;
+    const int    cap = pf_cap(il);
     Tensor sg, su, sd;
     pf_bank(il, pf_stream_now_ && pf_scr2_ >= 0 && (il & 1) ? pf_scr2_ : pf_scr_, sg, su, sd);
     void * st = adapter::stream(dev_);
@@ -663,7 +754,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     // Per row: the resident pass takes hits, the scratch pass the rest; each fills its other columns with distinct
     // unused slots of its own bank at weight 0 (ggml-cuda's MUL_MAT_ID MMQ faults on repeated ids in a row).
     static const bool pf_mmq = getenv("AI_Q4X_PF_MMQ") && atoi(getenv("AI_Q4X_PF_MMQ")) != 0;
-    const bool use_mmq = pf_mmq && B.up.type != GGML_TYPE_IQ2_XS;
+    const bool use_mmq = pf_mmq && B.up.type != GGML_TYPE_IQ2_XS && !(lent_ && il >= lend_from_);   // lent: its bank is the scratch
     std::vector<int32_t> s_res((size_t) (k * T)), s_scr((size_t) (k * T));
     std::vector<float>   m_res((size_t) (k * T)), m_scr((size_t) (k * T));
     std::vector<char>    used_r((size_t) B.n_slots), used_s((size_t) std::max(cap, k));
@@ -845,7 +936,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         return lg;
     }
     const int64_t HW = s.hc_dim(), V = s.n_vocab;
-    char * pb = (char *) dev_.buffer_base(pf_buf_);
+    char * pb = (char *) dev_.buffer_base(pf_buf_) + pf_buf_off_;
     auto raw = [&](size_t off, int type, int64_t n0, int64_t n1 = 1, int64_t n2 = 1) {
         Tensor t; t.buf = pf_buf_; t.type = type; t.ne[0] = n0; t.ne[1] = n1; t.ne[2] = n2;
         set_contiguous_strides(t); t.data = pb + off; return t;
@@ -940,7 +1031,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
             for (size_t l = 0; l < layers.size(); ++l) {
                 for (int e = 0; e < s.n_expert; ++e)
                     if (banks_[l].table_h[(size_t) e] < 0) pf_nonres_[l].push_back(e);
-                if ((int) pf_nonres_[l].size() > s.n_expert - banks_[l].n_slots) pf_stream_now_ = false;   // scratch too small
+                if ((int) pf_nonres_[l].size() > pf_cap((int) l)) pf_stream_now_ = false;   // scratch too small
             }
             pf_buf_layer_[0] = pf_buf_layer_[1] = -1;
             pf_spare_layer_[0] = pf_spare_layer_[1] = -1;
@@ -1215,6 +1306,14 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
     // own (verify records, round graphs), since with the MTP head and its draft rows resident both may not fit. The
     // next prefill allocates them again. AI_Q4X_PF_KEEP=1 keeps them.
     static const bool keep = getenv("AI_Q4X_PF_KEEP") && atoi(getenv("AI_Q4X_PF_KEEP")) != 0;
+    if (lent_) {   // [AI_Q4X_LEND] the state and scratch were the lent banks: give them back (nothing to free or keep)
+        lend_end();
+        if (pf_buf_ == lend_buf_) pf_buf_ = -1;
+        if (pf_scr_ == lend_buf_) pf_scr_ = -1;
+        pf_buf_off_ = pf_scr_off_ = 0;
+        pf_S_ = 0;
+        pf_buf_layer_[0] = pf_buf_layer_[1] = -1;
+    }
     if (!keep) {
         dev_.free_buffer(pf_buf_);
         dev_.free_buffer(pf_scr_);

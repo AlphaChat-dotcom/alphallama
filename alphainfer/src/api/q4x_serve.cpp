@@ -274,16 +274,23 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
         const size_t pf_state = (size_t) sp.hc_dim() * S * 4 + (sp.ple_layers.empty() ? 0 : (size_t) sp.n_embd * S * 4) +
                                 (size_t) S * 28 + (size_t) m.ctx * sub * 2 + 256;   // one device-written mask
         const bool   flat  = getenv("AI_Q4X_VRAM_RESERVE_MB") != nullptr;   // a flat reserve, as given
-        const size_t fixed = flat ? (size_t) env_int("AI_Q4X_VRAM_RESERVE_MB", 0) << 20
-                                  : ((ws + 830 + (size_t) (m.ctx * 30 / 1024)) << 20) + pf_state + (size_t) E * per_expert_max;
+        // [AI_Q4X_LEND] the prefill borrows the last layers' banks for its state and scratch (Qwen4ExpRun::lend_begin):
+        // neither is kept free through decode, only the rest of the reserve
+        const bool   lend  = !flat && env_int("AI_Q4X_LEND", 0) != 0;
+        // AI_Q4X_RESERVE_EXTRA_MB: with lending nothing else is left over for the captured verify widths a deeper MTP
+        // chain adds (on a 16 GB card depth 3 and 4 ran out of VRAM at 114 slots); default 160 MiB per draft above 2
+        const size_t extra = lend ? (size_t) env_int("AI_Q4X_RESERVE_EXTRA_MB", m.mtp ? 160 * std::max(0, m.mtp_k - 2) : 0) : 0;
+        const size_t fixed = flat   ? (size_t) env_int("AI_Q4X_VRAM_RESERVE_MB", 0) << 20
+                           : lend   ? (ws + 830 + extra + (size_t) (m.ctx * 30 / 1024)) << 20
+                                    : ((ws + 830 + (size_t) (m.ctx * 30 / 1024)) << 20) + pf_state + (size_t) E * per_expert_max;
         // slots s fit when fr - s * per_slot >= fixed - s * per_expert_max (the scratch is (E - s) experts)
-        const size_t per = flat ? per_slot : per_slot - per_expert_max;
+        const size_t per = flat || lend ? per_slot : per_slot - per_expert_max;
         slots = per > 0 && fr > fixed ? (int) ((fr - fixed) / per) : k;
         slots = std::clamp(slots, k, E);
         fprintf(stderr, "[ai-api] q4x expert slots auto: %zu MiB free; kept free %.0f MiB (prefill state %.0f + expert "
                         "scratch %.0f MiB at this count); %.1f MiB per slot -> %d\n",
-                fr >> 20, (flat ? fixed : fixed - (size_t) slots * per_expert_max) / 1048576.0, pf_state / 1048576.0,
-                (double) (E - slots) * per_expert_max / 1048576.0, per_slot / 1048576.0, slots);
+                fr >> 20, (flat || lend ? fixed : fixed - (size_t) slots * per_expert_max) / 1048576.0, lend ? 0.0 : pf_state / 1048576.0,
+                lend ? 0.0 : (double) (E - slots) * per_expert_max / 1048576.0, per_slot / 1048576.0, slots);
     }
     slots = std::clamp(slots, k, E);
     m.run = std::make_unique<Qwen4ExpRun>(m.prog, m.dev, m.ctx, slots);
@@ -410,7 +417,13 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     int  match  = 0;
     bool copied = m.copy_min > 0 && m.suffix_copy(toks, &match);
     std::vector<int32_t> d;
-    if (!copied || m.agree) d = m.run->mtp_draft(pending, m.mtp_k);
+    // AI_Q4X_MTP_LONG_CTX (default 8192) / AI_Q4X_MTP_K_LONG (default 2): past that many cells the chain drafts at most
+    // K_LONG, since a verify column's attention grows with the context (on a 16 GB card, depth 3 + min-p 0.5 against
+    // depth 2: chat +8%, short code +2.5%, rewrites level, a 16K-token context -8%)
+    static const int64_t long_ctx = env_int("AI_Q4X_MTP_LONG_CTX", 8192);
+    static const int     k_long   = env_int("AI_Q4X_MTP_K_LONG", 2);
+    const int            depth    = (int64_t) m.hist.size() > long_ctx ? std::min(m.mtp_k, k_long) : m.mtp_k;
+    if (!copied || m.agree) d = m.run->mtp_draft(pending, depth);
     if (copied && m.agree) {   // keep the copy only where the MTP agrees on its first token
         if (d.empty() || d[0] != toks[1]) { toks.resize(1); copied = false; }
     }

@@ -98,6 +98,10 @@ private:
     Tensor moe_doorbell(int il, const Tensor & x);
     Tensor moe_prefill(int il, const Tensor & x);                  // resident bank + streamed scratch bank
     bool   prefill_alloc(int64_t S, int64_t sub);
+    size_t pf_state_bytes(int64_t S, int64_t sub) const;   // prefill_alloc's state buffer (residuals, PLE, ids, masks)
+    int    pf_cap(int il) const;   // the layer's prefill scratch capacity: its non-resident experts (all of them when lent)
+    void   lend_begin();           // [AI_Q4X_LEND] the lent layers' banks become the prefill's buffers (their experts non-resident)
+    void   lend_end();             // ... and are copied back (the same experts) once the prefill's work has finished
     void   init_doorbell(int slots);
     void   dump(const char * name, int il, const Tensor & t);
     void   keep_record(int il, op::GdnRecord * gr, const Tensor * ple_padded);   // copy a layer's record out of the scope
@@ -234,6 +238,12 @@ private:
     // layer-major prefill state
     int                  pf_buf_ = -1, pf_scr_ = -1, pf_layer_ = -1, pf_n_ = 0;
     int64_t              pf_S_ = 0, pf_sub_ = 0;
+    // [AI_Q4X_LEND] layers lend_from_.. keep their slot banks in one buffer (lend_buf_) that a prefill borrows for its
+    // state (offset pf_buf_off_) and expert scratch (pf_scr_off_): the prefill's ~2 GB need not stay free in decode.
+    int                  lend_buf_ = -1, lend_from_ = 1 << 30;
+    size_t               lend_bytes_ = 0, pf_buf_off_ = 0, pf_scr_off_ = 0;
+    bool                 lent_ = false;
+    std::vector<std::vector<int32_t>> lend_owner_;   // per lent layer: its slots' experts while lent
     size_t               pf_off_R_ = 0, pf_off_ple_ = 0, pf_off_ids_ = 0, pf_off_pos4_ = 0, pf_off_cell_ = 0, pf_off_mask_ = 0;
     std::vector<int32_t> pf_slot_of_;
     // AI_Q4X_PF_SHARE: the CPU share's cost model in seconds (A per CPU decode pass, G0 + C per copied expert on the
