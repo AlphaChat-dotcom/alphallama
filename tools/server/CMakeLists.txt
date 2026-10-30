@@ -64,7 +64,7 @@ if (OpenSSL_FOUND)
     target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(${TARGET} PRIVATE ALPHA_HAS_OPENSSL)
 else()
-    message(WARNING "OpenSSL not found — license enforcement and checkpoint encryption disabled")
+    message(STATUS "OpenSSL not found: building the server without it")
     target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 endif()
 

@@ -994,6 +994,10 @@ static std::string alpha_q4x_find(const char * model_path, bool profile) {
         closedir(dd);
         if (profile && !found.empty()) return found[0];
     }
+    if (!profile && found.size() > 1) {
+        fprintf(stderr, "[auto] %zu .gguf files in %s/MTP/ -- keep exactly one MTP sidecar there; serving plain decode\n",
+                found.size(), dir.c_str());
+    }
     return !profile && found.size() == 1 ? found[0] : "";
 #endif
 }
