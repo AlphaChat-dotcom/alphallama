@@ -19,6 +19,14 @@
 #include <string>
 #include <map>
 
+// Sampling entry points, weak: an in-tree AlphaInfer (statically linked, symbols not exported) resolves them at link
+// time, where dlsym(RTLD_DEFAULT) would not find them; an older external library without them leaves them null.
+extern "C" {
+int ai_engine_supports_sampling(const ai_engine * e) __attribute__((weak));
+int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int top_k, float top_p, float min_p,
+                           uint64_t seed) __attribute__((weak));
+}
+
 namespace alphaserve {
 
 // See ai_engine_live() in the header: /health needs to see capture state from outside the
@@ -113,6 +121,12 @@ bool ai_gpu_engine::init(const ai_engine_params & params,
     if (n_streams_ <= 2 && !getenv("ALPHA_AI_NO_CHUNKED_PREFILL")) prefill_chunk_fn_ = dlsym(RTLD_DEFAULT, "ai_engine_prefill_chunk");
     prefill_mm_fn_ = dlsym(RTLD_DEFAULT, "ai_engine_prefill_mm");
 #endif
+    // sampling: newer libraries draw sampled target tokens on the device; Flash-Next and older libraries are greedy only
+    if (ai_engine_supports_sampling && ai_engine_set_sampling && ai_engine_supports_sampling(eng_) == 1) {
+        set_sampling_fn_ = (void *) &ai_engine_set_sampling;
+    }
+    fprintf(stderr, "[ai-engine] sampling: %s\n", set_sampling_fn_ ? "ON (temperature / top_k / top_p / seed on the device)"
+                                                                    : "greedy only (temperature > 0 is served greedy)");
     if (g_serve_mtmd) {
         fprintf(stderr, "[ai-engine] image input: %s\n", prefill_mm_fn_ ? "ON (ai_engine_prefill_mm)"
                                                                          : "REFUSED (this libalphainfer has no ai_engine_prefill_mm)");
@@ -192,6 +206,7 @@ int64_t ai_gpu_engine::ctx_cells() const {
 bool ai_gpu_engine::check_supported(const BatchRequest & req) {
     for (size_t i = 0; i < req.logits_mask.size(); ++i) {
         if (!req.logits_mask[i]) continue;   // params are only meaningful where logits are taken
+        if (set_sampling_fn_) continue;      // the engine samples: set_sampling() hands it every row's settings
 
         if (i < req.samp_temp.size() && req.samp_temp[i] > 0.0f) {
             last_error_ = "temperature sampling is not supported by the AlphaInfer backend yet "
@@ -365,6 +380,23 @@ bool ai_gpu_engine::process_one() {
         open_[s] = false;
         midpf_[s] = false;
         prompt_[s].clear();
+    }
+
+    // Sampling: hand each stream's settings to the engine before this batch's prefill / rounds. The engine keeps them per
+    // slot (an unchanged setting costs nothing), so a greedy request after a sampled one resets its slot to greedy.
+    if (set_sampling_fn_) {
+        using set_t = int (*)(ai_engine *, int, float, int, float, float, uint64_t);
+        for (size_t i = 0; i < req.logits_mask.size(); ++i) {
+            if (!req.logits_mask[i]) continue;
+            const int s = i < req.seq_ids.size() ? req.seq_ids[i] : 0;
+            if (s < 0 || s >= n_streams_) continue;
+            const float    t    = i < req.samp_temp.size()  ? req.samp_temp[i]  : 0.0f;
+            const int      k    = i < req.samp_top_k.size() ? req.samp_top_k[i] : 0;
+            const float    p    = i < req.samp_top_p.size() ? req.samp_top_p[i] : 1.0f;
+            const uint64_t base = i < req.samp_rng_base.size() ? req.samp_rng_base[i] : 0;
+            const uint64_t seed = base ? base : (i < req.samp_rng.size() ? req.samp_rng[i] : 0);
+            ((set_t) set_sampling_fn_)(eng_, s, t, k, p, 0.0f, seed);
+        }
     }
 
     // Split the batch: a token of an open stream is its pending decode token; anything else is prompt.

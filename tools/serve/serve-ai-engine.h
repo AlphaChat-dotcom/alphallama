@@ -81,6 +81,8 @@ public:
     int64_t     free_vram_mib() const;
     int         calibration_state() const;   // -2: library predates the getter
     int64_t     ctx_cells() const;           // -1: library predates the getter
+    // the engine draws sampled tokens itself (ai_engine_set_sampling); false = greedy only (Flash-Next, older libraries)
+    bool        supports_sampling() const { return set_sampling_fn_ != nullptr; }
 
     int64_t total_decodes() const { return n_decodes_; }
     int     n_streams() const { return n_streams_; }
@@ -111,6 +113,7 @@ private:
     std::vector<bool> midpf_;                  // per stream: chunked prefill started, last chunk not yet sent
     void * prefill_chunk_fn_ = nullptr;        // ai_engine_prefill_chunk (newer libraries only), resolved with dlsym
     void * prefill_mm_fn_    = nullptr;        // ai_engine_prefill_mm (image input, newer libraries only)
+    void * set_sampling_fn_  = nullptr;        // ai_engine_set_sampling, when the engine supports sampling
     const llama_vocab * vocab_ = nullptr;
     spsc_queue<BatchRequest, 64> * in_  = nullptr;
     spsc_queue<BatchResult,  64> * out_ = nullptr;

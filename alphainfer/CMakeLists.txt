@@ -70,6 +70,7 @@ add_library(aicore STATIC
     src/kernels/gdn_conv_pf.cu
     src/kernels/gemm_f16w_pf.cu
     src/kernels/argmax.cu
+    src/kernels/sample.cu
     src/kernels/add_rmsnorm.cu
     src/kernels/moe_merge_norm.cu
     src/kernels/moe_merge_norm_coop.cu

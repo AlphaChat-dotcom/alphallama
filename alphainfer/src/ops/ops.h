@@ -73,6 +73,12 @@ AddNorm add_rmsnorm(Device & d, const Tensor & mix, const Tensor & res, const Te
 Tensor add(Device & d, const Tensor & a, const Tensor & b);
 Tensor rows(Device & d, const Tensor & x, const Tensor & ids);                // select rows (i32 ids)
 Tensor argmax(Device & d, const Tensor & logits, const Tensor * map = nullptr);   // f32[V,N] -> i32[N]; map: row -> id
+// Target-token sampling after argmax (kernels.h sample_rows): rewrites `token` (the argmax of `logits`) in place on
+// rows whose stream samples; greedy rows are untouched. Row r is stream slot first_region + r / L and picks the token
+// at position base[r / L] + 1 + r % L, or pos_const + r % L when base is null. params: the device array of per-slot
+// SampleParams (nullptr: no-op).
+void   sample_into(Device & d, const Tensor & logits, const Tensor & token, int64_t L, int first_region,
+                   const Tensor * base, int64_t pos_const, const void * params);
 Tensor max_softmax(Device & d, const Tensor & logits);   // f32[V,N] -> f32[N]: a draft's confidence (AI_MTP_GATE)
 void   copy_into(Device & d, const Tensor & src, const Tensor & dst, const char * who = "?");  // dst <- src
 

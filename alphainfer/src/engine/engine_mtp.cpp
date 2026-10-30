@@ -172,7 +172,9 @@ void Engine::prefill_mtp_range(int stream, const std::vector<int32_t> & prompt, 
             }
             prog_.mtp(dev_, hin.ids, hidden, hin, Qwen35Hybrid::HeadRows::None);
         } else {
-            am = op::argmax(dev_, prog_.logits(dev_, last_row(hidden)));
+            const Tensor lg = prog_.logits(dev_, last_row(hidden));
+            am = op::argmax(dev_, lg);
+            op::sample_into(dev_, lg, am, 1, stream, nullptr, n, samp_ptr());   // the first token is at position n
         }
         if (r) {
             r->end();
@@ -227,6 +229,10 @@ Engine::StepOut Engine::build_mtp(const Qwen35Hybrid::Inputs & vin, const Qwen35
     Tensor hidden = prog_.forward(dev_, vin, true, &rec);
     out.logits = prog_.logits(dev_, hidden);
     out.g      = op::argmax(dev_, out.logits);
+    {
+        const Tensor base = main_in_.base_view(B);
+        op::sample_into(dev_, out.logits, out.g, L, vin.first_region, &base, -1, samp_ptr());
+    }
     op::Accept acc = op::mtp_accept(dev_, out.g, vin.ids, L, B);
     out.m = acc.m;
     prog_.fold_masked(dev_, vin, rec, acc.colmask, acc.m);
@@ -256,6 +262,10 @@ Engine::StepOut Engine::profile_mtp(const Qwen35Hybrid::Inputs & vin, const Qwen
     Tensor hidden = prog_.forward(dev_, vin, true, &rec);
     out.logits = prog_.logits(dev_, hidden);
     out.g      = op::argmax(dev_, out.logits);
+    {
+        const Tensor base = main_in_.base_view(B);
+        op::sample_into(dev_, out.logits, out.g, L, vin.first_region, &base, -1, samp_ptr());
+    }
     dev_.synchronize();
     nvtxRangePop();
     const auto t1 = clk::now();
@@ -407,6 +417,10 @@ Engine::StepOut Engine::build_df2(const Qwen35Hybrid::Inputs & vin) {
     Tensor hidden = prog_.forward(dev_, vin, true, &rec);   // also writes the taps of all L rows
     out.logits = prog_.logits(dev_, hidden);
     out.g      = op::argmax(dev_, out.logits);
+    {
+        const Tensor base = main_in_.base_view(B);
+        op::sample_into(dev_, out.logits, out.g, L, vin.first_region, &base, -1, samp_ptr());
+    }
     op::Accept acc = op::mtp_accept(dev_, out.g, vin.ids, L, B);
     out.m = acc.m;
     prog_.fold_masked(dev_, vin, rec, acc.colmask, acc.m);
@@ -463,7 +477,9 @@ void Engine::prefill_df2(int stream, const std::vector<int32_t> & prompt, Stream
         Tensor hidden = prog_.forward(dev_, in, last);
         Tensor am;
         if (last) {
-            am = op::argmax(dev_, prog_.logits(dev_, last_row(hidden)));
+            const Tensor lg = prog_.logits(dev_, last_row(hidden));
+            am = op::argmax(dev_, lg);
+            op::sample_into(dev_, lg, am, 1, stream, nullptr, n, samp_ptr());   // the first token is at position n
         }
         if (round) {
             round->end();

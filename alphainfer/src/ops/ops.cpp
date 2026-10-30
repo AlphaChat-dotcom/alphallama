@@ -424,6 +424,26 @@ Tensor argmax(Device & d, const Tensor & logits, const Tensor * map) {
     return c.run(ggml_argmax(c.ctx(), c.in(logits)));
 }
 
+void sample_into(Device & d, const Tensor & logits, const Tensor & token, int64_t L, int first_region,
+                 const Tensor * base, int64_t pos_const, const void * params) {
+    if (params == nullptr) {
+        return;
+    }
+    if (logits.type != F32 || !logits.contiguous() || token.type != I32) {
+        throw std::runtime_error("sample_into: f32 contiguous logits and i32 tokens only");
+    }
+    const int64_t   ncols = logits.ne[0];
+    const int64_t   rows  = logits.numel() / ncols;
+    Tensor          sc    = d.ws_alloc(F32, kern::sample_scratch_floats(rows));
+    void *          st    = adapter::stream(d);
+    const float *   px    = (const float *) logits.data;
+    float *         ps    = (float *) sc.data;
+    int32_t *       pd    = (int32_t *) token.data;
+    const int32_t * pb    = (base != nullptr && base->valid()) ? (const int32_t *) base->data : nullptr;
+    const auto *    pp    = (const kern::SampleParams *) params;
+    adapter::native(d, [=]() { kern::sample_rows(st, px, ncols, rows, L, first_region, pb, pos_const, pp, ps, pd); });
+}
+
 
 void copy_into(Device & d, const Tensor & src, const Tensor & dst, const char * who) {
     // ggml_cpy asserts nelements(src) == nelements(dst) and aborts with only a backtrace, which

@@ -282,6 +282,29 @@ int ai_engine_has_mtp(const ai_engine * e) {
     return const_cast<ai_engine_s *>(e)->engine.program().has_mtp() ? 1 : 0;
 }
 
+int ai_engine_supports_sampling(const ai_engine * e) {
+    if (!e) { return 0; }
+#ifdef AI_Q4X_FORWARD
+    if (e->q4x) { return 0; }   // Flash-Next: greedy only for now
+#endif
+    return e->engine.sampling_enabled() ? 1 : 0;
+}
+
+int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int top_k, float top_p, float min_p,
+                           uint64_t seed) {
+    if (!e) { return AI_ENGINE_EINVAL; }
+    if (!ai_engine_supports_sampling(e)) {
+        if (!(temperature > 0.0f)) { return AI_ENGINE_OK; }   // greedy is what it does anyway
+        e->last_error = "ai_engine_set_sampling: this engine is greedy only";
+        return AI_ENGINE_ENOTSUP;
+    }
+    if (stream_id < 0 || stream_id >= e->n_streams) {
+        e->last_error = "ai_engine_set_sampling: stream_id out of range";
+        return AI_ENGINE_EINVAL;
+    }
+    return e->engine.set_sampling(stream_id, temperature, top_k, top_p, min_p, seed) ? AI_ENGINE_OK : AI_ENGINE_EFAIL;
+}
+
 int ai_engine_prefill(ai_engine * e, int stream_id,
                       const int32_t * tokens, int n_tokens, int32_t * out_first) {
     if (out_first) { *out_first = 0; }

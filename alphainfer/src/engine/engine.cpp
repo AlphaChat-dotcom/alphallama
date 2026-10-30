@@ -601,7 +601,8 @@ void Engine::ws_auto_calibrate() {
                 const int64_t Eh = hidden.ne[0], Th = hidden.ne[1];
                 const Tensor  lr = hidden.view(Eh, 1, 1, 1, hidden.nb[1], hidden.nb[1], hidden.nb[1],
                                                hidden.nb[1] * (size_t) (Th - 1));
-                op::argmax(dev_, prog_.logits(dev_, lr));
+                const Tensor lg = prog_.logits(dev_, lr);
+                op::sample_into(dev_, lg, op::argmax(dev_, lg), 1, 0, nullptr, 1, samp_ptr());   // sized as served
             }
             r.end();
             r.launch();
@@ -795,6 +796,19 @@ bool Engine::init(const EngineConfig & cfg) {
         }
     }
     main_in_.alloc(dev_, T, T * R, B, "ingress");
+    // per-slot sampling parameters (set_sampling); AI_SAMPLING=0 leaves them out and every pick stays a plain argmax
+    if (!getenv("AI_SAMPLING") || atoi(getenv("AI_SAMPLING")) != 0) {
+        samp_n_    = (int) B;
+        const size_t bytes = (size_t) B * sizeof(kern::SampleParams);
+        samp_buf_  = dev_.alloc_buffer(bytes + dev_.alignment(), "sample.params");
+        size_t off = 0;
+        samp_dev_  = carve(dev_, samp_buf_, off, I32, (int64_t) (bytes / 4));
+        samp_host_ = dev_.alloc_pinned(bytes);
+        auto * hp  = (kern::SampleParams *) samp_host_;
+        for (int64_t i = 0; i < B; ++i) {
+            hp[i] = kern::SampleParams{ 0.0f, 1.0f, 0.0f, 0, 0u, 0u, { 0, 0 } };
+        }
+    }
     if (host_embd) {
         main_in_.alloc_embd(dev_, prog_.tok_embd(), "ingress.embd");
     }
@@ -825,6 +839,9 @@ bool Engine::init(const EngineConfig & cfg) {
                               : prog_.workspace_bytes(cfg_.chunk, std::max<int64_t>(16, B * (K + 1))) * (K > 0 ? 2 : 1);
     dev_.init_workspace(ws);
     dev_.finalize();
+    if (samp_buf_ >= 0) {
+        dev_.upload(samp_dev_, samp_host_, 0, (size_t) samp_n_ * sizeof(kern::SampleParams));   // every slot greedy
+    }
     if (kv_plan_bytes_ >= 0 && cfg.verbose) {
         // the fit model, checked on every run: what the plan expected vs what alloc_state..finalize took
         const double got = (double) (dev_.total_allocated() - kv_alloc_before_);
@@ -881,6 +898,27 @@ void Engine::reset_streams(int B) {
     k_in_         = df2_ ? std::min(cfg_.mtp_k, (int) df2_->block_size() - 1) : chain_cap(cfg_.mtp_k);
     in_decode_    = false;
     live_streams_ = 0;
+}
+
+bool Engine::set_sampling(int stream, float temperature, int top_k, float top_p, float min_p, uint64_t seed) {
+    if (samp_buf_ < 0 || stream < 0 || stream >= samp_n_) {
+        return false;
+    }
+    kern::SampleParams p{};
+    p.temperature = temperature > 0.0f ? temperature : 0.0f;
+    p.top_k       = top_k > 0 ? top_k : 0;
+    p.top_p       = top_p > 0.0f && top_p < 1.0f ? top_p : 1.0f;
+    p.min_p       = min_p > 0.0f && min_p <= 1.0f ? min_p : 0.0f;
+    p.seed_lo     = (uint32_t) seed;
+    p.seed_hi     = (uint32_t) (seed >> 32);
+    auto * hp = (kern::SampleParams *) samp_host_;
+    if (memcmp(&hp[stream], &p, sizeof(p)) == 0) {
+        return true;
+    }
+    hp[stream] = p;
+    // stream-ordered on the compute stream, so the next round (or prefill) sees it and an in-flight one does not
+    dev_.upload_async(samp_dev_, &hp[stream], (size_t) stream * sizeof(p), sizeof(p));
+    return true;
 }
 
 void Engine::reset_stream(int stream) {
@@ -1427,7 +1465,9 @@ int32_t Engine::prefill_range(int stream, const std::vector<int32_t> & prompt, i
         if (last) {
             const int64_t Eh = hidden.ne[0], Th = hidden.ne[1];
             const Tensor  lr = hidden.view(Eh, 1, 1, 1, hidden.nb[1], hidden.nb[1], hidden.nb[1], hidden.nb[1] * (size_t) (Th - 1));
-            am = op::argmax(dev_, prog_.logits(dev_, lr));
+            const Tensor lg = prog_.logits(dev_, lr);
+            am = op::argmax(dev_, lg);
+            op::sample_into(dev_, lg, am, 1, stream, nullptr, n, samp_ptr());   // the first token is at position n
         }
         if (round) {
             round->end();
@@ -1496,6 +1536,8 @@ Engine::StepOut Engine::build_plain(const Qwen35Hybrid::Inputs & in) {
     StepOut o;
     o.logits = prog_.logits(dev_, prog_.forward(dev_, in, false));
     o.token  = op::argmax(dev_, o.logits);
+    const Tensor base = main_in_.base_view(in.B);
+    op::sample_into(dev_, o.logits, o.token, 1, in.first_region, &base, -1, samp_ptr());
     return o;
 }
 

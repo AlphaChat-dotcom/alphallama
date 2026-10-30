@@ -148,6 +148,18 @@ int ai_engine_prefill_mm(ai_engine * e, int stream_id, const int32_t * tokens, i
 // The model's embedding width (the row length ai_engine_prefill_mm's embd takes).
 int ai_engine_n_embd(const ai_engine * e);
 
+// -- Sampling ----------------------------------------------------------------------------------------------------
+// 1 when this engine can sample its target tokens (ai_engine_set_sampling), 0 when it is greedy only (Flash-Next for now).
+int ai_engine_supports_sampling(const ai_engine * e);
+// Sampling for one stream slot; temperature <= 0 is greedy (every slot's default). top_k 0 = off (it cuts up to 64),
+// top_p 1 = off, min_p 0 = off. Tokens are drawn on the device from Philox(seed, position, slot), so the same seed and
+// prompt give the same text, and MTP / lookup / DFlash2 keep their speed: a draft is accepted when it equals the drawn
+// token, so the output follows the sampling distribution exactly. The setting survives ai_engine_reset_stream and
+// prefill: set it before the request's prefill (its first token is drawn there), and back to greedy for a greedy one.
+// Returns ENOTSUP on an engine without sampling, EINVAL for a bad slot.
+int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int top_k, float top_p, float min_p,
+                           uint64_t seed);
+
 // One decode round. See notes 1-3 at the top of this header: in particular, this advances every
 // open stream and out_sampled must have room for n_streams entries.
 int ai_engine_decode(ai_engine * e,

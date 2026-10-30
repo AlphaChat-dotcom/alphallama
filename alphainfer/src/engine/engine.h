@@ -127,6 +127,13 @@ public:
     };
     // Size the batch and clear every slot (what generate_batch does on entry).
     void    open_streams(int B);
+    // Per-slot sampling for the target tokens (temperature <= 0 = greedy, the default). It survives reset_stream and
+    // prefill, so a caller sets it before a request's prefill (the first token is drawn there) and resets it to greedy
+    // for the next greedy request. Drafts stay argmax; a draft is accepted when it equals the sampled target, so MTP,
+    // prompt lookup and DFlash2 keep working and the output follows the sampling distribution exactly. Returns false
+    // when sampling is off (AI_SAMPLING=0) or the slot is out of range.
+    bool    set_sampling(int stream, float temperature, int top_k, float top_p, float min_p, uint64_t seed);
+    bool    sampling_enabled() const { return samp_buf_ >= 0; }
     // Prompt phase for one slot; returns the first token, which the caller feeds back on step 1.
     int32_t prefill_one(int stream, const std::vector<int32_t> & prompt, Timing & tm);
     // Prompt phase with precomputed input rows (image embeddings): rows `embd_row[r]` take embd[r * E ..] instead
@@ -373,6 +380,12 @@ private:
     std::vector<int>     acc_now_;   // scratch: per-round accept counts
 
     Ingress  main_in_, head_in_;
+    // per-slot kern::SampleParams on the device (read by the captured rounds) and its pinned host copy
+    int       samp_buf_  = -1;
+    Tensor    samp_dev_;
+    void *    samp_host_ = nullptr;
+    int       samp_n_    = 0;
+    const void * samp_ptr() const { return samp_buf_ >= 0 ? samp_dev_.data : nullptr; }
     int32_t * h_out_    = nullptr;   // plain tokens [B]
     int32_t * h_g_      = nullptr;   // [B*(k+1)]
     int32_t * h_m_      = nullptr;   // [B]

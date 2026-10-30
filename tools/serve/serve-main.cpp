@@ -1323,23 +1323,26 @@ int main(int argc, char ** argv) {
         if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
         if (!ctx_explicit) n_ctx   = 32768;
         setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
-        // 16 GB-class cards (under 20 GB): the prefill borrows the last layers' slot banks (AI_Q4X_LEND), so the auto
-        // slot count can hold more experts through decode (4080: 92 -> 114 per layer), and MTP drafts 3 deep with min-p
-        // 0.5. Measured on the 4080 (sets A / V / R: 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1). Larger cards keep
-        // depth 2 without lending until measured there.
+        // MTP drafts 3 deep, each draft kept only while its own top-1 probability is >= 0.5 (AI_Q4X_MTP_MINP), on every
+        // card. Sets A / V / R vs depth 2: 4080 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1; 3090 +4-6%; 5090 +9 / +7 / +3%.
+        // The prefill borrows the last layers' slot banks (AI_Q4X_LEND), so the auto slot count holds more experts through
+        // decode (4080: 92 -> 114 per layer), on 16 GB-class cards (under 20 GB) and on 32 GB-class cards (28 GB and up),
+        // where it was measured to pay. On a 24 GB card (3090) it bought 1-3% decode for 20-40% more time to first token,
+        // so it stays off there.
         size_t vram_free = 0, vram_total = 0;
         alpha_vram_info(&vram_free, &vram_total);
         const bool card16 = vram_total > 0 && vram_total < (20ull << 30);
-        if (card16) setenv("AI_Q4X_LEND", "1", /*overwrite=*/ 0);
+        const bool card32 = vram_total >= (28ull << 30);
+        if (card16 || card32) setenv("AI_Q4X_LEND", "1", /*overwrite=*/ 0);
         const std::string sidecar = alpha_q4x_find(model_path, /*profile=*/ false);
-        if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : (card16 ? "3" : "2"), 1);
-        if (card16 && atoi(getenv("ALPHA_AI_MTP_K")) > 0) setenv("AI_Q4X_MTP_MINP", "0.5", /*overwrite=*/ 0);
+        if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : "3", 1);
+        if (atoi(getenv("ALPHA_AI_MTP_K")) > 0) setenv("AI_Q4X_MTP_MINP", "0.5", /*overwrite=*/ 0);
         if (!getenv("ALPHA_DRE_PROFILE") && !getenv("AI_Q4X_PROFILE")) {
             const std::string prof = alpha_q4x_find(model_path, /*profile=*/ true);
             if (!prof.empty()) setenv("ALPHA_DRE_PROFILE", prof.c_str(), 1);
         }
         const bool mtp = atoi(getenv("ALPHA_AI_MTP_K")) > 0;
-        const std::string mtp_desc = std::string("MTP depth ") + getenv("ALPHA_AI_MTP_K") + " (fast verify; ALPHA_AI_MTP_K=0 for plain decode)";
+        const std::string mtp_desc = std::string("MTP depth ") + getenv("ALPHA_AI_MTP_K") + (getenv("AI_Q4X_MTP_MINP") ? std::string(", draft min-p ") + getenv("AI_Q4X_MTP_MINP") : std::string()) + " (fast verify; ALPHA_AI_MTP_K=0 for plain decode)";
         fprintf(stderr, "[auto] Flash-Next (qwen4exp) -> AlphaInfer 2, 1 stream x %d cells, experts offloaded (slots auto%s), %s, routing profile %s\n",
                 n_ctx, getenv("AI_Q4X_LEND") && atoi(getenv("AI_Q4X_LEND")) ? ", prefill lends slot banks" : "",
                 mtp ? mtp_desc.c_str() : (sidecar.empty() ? "plain decode (no MTP head in <model dir>/MTP/)" : "plain decode (ALPHA_AI_MTP_K=0)"),
@@ -3143,8 +3146,10 @@ int main(int argc, char ** argv) {
                 // output is whatever greedy text the prompt asks for). json_schema, grammar and logit_bias always refuse.
                 static const bool ai_greedy_fallback = !getenv("ALPHA_AI_LENIENT") || atoi(getenv("ALPHA_AI_LENIENT")) != 0;
                 static const bool ai_lenient = getenv("ALPHA_AI_LENIENT") && atoi(getenv("ALPHA_AI_LENIENT")) != 0;
-                if (ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
-                if (ireq.temperature > 0.0f) {
+                // an engine that samples (27B / 35B, libalphainfer with ai_engine_set_sampling) takes the request's settings as they are
+                const bool ai_samples = alphaserve::ai_engine_live() && alphaserve::ai_engine_live()->supports_sampling();
+                if (!ai_samples && ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
+                if (!ai_samples && ireq.temperature > 0.0f) {
                     res.status = 400;
                     res.set_content("{\"error\":{\"message\":\"this server (AlphaInfer backend) is greedy-only: send temperature 0 "
                                     "or omit it (this server was started with ALPHA_AI_LENIENT=0)\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
@@ -3163,7 +3168,7 @@ int main(int argc, char ** argv) {
                                     "\"code\":\"unsupported_constraint\"}}", "application/json");
                     return;
                 }
-                ireq.top_k = 1; ireq.top_p = 1.0f;   // irrelevant at temperature 0
+                if (ireq.temperature <= 0.0f) { ireq.top_k = 1; ireq.top_p = 1.0f; }   // greedy: the cuts are irrelevant
             }
             #endif
             ireq.stream = stream;
@@ -3485,8 +3490,10 @@ int main(int argc, char ** argv) {
             // output is whatever greedy text the prompt asks for). json_schema, grammar and logit_bias always refuse.
             static const bool ai_greedy_fallback = !getenv("ALPHA_AI_LENIENT") || atoi(getenv("ALPHA_AI_LENIENT")) != 0;
             static const bool ai_lenient = getenv("ALPHA_AI_LENIENT") && atoi(getenv("ALPHA_AI_LENIENT")) != 0;
-            if (ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
-            if (ireq.temperature > 0.0f) {
+            // an engine that samples (27B / 35B, libalphainfer with ai_engine_set_sampling) takes the request's settings as they are
+            const bool ai_samples = alphaserve::ai_engine_live() && alphaserve::ai_engine_live()->supports_sampling();
+            if (!ai_samples && ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
+            if (!ai_samples && ireq.temperature > 0.0f) {
                 res.status = 400;
                 res.set_content("{\"error\":{\"message\":\"this server (AlphaInfer backend) is greedy-only: send temperature 0 "
                                 "or omit it (this server was started with ALPHA_AI_LENIENT=0)\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
@@ -3505,7 +3512,7 @@ int main(int argc, char ** argv) {
                                 "\"code\":\"unsupported_constraint\"}}", "application/json");
                 return;
             }
-            ireq.top_k = 1; ireq.top_p = 1.0f;   // irrelevant at temperature 0
+            if (ireq.temperature <= 0.0f) { ireq.top_k = 1; ireq.top_p = 1.0f; }   // greedy: the cuts are irrelevant
         }
         #endif
         ireq.stream = stream;

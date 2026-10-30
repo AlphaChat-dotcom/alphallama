@@ -347,6 +347,25 @@ int  argmax_partials_per_row();
 void argmax_rows(void * stream, const float * x, int64_t ncols, int64_t rows, float * pmax, int32_t * pidx,
                  int32_t * dst, const int32_t * map = nullptr);   // map: dst = map[argmax] (draft vocab)
 
+// Per-stream sampling of target tokens (src/kernels/sample.cu). One entry per stream slot, read on the device so
+// captured rounds pick up a request's settings without re-recording. temperature <= 0 = greedy.
+struct SampleParams {
+    float    temperature;
+    float    top_p;      // 1 = off
+    float    min_p;      // 0 = off
+    int32_t  top_k;      // 0 = off; above 64 it does not cut
+    uint32_t seed_lo, seed_hi;
+    int32_t  pad[2];
+};
+// Rewrites dst[row] (holding the argmax of that row) with a draw for every row whose stream samples. Row r belongs to
+// stream slot first_region + r / L and picks the token at position base[r / L] + 1 + r % L (base: the device
+// positions of each stream's first row, as captured rounds need), or pos_const + r % L when base is null.
+// scratch: sample_scratch_floats(rows) floats.
+int64_t sample_scratch_floats(int64_t rows);
+void    sample_rows(void * stream, const float * x, int64_t ncols, int64_t rows, int64_t L, int first_region,
+                    const int32_t * base, int64_t pos_const, const SampleParams * params, float * scratch,
+                    int32_t * dst);
+
 // r = mix + res; p = rms_norm(r) * w -- the residual add fused into the norm that always follows
 // it. Bit-exact with the two ops it replaces (same block size, accumulation order and reduction).
 // q8 (optional, may be null): a block_q8_1 copy of the normed output, so consumers do not each
