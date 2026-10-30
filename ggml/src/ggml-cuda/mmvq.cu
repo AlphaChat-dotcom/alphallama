@@ -430,10 +430,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-#if ALPHA_BATCH_INVARIANT_MMVQ
-    ncols_dst = 1;  // pin rows-per-block to the M=1 shape, matching the calc_nwarps pin, so the whole
-                    // (nwarps, rows_per_block) reduction geometry is identical for every batch width
-#endif
+    // Not pinned under ALPHA_BATCH_INVARIANT_MMVQ: each row of a block keeps its own accumulator over the same kbx
+    // sequence, and the cross-warp and warp reductions run per row, so a row's result depends on nwarps (pinned in
+    // calc_nwarps) but not on how many rows share a block. Pinning it to 1 only cost speed (35B exact, 4-row
+    // verify: ~5%).
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
