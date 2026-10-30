@@ -516,6 +516,13 @@ void gpu_engine::backend_sampler_sync(const BatchRequest & req) {
         }
         if (llama_set_sampler(ctx_, seq, want ? samp_chain_[seq] : nullptr)) {
             samp_backend_[seq] = want;
+            // A chain is backend-initialised once, when it is installed. Once removed (a sampling request on this
+            // seq), free it so the next greedy request installs a fresh chain: re-installing the same one asserts
+            // "llama_sampler_chain_backend_init() called twice".
+            if (!want && samp_chain_[seq]) {
+                llama_sampler_free(samp_chain_[seq]);
+                samp_chain_[seq] = nullptr;
+            }
         } else {
             samp_backend_[seq] = 0;   // could not offload -- stay on the host path
         }

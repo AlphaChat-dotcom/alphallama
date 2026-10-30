@@ -3137,15 +3137,17 @@ int main(int argc, char ** argv) {
             // explicit temperature > 0 is a clear 400 up front, never a truncated 200 from a refused batch.
             if (mode == MODE_ALPHAINFER) {
                 if (!body.contains("temperature") || body["temperature"].is_null()) ireq.temperature = 0.0f;
-                // ALPHA_AI_LENIENT=1 (opt-in): a temperature > 0 is served greedy instead of refused, and response_format
-                // json_object is accepted without enforcement (the output is whatever greedy text the prompt asks for), for
-                // clients that always send them. json_schema, grammar and logit_bias still refuse.
+                // A temperature > 0 is served greedy by default (the engine has no sampling yet) and the reply says so in
+                // X-Alpha-Sampling: greedy, rather than failing chat clients that always send one. ALPHA_AI_LENIENT=0 refuses it
+                // with a 400 instead. ALPHA_AI_LENIENT=1 also accepts response_format json_object without enforcement (the
+                // output is whatever greedy text the prompt asks for). json_schema, grammar and logit_bias always refuse.
+                static const bool ai_greedy_fallback = !getenv("ALPHA_AI_LENIENT") || atoi(getenv("ALPHA_AI_LENIENT")) != 0;
                 static const bool ai_lenient = getenv("ALPHA_AI_LENIENT") && atoi(getenv("ALPHA_AI_LENIENT")) != 0;
-                if (ai_lenient && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
+                if (ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
                 if (ireq.temperature > 0.0f) {
                     res.status = 400;
                     res.set_content("{\"error\":{\"message\":\"this server (AlphaInfer backend) is greedy-only: send temperature 0 "
-                                    "or omit it\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
+                                    "or omit it (this server was started with ALPHA_AI_LENIENT=0)\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
                     return;
                 }
                 // constrained decoding needs a logits mask, which the engine refuses (ENOTSUP): say so instead of
@@ -3477,15 +3479,17 @@ int main(int argc, char ** argv) {
         // explicit temperature > 0 is a clear 400 up front, never a truncated 200 from a refused batch.
         if (mode == MODE_ALPHAINFER) {
             if (!body.contains("temperature") || body["temperature"].is_null()) ireq.temperature = 0.0f;
-            // ALPHA_AI_LENIENT=1 (opt-in): a temperature > 0 is served greedy instead of refused, and response_format
-            // json_object is accepted without enforcement (the output is whatever greedy text the prompt asks for), for
-            // clients that always send them. json_schema, grammar and logit_bias still refuse.
+            // A temperature > 0 is served greedy by default (the engine has no sampling yet) and the reply says so in
+            // X-Alpha-Sampling: greedy, rather than failing chat clients that always send one. ALPHA_AI_LENIENT=0 refuses it
+            // with a 400 instead. ALPHA_AI_LENIENT=1 also accepts response_format json_object without enforcement (the
+            // output is whatever greedy text the prompt asks for). json_schema, grammar and logit_bias always refuse.
+            static const bool ai_greedy_fallback = !getenv("ALPHA_AI_LENIENT") || atoi(getenv("ALPHA_AI_LENIENT")) != 0;
             static const bool ai_lenient = getenv("ALPHA_AI_LENIENT") && atoi(getenv("ALPHA_AI_LENIENT")) != 0;
-            if (ai_lenient && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
+            if (ai_greedy_fallback && ireq.temperature > 0.0f) { ireq.temperature = 0.0f; res.set_header("X-Alpha-Sampling", "greedy"); }
             if (ireq.temperature > 0.0f) {
                 res.status = 400;
                 res.set_content("{\"error\":{\"message\":\"this server (AlphaInfer backend) is greedy-only: send temperature 0 "
-                                "or omit it\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
+                                "or omit it (this server was started with ALPHA_AI_LENIENT=0)\",\"type\":\"invalid_request_error\",\"code\":\"unsupported_sampling\"}}", "application/json");
                 return;
             }
             // constrained decoding needs a logits mask, which the engine refuses (ENOTSUP): say so instead of
