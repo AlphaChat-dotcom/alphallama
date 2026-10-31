@@ -81,6 +81,7 @@ struct serve_slot {
     float temperature = 0.7f;
     int   top_k = 40;
     float top_p = 0.95f;
+    float min_p = 0.0f;
     int   seed = -1;
     uint64_t rng_base = 0;   // per-request sampling RNG base (=seed, or random when seed<0)
 
@@ -166,6 +167,7 @@ struct serve_slot {
         temperature = 0.7f;
         top_k = 40;
         top_p = 0.95f;
+        min_p = 0.0f;
         seed = -1;
         stream = false;
         http_connection = nullptr;

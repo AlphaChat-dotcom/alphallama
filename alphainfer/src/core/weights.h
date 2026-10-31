@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,13 @@ public:
     // mapping. The page-cache page is then never mapped into this process, so kernel memory compaction migrating it
     // sends no TLB-shootdown IPIs to the spinning pool cpus (which can slow every pool phase ~2x). Thread-safe.
     bool      host_pread(const void * p, void * dst, size_t n) const;
+    // host_mmap only: host_pread only if every byte is in the page cache (preadv2 RWF_NOWAIT): 1 = read, 0 = it would
+    // wait for the disk (nothing to rely on in dst), -1 = p is not in a mapping or the call is unsupported
+    int       host_pread_nowait(const void * p, void * dst, size_t n) const;
+    // host_mmap only: host_pread through an O_DIRECT fd (opened on first use): the 4 KiB-aligned block(s) holding the
+    // bytes are read past the page cache and the bytes copied out -- no page-cache allocation, so no reclaim on the read
+    // path. false when p is not in a mapping or O_DIRECT is refused (the caller falls back). Thread-safe.
+    bool      host_pread_direct(const void * p, void * dst, size_t n) const;
     // host_mmap only: start reading n bytes at a pointer into the shard mappings into the page cache (POSIX_FADV_WILLNEED:
     // asynchronous readahead, nothing mapped); false when p is not in a mapping
     bool      host_prefetch(const void * p, size_t n) const;
@@ -122,6 +130,8 @@ private:
     char *                        host_block_ = nullptr;
     std::vector<std::pair<void *, size_t>> maps_;   // host_mmap: one read-only mapping per shard
     std::vector<int>              fds_;            // host_pread: one O_RDONLY fd per shard, opened with the mappings
+    mutable std::vector<int>      dfds_;           // host_pread_direct: one O_DIRECT fd per shard (-2 = not opened yet)
+    mutable std::mutex            dfd_mu_;
     bool                          host_registered_ = false;
     double                        load_s_ = 0;
 };

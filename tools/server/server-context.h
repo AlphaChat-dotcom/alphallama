@@ -7,12 +7,16 @@
 #include "server-entity.h"
 #include "server-metadata.h"
 
+#include <mutex>
+
 // Corpus context for tool registration - defined here to avoid circular deps
 struct corpus_tool_context {
     bm25_index * bm25 = nullptr;
     entity_index * entities = nullptr;
     entity_linker * linker = nullptr;
     code_entity_extractor * extractor = nullptr;
+    // the server's corpus lock: held around every use of entities / linker / extractor (bm25 has its own lock)
+    std::mutex * corpus_mtx = nullptr;
     std::string model_name;  // for model-tagged experiences
 };
 

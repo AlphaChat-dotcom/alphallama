@@ -74,7 +74,7 @@ static std::wstring alpha_self_dir_w() {
 // Windows has no execv: run alphallama-serve.exe with this process's own arguments (the command line after the
 // program name, so the user's quoting is kept), wait for it, and hand back its exit code. Ctrl+C reaches the child
 // through the shared console; this process ignores it while it waits. False if the child could not be started.
-static bool alpha_win_run_serve(const std::wstring & serve, int & rc) {
+static bool alpha_win_run_serve(const std::wstring & serve, const std::wstring & extra_args, int & rc) {
     const wchar_t * cl = GetCommandLineW();
     // skip the program name: a quoted one runs to the closing quote, an unquoted one to the first space or tab
     if (*cl == L'"') {
@@ -84,7 +84,7 @@ static bool alpha_win_run_serve(const std::wstring & serve, int & rc) {
     } else {
         while (*cl && *cl != L' ' && *cl != L'\t') cl++;
     }
-    std::wstring cmd = L"\"" + serve + L"\"" + cl;
+    std::wstring cmd = L"\"" + serve + L"\"" + cl + extra_args;
     // pass this process's standard handles on explicitly: without STARTF_USESTDHANDLES a child of a process whose
     // output is redirected (a log file, a service) writes to the console instead, and its output is lost
     STARTUPINFOW si = {};
@@ -213,7 +213,7 @@ int main(int argc, char ** argv) {
     // the HW planner classifies the run as MoE offload (LUT_DIRECT / SELF_SPEC / CPU_MOE) and the
     // invocation uses none of the corpus/RAG/dev features this engine owns, exec the
     // alphallama-serve binary next to this one. Its arg parser ignores unknown flags, so argv
-    // passes through unchanged (on Windows, which has no exec, it runs as a child and its exit code is returned).
+    // passes through, plus --host/--port when absent (on Windows, which has no exec, it runs as a child and its exit code is returned).
     // ALPHA_NO_AUTOROUTE=1 forces this engine.
     if (!getenv("ALPHA_NO_AUTOROUTE") && !params.model.path.empty()) {
         bool corpus_or_dev = false;
@@ -223,6 +223,21 @@ int main(int argc, char ** argv) {
                 strcmp(a, "--tools") == 0 || strcmp(a, "--mode") == 0) {
                 corpus_or_dev = true; // retrieval/dev job: this engine owns it, don't route
                 break;
+            }
+        }
+        // alphallama-serve does not implement API keys or TLS: handing off would silently drop them
+        // (params reflects both the flags and their environment variables; the scan below also catches an empty key file)
+        bool auth_or_tls = !params.api_keys.empty() || !params.ssl_file_key.empty() || !params.ssl_file_cert.empty();
+        for (const char * e : { "LLAMA_API_KEY", "LLAMA_ARG_API_KEY", "LLAMA_ARG_API_KEY_FILE",
+                                "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_SSL_CERT_FILE" }) {
+            if (getenv(e)) {
+                auth_or_tls = true;
+            }
+        }
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--api-key") == 0 || strcmp(argv[i], "--api-key-file") == 0 ||
+                strcmp(argv[i], "--ssl-key-file") == 0 || strcmp(argv[i], "--ssl-cert-file") == 0) {
+                auth_or_tls = true;
             }
         }
         if (!corpus_or_dev) {
@@ -240,7 +255,10 @@ int main(int argc, char ** argv) {
                 std::string serve = dir + "/alphallama-serve";
                 const bool have_serve = access(serve.c_str(), X_OK) == 0;
 #endif
-                if (have_serve) {
+                if (have_serve && auth_or_tls) {
+                    fprintf(stderr, "[alphallama] not handing off to alphallama-serve: it would not apply "
+                                    "--api-key / --api-key-file / --ssl-key-file / --ssl-cert-file; serving here.\n");
+                } else if (have_serve) {
                     fprintf(stderr,
                         "==================================================================\n"
                         "[alphallama] MoE model does not fit VRAM (HW planner strategy: %s).\n"
@@ -251,16 +269,45 @@ int main(int argc, char ** argv) {
                         "==================================================================\n",
                         plan.strategy_name ? plan.strategy_name : "MoE-offload");
                     fflush(stderr);
+                    // alphallama-serve defaults to 0.0.0.0:8080; pass this engine's bind address and port
+                    // (loopback / 18080 unless set) when the command line does not name them
+                    bool have_host = false;
+                    bool have_port = false;
+                    for (int i = 1; i < argc; i++) {
+                        have_host = have_host || strcmp(argv[i], "--host") == 0;
+                        have_port = have_port || strcmp(argv[i], "--port") == 0;
+                    }
+                    std::vector<std::string> extra;
+                    if (!have_host) {
+                        extra.push_back("--host");
+                        extra.push_back(params.hostname);
+                    }
+                    if (!have_port) {
+                        extra.push_back("--port");
+                        extra.push_back(std::to_string(params.port));
+                    }
 #if defined(_WIN32)
+                    std::wstring extra_w;
+                    for (const auto & s : extra) {
+                        extra_w += L" \"" + std::wstring(s.begin(), s.end()) + L"\"";
+                    }
                     int rc = 0;
-                    if (alpha_win_run_serve(serve, rc)) {
+                    if (alpha_win_run_serve(serve, extra_w, rc)) {
                         return rc;
                     }
                     fprintf(stderr, "[alphallama] could not start alphallama-serve.exe (error %lu) — continuing in this engine.\n",
                             (unsigned long) GetLastError());
 #else
-                    argv[0] = const_cast<char *>(serve.c_str());
-                    execv(serve.c_str(), argv);
+                    std::vector<char *> serve_argv;
+                    serve_argv.push_back(const_cast<char *>(serve.c_str()));
+                    for (int i = 1; i < argc; i++) {
+                        serve_argv.push_back(argv[i]);
+                    }
+                    for (auto & s : extra) {
+                        serve_argv.push_back(&s[0]);
+                    }
+                    serve_argv.push_back(nullptr);
+                    execv(serve.c_str(), serve_argv.data());
                     // execv only returns on failure; fall through and run in-process.
                     fprintf(stderr, "[alphallama] exec of '%s' failed (%s) — continuing in this engine.\n",
                             serve.c_str(), strerror(errno));
@@ -393,7 +440,9 @@ int main(int argc, char ** argv) {
     ctx_http.post("/api/corpus/query",                ex_wrapper(routes.post_kv_route));
     ctx_http.post("/api/kv_chunk/index",              ex_wrapper(routes.post_kv_index));  // legacy alias
     ctx_http.post("/api/kv_chunk/route",              ex_wrapper(routes.post_kv_route));  // legacy alias
+#ifdef ALPHA_INTERNAL
     ctx_http.post("/api/expert_routing",              ex_wrapper(routes.post_expert_routing));
+#endif
     ctx_http.post("/api/oracle",                       ex_wrapper(routes.post_oracle));
 #ifdef ALPHA_DELTANET
     ctx_http.post("/api/deltanet/load",                ex_wrapper(routes.post_deltanet_load));
@@ -405,8 +454,10 @@ int main(int argc, char ** argv) {
     ctx_http.post("/api/dense/build_ann",              ex_wrapper(routes.post_dense_build_ann));
     // KV pool endpoints
     ctx_http.get ("/api/kv_pool/stats",               ex_wrapper(routes.get_kv_pool_stats));
+#ifdef ALPHA_INTERNAL
     ctx_http.post("/api/kv_pool/save",                ex_wrapper(routes.post_kv_pool_save));
     ctx_http.post("/api/kv_pool/load",                ex_wrapper(routes.post_kv_pool_load));
+#endif
     // Batch inference
     ctx_http.post("/api/batch",                       ex_wrapper(routes.post_batch_completions));
 

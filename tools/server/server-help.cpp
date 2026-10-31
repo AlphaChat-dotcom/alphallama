@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -70,21 +71,41 @@ struct oracle_state {
 
 static oracle_state g_oracle;
 
+// Serialises the whole load / answer / free sequence: g_oracle is shared by every /api/oracle request.
+static std::mutex g_oracle_mtx;
+
 // Suppress all llama.cpp log output (oracle init leaks binary name, GGUF, flash attn, etc.)
 static void silent_log(ggml_log_level, const char *, void *) {}
+
+// Silences llama.cpp logging while the oracle loads and puts back whatever callback was installed
+// before (the server's own logger), instead of resetting it to the default.
+struct oracle_log_silencer {
+    ggml_log_callback prev_cb   = nullptr;
+    void *            prev_data = nullptr;
+    oracle_log_silencer()  { llama_log_get(&prev_cb, &prev_data); llama_log_set(silent_log, nullptr); }
+    ~oracle_log_silencer() { llama_log_set(prev_cb, prev_data); }
+};
 
 // Load the embedded oracle. Returns loaded model or nullptr.
 static llama_model * load_embedded_oracle(llama_model_params mparams) {
     if (!oracle_embed::available()) return nullptr;
 
 #ifdef _WIN32
-    // Windows has no fmemopen: write to a per-user temp file, load, delete.
+    // Windows has no fmemopen: write to a per-user temp file, load, delete. GetTempFileNameA creates the file
+    // under a new unique name (CREATE_NEW), so a file another process planted at a fixed name is never reused,
+    // and concurrent servers do not share one.
     char tmp_dir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmp_dir);
-    std::string tmp_path = std::string(tmp_dir) + "alphallama_oracle.tmp";
+    char tmp_file[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tmp_dir) == 0 || GetTempFileNameA(tmp_dir, "alo", 0, tmp_file) == 0) {
+        return nullptr;
+    }
+    const std::string tmp_path = tmp_file;
 
     FILE * f = fopen(tmp_path.c_str(), "wb");
-    if (!f) return nullptr;
+    if (!f) {
+        std::remove(tmp_path.c_str());
+        return nullptr;
+    }
 
     size_t written = fwrite(oracle_embed::data(), 1, oracle_embed::size(), f);
     fclose(f);
@@ -114,7 +135,7 @@ bool alpha_error_assistant::load() {
 
     // Suppress logs during oracle load; its init output leaks internal details
     // (binary name "alphallama", "GGUF", "flash attention", layer counts, etc.)
-    llama_log_set(silent_log, nullptr);
+    oracle_log_silencer quiet;
 
     // Load on CPU only so it does not compete with the main model for VRAM
     llama_model_params mparams = llama_model_default_params();
@@ -127,14 +148,12 @@ bool alpha_error_assistant::load() {
     if (!g_oracle.model) {
         g_oracle_path = find_model_path();
         if (g_oracle_path.empty()) {
-            llama_log_set(nullptr, nullptr);
             return false;
         }
         g_oracle.model = llama_model_load_from_file(g_oracle_path.c_str(), mparams);
     }
 
     if (!g_oracle.model) {
-        llama_log_set(nullptr, nullptr);  // restore default logging
         return false;
     }
 
@@ -144,9 +163,6 @@ bool alpha_error_assistant::load() {
     // Leave flash_attn at its default (the oracle is tiny)
 
     g_oracle.ctx = llama_init_from_model(g_oracle.model, cparams);
-
-    // Restore default logging after oracle is loaded
-    llama_log_set(nullptr, nullptr);
 
     if (!g_oracle.ctx) {
         llama_model_free(g_oracle.model);
@@ -165,6 +181,7 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
                                            const std::string & command_line,
                                            const std::string & extra_context,
                                            bool is_question) {
+    std::lock_guard<std::mutex> oracle_lock(g_oracle_mtx);
     if (!load()) return "";
 
     // Build the prompt, hardened against prompt injection and info leaks:
@@ -318,9 +335,6 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
     if (n <= 0) return "";
     tokens.resize(n);
 
-    // Suppress logs during oracle inference (decode logs leak internal details)
-    llama_log_set(silent_log, nullptr);
-
     // Clear KV
     llama_memory_seq_rm(llama_get_memory(g_oracle.ctx), 0, -1, -1);
 
@@ -329,7 +343,6 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
     const int n_batch = (int) llama_n_batch(g_oracle.ctx);
     if (n + 32 > (int) llama_n_ctx(g_oracle.ctx)) {
         unload();
-        llama_log_set(nullptr, nullptr);
         return "";
     }
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
@@ -346,7 +359,6 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
         if (llama_decode(g_oracle.ctx, batch) != 0) {
             llama_batch_free(batch);
             unload();
-            llama_log_set(nullptr, nullptr);
             return "";
         }
     }
@@ -407,7 +419,6 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
 
     llama_sampler_free(smpl);
     unload();  // free resources immediately
-    llama_log_set(nullptr, nullptr);  // restore default logging
 
     // Drop any reasoning block the model still emitted, then trim.
     {

@@ -6,6 +6,8 @@
 //
 //   ai-api-gen -m model.gguf --tokens-in p.i32[,q.i32,...] [-n 256] [--ctx 4096] [--slots N|-1] [--mtp-k K] [--requests R]
 //              [--chunk-feed C] [--stop a,b] [--gen-out prefix]   -> prefix.<r>.i32 per request
+//              [--temp T --top-k K --top-p P --min-p M --seed S --seed-step D]: request r samples with seed S + r * D
+//              through ai_engine_set_sampling (set before its prefill); T <= 0 (the default) = greedy, no call made
 #include "api/ai_engine.h"
 
 #include <algorithm>
@@ -22,6 +24,9 @@ int main(int argc, char ** argv) {
     std::string model, tokens_in, gen_out, chat_turn;
     int         n_gen = 256, slots = -1, mtp_k = 0, requests = 1, chunk_feed = 0;
     int64_t     ctx = 4096;
+    float       temp = 0.0f, top_p = 1.0f, min_p = 0.0f;
+    int         top_k = 0;
+    long long   seed = 1, seed_step = 0;
     std::vector<int32_t> stop;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -34,7 +39,13 @@ int main(int argc, char ** argv) {
         else if (a == "--requests") requests = atoi(v.c_str());
         else if (a == "--chunk-feed") chunk_feed = atoi(v.c_str());
         else if (a == "--gen-out") gen_out = v;
-        else if (a == "--chat-turn") chat_turn = v;   // request r > 0: previous prompt + its answer + these tokens
+        else if (a == "--chat-turn") chat_turn = v;
+        else if (a == "--temp") temp = (float) atof(v.c_str());
+        else if (a == "--top-k") top_k = atoi(v.c_str());
+        else if (a == "--top-p") top_p = (float) atof(v.c_str());
+        else if (a == "--min-p") min_p = (float) atof(v.c_str());
+        else if (a == "--seed") seed = atoll(v.c_str());
+        else if (a == "--seed-step") seed_step = atoll(v.c_str());   // request r > 0: previous prompt + its answer + these tokens
         else if (a == "--stop") {
             for (const char * q = v.c_str(); *q;) {
                 char *     e  = nullptr;
@@ -95,6 +106,13 @@ int main(int argc, char ** argv) {
         const auto tp    = std::chrono::steady_clock::now();
         int32_t    first = -1;
         int        rc    = AI_ENGINE_OK;
+        if (temp > 0.0f) {
+            const uint64_t sd = (uint64_t) (seed + (long long) r * seed_step);
+            rc = ai_engine_set_sampling(e, 0, temp, top_k, top_p, min_p, sd);
+            if (r == 0) fprintf(stderr, "[api-gen] sampling: supports %d, temp %.2f top_k %d top_p %.2f min_p %.2f seed %llu (+%lld per request) -> rc %d\n",
+                                ai_engine_supports_sampling(e), temp, top_k, top_p, min_p, (unsigned long long) sd, seed_step, rc);
+            if (rc != AI_ENGINE_OK) { fprintf(stderr, "[api-gen] set_sampling rc %d: %s\n", rc, ai_engine_last_error(e)); rc_all = 1; break; }
+        }
         if (chunk_feed > 0) {
             for (size_t off = 0; off < prompt.size() && rc == AI_ENGINE_OK; off += (size_t) chunk_feed) {
                 const int  nn   = (int) std::min(prompt.size() - off, (size_t) chunk_feed);

@@ -214,7 +214,31 @@ void * Device::ws_alloc_raw(size_t bytes, int * buf_out) {
         if (ws_trace_on_) ws_peak_live_ = ws_live_;
     }
     *buf_out = ws_buf_;
-    return (char *) buffer_base(ws_buf_) + off;
+    return (char *) buffer_base(ws_buf_) + ws_base_off_ + off;
+}
+
+void Device::ws_redirect(int buf, size_t off, size_t cap) {
+    if (ws_redirected()) throw std::runtime_error("ws_redirect: already redirected");
+    if (off % alignment_ != 0) throw std::runtime_error("ws_redirect: borrowed range not aligned");
+    ws_saved_ = WsSaved{ ws_buf_, ws_cap_, ws_off_, ws_high_, ws_base_off_, ws_high_tag_ };
+    ws_buf_ = buf;
+    ws_base_off_ = off;
+    ws_cap_ = cap;
+    ws_off_ = 0;
+    ws_high_ = 0;
+    ws_live_.clear();
+}
+
+void Device::ws_restore() {
+    if (!ws_redirected()) return;
+    ws_buf_      = ws_saved_.buf;
+    ws_cap_      = ws_saved_.cap;
+    ws_off_      = ws_saved_.off;
+    ws_high_     = ws_saved_.high;
+    ws_base_off_ = ws_saved_.base_off;
+    ws_high_tag_ = ws_saved_.high_tag;
+    ws_saved_    = WsSaved{};
+    ws_live_.clear();
 }
 
 Tensor Device::ws_alloc(int type, int64_t n0, int64_t n1, int64_t n2, int64_t n3) {

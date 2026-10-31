@@ -415,12 +415,14 @@ void gpu_engine::stop() {
 
 // Host-side token sampler (temperature / top-k / top-p / seeded categorical).
 // Applied per slot in decode_batch when the request asked for sampling; greedy slots keep the
-// argmax path. Order: temperature -> top-k -> top-p (nucleus) -> softmax over the survivors ->
+// argmax path. Order: temperature -> top-k -> top-p (nucleus) -> min-p -> softmax over the survivors ->
 // categorical draw. Reproducible for a fixed RNG seed.
 static llama_token alpha_sample_token(const float * logits, int n_vocab,
-                                      float temperature, int top_k, float top_p, uint64_t rng_seed) {
+                                      float temperature, int top_k, float top_p, uint64_t rng_seed,
+                                      float min_p = 0.0f) {
     if (n_vocab <= 0) return 0;
-    if (temperature <= 0.0f || top_k == 1) {           // degenerate -> argmax
+    // below 1e-6, 1 / T overflows the scaled logits (and the draw is the argmax anyway)
+    if (!(temperature >= 1e-6f) || top_k == 1) {        // degenerate -> argmax
         int best = 0; float bl = logits[0];
         for (int v = 1; v < n_vocab; v++) if (logits[v] > bl) { bl = logits[v]; best = v; }
         return best;
@@ -449,6 +451,12 @@ static llama_token alpha_sample_token(const float * logits, int n_vocab,
     if (top_p < 1.0f && top_p > 0.0f) {
         double cum = 0.0; size_t keep = probs.size();
         for (size_t i = 0; i < probs.size(); i++) { cum += probs[i] / sum; if (cum >= (double)top_p) { keep = i + 1; break; } }
+        if (keep < probs.size()) { probs.resize(keep); cand.resize(keep); sum = 0.0; for (double p : probs) sum += p; }
+    }
+    // min-p: keep the tokens at least min_p times as likely as the top one (probs[0] is the top, exp(0) = 1)
+    if (min_p > 0.0f && min_p <= 1.0f) {
+        size_t keep = 1;
+        while (keep < probs.size() && probs[keep] >= (double) min_p) keep++;
         if (keep < probs.size()) { probs.resize(keep); cand.resize(keep); sum = 0.0; for (double p : probs) sum += p; }
     }
     // categorical draw with a seeded RNG
@@ -623,7 +631,8 @@ bool gpu_engine::mm_prefill(const BatchRequest & req, BatchResult & result) {
     const float * logits = llama_get_logits_ith(ctx_, -1);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_)));
     if (logits) {
-        tok = alpha_sample_token(logits, n_vocab, req.samp_temp[last], req.samp_top_k[last], req.samp_top_p[last], req.samp_rng[last]);
+        tok = alpha_sample_token(logits, n_vocab, req.samp_temp[last], req.samp_top_k[last], req.samp_top_p[last], req.samp_rng[last],
+                                 (size_t) last < req.samp_min_p.size() ? req.samp_min_p[last] : 0.0f);
     } else {
         tok = llama_get_sampled_token_ith(ctx_, -1);
     }
@@ -963,7 +972,8 @@ bool gpu_engine::decode_batch(const BatchRequest & req, BatchResult & result) {
             if (logits) {
                 const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_)));
                 tok = alpha_sample_token(logits, n_vocab, req.samp_temp[i],
-                                         req.samp_top_k[i], req.samp_top_p[i], req.samp_rng[i]);
+                                         req.samp_top_k[i], req.samp_top_p[i], req.samp_rng[i],
+                                         (size_t) i < req.samp_min_p.size() ? req.samp_min_p[i] : 0.0f);
                 // ALPHA_SEED_TRACE: the seed schedule cannot be validated by comparing generated
                 // text, since MTP and plain decode see slightly different logits (different batch
                 // widths, non-batch-invariant kernels). Trace (position, seed) in both paths instead.
@@ -1627,7 +1637,8 @@ void gpu_engine::mtp_window_extend(const BatchRequest & req, BatchResult & resul
             fprintf(stderr, "[seedtrace] mtp   pos=%d seed=%llu\n",
                     (int) (pos0 + 1 + i), (unsigned long long) seed);
         return alpha_sample_token(lg, n_vocab, req.samp_temp[0],
-                                  req.samp_top_k[0], req.samp_top_p[0], seed);
+                                  req.samp_top_k[0], req.samp_top_p[0], seed,
+                                  req.samp_min_p.empty() ? 0.0f : req.samp_min_p[0]);
     };
 
     // 3. Verify [last@pos0, d[0]@pos0+1, ... d[k-1]@pos0+k] in one batched decode.

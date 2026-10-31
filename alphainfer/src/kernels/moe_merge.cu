@@ -77,3 +77,34 @@ void moe_merge_residual(void * stream, const float * exps, const float * w, cons
 }
 
 }  // namespace ai::kern
+
+// y = (sum_j exps[.., j, ..] * w[j]) [+ add]: the MUL + k-1 ADDs (+ ADD) of the offloaded MoE paths in one launch.
+// add may alias y (an accumulator: each element is read then written by the same thread; IEEE addition commutes).
+__global__ static void moe_weighted_sum_k(const float * __restrict__ e, const float * __restrict__ w, const float * add,
+                                          float * y, long long E, int k, long long T) {
+    const long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= E * T) {
+        return;
+    }
+    const long long t    = idx / E;
+    const long long i    = idx - t * E;
+    const long long base = (long long) k * t;
+    float acc = e[i + E * base] * w[base];
+    for (int j = 1; j < k; ++j) {
+        acc = acc + e[i + E * (base + j)] * w[base + j];
+    }
+    y[idx] = add ? acc + add[idx] : acc;
+}
+
+namespace ai::kern {
+
+void moe_weighted_sum(void * stream, const float * exps, const float * w, const float * add, float * y, int64_t E,
+                      int64_t k, int64_t T) {
+    const long long n       = (long long) E * T;
+    const int       threads = 256;
+    const long long blocks  = (n + threads - 1) / threads;
+    moe_weighted_sum_k<<<(unsigned) blocks, threads, 0, (cudaStream_t) stream>>>(exps, w, add, y, (long long) E,
+                                                                                (int) k, (long long) T);
+}
+
+}  // namespace ai::kern

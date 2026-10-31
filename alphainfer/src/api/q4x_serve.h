@@ -58,6 +58,12 @@ public:
     int32_t decode_plain(int32_t pending);                      // one token
     void    decode_spec(int32_t pending, std::vector<int32_t> & out);   // 1 .. mtp_k() + 1 tokens, the last pending
     void    reset();
+    // [sampling] temperature <= 0 = greedy (the default); top_k 0 / top_p 1 / min_p 0 = off. Tokens are drawn on the
+    // device (ops sample_into, Philox(seed, position)); drafts stay argmax and are accepted only when equal to the draw,
+    // so MTP keeps its speed and the text follows the sampling distribution. Persists across requests: set it before a
+    // request's prefill. false when sampling is not built in (AI_SAMPLING=0) and temperature > 0.
+    bool    sampling_enabled() const;
+    bool    set_sampling(float temperature, int top_k, float top_p, float min_p, uint64_t seed);
 
 private:
     struct Impl;

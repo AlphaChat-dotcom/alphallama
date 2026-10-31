@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -102,12 +103,23 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
         return t;
     };
     auto pad = [&](size_t v) { return (v + 255) / 256 * 256; };
+    auto bank_bytes = [&](size_t b) {
+        size_t s = 0;
+        for (const Tensor * h : { &banks[b].gate_exps, &banks[b].up_exps, &banks[b].down_exps }) {
+            s += pad(dev_.alloc_size(bank_of(*h, banks_[b].n_slots + k_)));
+        }
+        return s;
+    };
+    for (size_t b = 0; b < nbk; ++b) banks_[b].n_slots = std::max(0, std::min(slots[b], E_));
+    // prefill slot lending: the last lendable banks, until cfg_.lend_bytes is covered, live in their own buffer
+    const size_t lend_end_b = cfg_.lend_banks_end < 0 ? nbk : std::min(nbk, (size_t) cfg_.lend_banks_end);
+    for (size_t b = lend_end_b; b-- > 0 && lend_bytes_ < cfg_.lend_bytes;) {
+        banks_[b].lent = true;
+        lend_bytes_ += bank_bytes(b);
+    }
     size_t total = 4096;
     for (size_t b = 0; b < nbk; ++b) {
-        const auto & w  = banks[b];
-        const int    ns = std::max(0, std::min(slots[b], E_));
-        banks_[b].n_slots = ns;
-        for (const Tensor * h : { &w.gate_exps, &w.up_exps, &w.down_exps }) total += pad(dev_.alloc_size(bank_of(*h, ns + k_)));
+        if (!banks_[b].lent) total += bank_bytes(b);
         total += pad((size_t) E_ * 4);
     }
     for (int rep : stage_rep) {
@@ -126,6 +138,31 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
         off     += dev_.alloc_size(t);
         return t;
     };
+    char * lbase = nullptr;
+    size_t loff  = 0;
+    if (lend_bytes_ > 0) {
+        lend_buf_ = dev_.alloc_buffer(lend_bytes_, "door.lend");
+        lbase     = (char *) dev_.buffer_base(lend_buf_);
+    }
+    auto carve_lent = [&](const Tensor & h, int n) {   // lent banks, highest bank first (from the buffer's start)
+        Tensor t = bank_of(h, n);
+        t.buf    = lend_buf_;
+        loff     = pad(loff);
+        t.data   = lbase + loff;
+        loff    += dev_.alloc_size(t);
+        return t;
+    };
+    for (size_t b = nbk; b-- > 0;) {
+        if (!banks_[b].lent) continue;
+        const auto & w = banks[b];
+        Bank &       B = banks_[b];
+        B.lend_off = pad(loff);
+        B.gate     = carve_lent(w.gate_exps, B.n_slots + k_);
+        B.up       = carve_lent(w.up_exps, B.n_slots + k_);
+        B.down     = carve_lent(w.down_exps, B.n_slots + k_);
+        B.lend_len = loff - B.lend_off;
+    }
+    if (loff > lend_bytes_) throw std::runtime_error("DoorbellMoe: lent carve overran its buffer");
     auto copy_expert = [](const Tensor & dst, int slot, const Tensor & src, int e) {
         cudaMemcpy((char *) dst.data + (size_t) slot * dst.nb[2], (const char *) src.data + (size_t) e * src.nb[2],
                    src.nb[2], cudaMemcpyHostToDevice);
@@ -138,9 +175,11 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
         const auto & w = banks[b];
         Bank &       B = banks_[b];
         const int    ns = B.n_slots, nb = ns + k_;
-        B.gate = carve(w.gate_exps, nb);
-        B.up   = carve(w.up_exps, nb);
-        B.down = carve(w.down_exps, nb);
+        if (!B.lent) {   // a lent bank's slots were carved from door.lend above
+            B.gate = carve(w.gate_exps, nb);
+            B.up   = carve(w.up_exps, nb);
+            B.down = carve(w.down_exps, nb);
+        }
         B.host_gate = w.gate_exps;
         B.host_up   = w.up_exps;
         B.host_down = w.down_exps;
@@ -196,7 +235,7 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
     cudaMemset(counters_, 0, nbk * 4);
     off += nbk * 4;
     if (off > total) throw std::runtime_error("DoorbellMoe: device carve overran its buffer");
-    device_bytes_ = total;
+    device_bytes_ = total + lend_bytes_;
 
     // CPU pool placement: explicit list, else the topology plan (the launch thread owns its physical core)
     std::vector<int> cpus = cfg_.cpus;
@@ -240,9 +279,15 @@ DoorbellMoe::DoorbellMoe(Device & dev, const std::vector<op::MoeWeights> & banks
     fprintf(stderr, "[door] doorbell offload: %zu banks, %d..%d resident + %d filler slots per bank of %d experts "
                     "(%.2f GiB slots, %zu staging group(s) x %d slots, %.2f GiB device total), t_max %lld, CPU pool %d "
                     "threads%s, admission %d/round; profile mass resident %s\n",
-            nbk, min_s, max_s, k_, E_, slot_bytes / 1073741824.0, stages_.size(), pf, total / 1073741824.0,
+            nbk, min_s, max_s, k_, E_, slot_bytes / 1073741824.0, stages_.size(), pf, device_bytes_ / 1073741824.0,
             (long long) cfg_.t_max, cpus.empty() ? threads : (int) cpus.size(), cpus.empty() ? "" : " (pinned)",
             cfg_.admit, ranked ? (std::to_string(100.0 * resident / ranked).substr(0, 5) + "%").c_str() : "n/a");
+    if (lend_bytes_ > 0) {
+        int nl = 0;
+        for (const Bank & B : banks_) nl += B.lent ? 1 : 0;
+        fprintf(stderr, "[door] prefill slot lending: %d bank(s) (%.2f GiB) lendable as prefill workspace\n", nl,
+                lend_bytes_ / 1073741824.0);
+    }
 }
 
 DoorbellMoe::~DoorbellMoe() {
@@ -290,12 +335,12 @@ Tensor DoorbellMoe::moe(int bank, const op::MoeWeights & w, const op::MoeParams 
     });
     Tensor shared = op::moe_shared(dev_, x, w);   // overlaps the CPU's work on the misses
     if (shared.type != F32 || !shared.contiguous()) throw std::runtime_error("DoorbellMoe::moe: shared expert output not f32 contiguous");
-    Tensor routed = op::moe_experts(dev_, x, B.up, B.gate, B.down, slots, wm, k_);
+    Tensor exps = op::moe_experts_raw(dev_, x, B.up, B.gate, B.down, slots);
     float * shp = (float *) shared.data;
     adapter::native(dev_, [=]() {
         kern::door_wait_add(adapter::stream(*dev), bl.d_done, ctr, sp, f0, bl.d_yp, shp, N, k, T);
     });
-    return op::add(dev_, routed, shared);
+    return op::moe_wsum(dev_, exps, wm, k_, &shared);   // routed + shared in one launch (was MUL, k-1 ADDs, ADD)
 }
 
 Tensor DoorbellMoe::moe_bulk(int bank, const op::MoeWeights & w, const op::MoeParams & p, const Tensor & x) {
@@ -335,9 +380,11 @@ Tensor DoorbellMoe::moe_bulk(int bank, const op::MoeWeights & w, const op::MoePa
     std::vector<float>   mk((size_t) n);
     std::vector<char>    seen((size_t) E_, 0);
     std::vector<int32_t> missed;
+    // a lent bank's slot memory is the prefill's workspace right now: nothing in it is resident (fillers included)
+    const bool lent = lending_ && B.lent;
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = h_sel_[i];
-        const int32_t s = B.table_h[(size_t) e];
+        const int32_t s = lent ? -1 : B.table_h[(size_t) e];
         sl[(size_t) i] = s >= 0 ? s : B.n_slots + (int32_t) (i % k_);
         mk[(size_t) i] = s >= 0 ? 1.0f : 0.0f;
         if (s < 0 && !seen[(size_t) e]) { seen[(size_t) e] = 1; missed.push_back(e); }
@@ -351,12 +398,13 @@ Tensor DoorbellMoe::moe_bulk(int bank, const op::MoeWeights & w, const op::MoePa
         Device::Scope sc(dev_);
         Tensor st, m;
         upload_pass(sl, mk, st, m);
-        Tensor part = op::moe_experts(dev_, x, up, gate, down, st, op::mul(dev_, route.weights, m), k_);
-        if (first) op::copy_into(dev_, part, acc, "door bulk acc");
-        else       op::copy_into(dev_, op::add(dev_, acc, part), acc, "door bulk acc");
+        // the pass's weighted sum lands in acc directly (added to it after the first pass): no [N, k, T] weighted
+        // copy, no partial sums, no copy -- the bulk of a large chunk's MoE workspace
+        Tensor exps = op::moe_experts_raw(dev_, x, up, gate, down, st);
+        op::moe_wsum(dev_, exps, op::mul(dev_, route.weights, m), k_, first ? nullptr : &acc, &acc);
         first = false;
     };
-    run_pass(B.up, B.gate, B.down);
+    if (!lent) run_pass(B.up, B.gate, B.down);
     void * stream = adapter::stream(dev_);
     std::vector<int32_t> stage_of((size_t) E_, -1);
     std::vector<char>    used((size_t) S.slots, 0);
@@ -553,18 +601,72 @@ void DoorbellMoe::reset_residency() {
     n_resets_++;
 }
 
+bool DoorbellMoe::lend_begin(int * buf, size_t * bytes) {
+    if (lend_bytes_ == 0 || lending_) return false;
+    dev_.synchronize();   // nothing in flight reads the slots (the previous rounds) before the prefill writes them
+    // the admission copies queued at the last boundary land and are published now: no copy into a lent slot can
+    // arrive while the slot is workspace, and lend_end restores every owner (the restore also keeps them)
+    std::vector<char> dirty(banks_.size(), 0);
+    for (const Pending & p : pending_) {
+        const size_t si = (size_t) (p.job % (int64_t) staging_.size());
+        while (recorded_[si].load(std::memory_order_acquire) != p.job) std::this_thread::yield();
+        cudaEventSynchronize((cudaEvent_t) staging_ev_[si]);
+        Bank & B = banks_[(size_t) p.bank];
+        B.table_h[(size_t) p.expert] = p.slot;
+        B.owner[(size_t) p.slot]     = p.expert;
+        dirty[(size_t) p.bank]       = 1;
+        n_publish_++;
+    }
+    pending_.clear();
+    for (size_t b = 0; b < banks_.size(); ++b) {
+        if (!dirty[b]) continue;
+        cudaMemcpy(banks_[b].table.data, banks_[b].table_h.data(), (size_t) E_ * 4, cudaMemcpyHostToDevice);
+        if (table_pin_) memcpy(table_pin_ + b * (size_t) E_, banks_[b].table_h.data(), (size_t) E_ * 4);
+    }
+    lending_ = true;
+    *buf     = lend_buf_;
+    *bytes   = lend_bytes_;
+    n_lends_++;
+    return true;
+}
+
+void DoorbellMoe::lend_end(size_t used) {
+    if (!lending_) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    void * st = adapter::stream(dev_);   // after the prefill's kernels, which read and write the borrowed bytes
+    for (Bank & B : banks_) {
+        if (!B.lent || B.lend_off >= used) continue;   // the workspace never reached this bank: its slots are intact
+        const Tensor * src[3] = { &B.host_gate, &B.host_up, &B.host_down };
+        const Tensor * dst[3] = { &B.gate, &B.up, &B.down };
+        for (int sl = 0; sl < B.n_slots + k_; ++sl) {
+            const int32_t e = sl < B.n_slots ? B.owner[(size_t) sl] : sl - B.n_slots;   // fillers: experts 0..k-1
+            if (e < 0) continue;
+            for (int r = 0; r < 3; ++r) {
+                cudaMemcpyAsync((char *) dst[r]->data + (size_t) sl * dst[r]->nb[2],
+                                (const char *) src[r]->data + (size_t) e * src[r]->nb[2], src[r]->nb[2],
+                                cudaMemcpyHostToDevice, (cudaStream_t) st);
+                n_lend_bytes_ += src[r]->nb[2];
+            }
+        }
+    }
+    dev_.synchronize();
+    lending_ = false;
+    lend_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 std::string DoorbellMoe::stats_line() const {
     const auto & ps = pool_->stats();
     char buf[512];
     snprintf(buf, sizeof buf,
              "decode columns %llu, missed %llu (hit %.1f%%), admitted %llu, published %llu | CPU pool rings %llu, "
              "computed %llu, busy %.1f ms | prefill columns %llu, staged %llu (%.2f GiB copied) | residency resets %llu "
-             "(%llu slots restored)",
+             "(%llu slots restored) | prefill lends %llu (%.2f GiB restored in %.0f ms)",
              (unsigned long long) n_cols_, (unsigned long long) n_miss_,
              n_cols_ ? 100.0 * (double) (n_cols_ - n_miss_) / (double) n_cols_ : 0.0, (unsigned long long) n_admit_,
              (unsigned long long) n_publish_, (unsigned long long) ps.rings.load(), (unsigned long long) ps.misses.load(),
              ps.busy_ns.load() / 1e6, (unsigned long long) n_bulk_cols_, (unsigned long long) n_bulk_miss_,
-             n_bulk_bytes_ / 1073741824.0, (unsigned long long) n_resets_, (unsigned long long) n_restored_);
+             n_bulk_bytes_ / 1073741824.0, (unsigned long long) n_resets_, (unsigned long long) n_restored_,
+             (unsigned long long) n_lends_, n_lend_bytes_ / 1073741824.0, lend_ms_);
     return buf;
 }
 

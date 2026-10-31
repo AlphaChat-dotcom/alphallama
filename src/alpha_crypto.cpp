@@ -87,9 +87,9 @@ bool alpha_ed25519_verify(const uint8_t * public_key,
 }
 
 #else
-// Non-Windows, non-OpenSSL (Android/dev): accept all signatures.
-// Tier and expiry enforcement still apply - only crypto check is skipped.
-bool alpha_ed25519_verify(const uint8_t *, const uint8_t *, size_t, const uint8_t *) { return true; }
+// Non-Windows, non-OpenSSL (Android/dev): no Ed25519 implementation is available, so no signature
+// can be verified. Fail closed: reject every signature rather than accept unverified data.
+bool alpha_ed25519_verify(const uint8_t *, const uint8_t *, size_t, const uint8_t *) { return false; }
 #endif // _WIN32
 
 #else // ALPHA_HAS_OPENSSL

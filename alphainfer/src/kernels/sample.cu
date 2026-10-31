@@ -13,8 +13,8 @@
 //          64 largest; when the nucleus holds more than 64 tokens there is no top_p cut
 // in the order the AlphaServe host sampler applies them (temperature, top_k, top_p, softmax), plus min_p.
 //
-// u_i comes from Philox4x32-10 keyed by the request seed, with counter (token id, position, slot): a draw depends
-// only on (seed, position, slot, logits). A verify row and the plain decode of the same position therefore draw the
+// u_i comes from Philox4x32-10 keyed by the request seed, with counter (token id, position): a draw depends only on
+// (seed, position, logits), so the same request gives the same text on any slot. A verify row and the plain decode of the same position therefore draw the
 // same token from the same logits, so exact MTP verify stays token-identical to plain decode when sampling too.
 #include "kernels/kernels.h"
 
@@ -196,8 +196,10 @@ __global__ static void sample_gumbel_partial_k(const float * __restrict__ x, lon
          col += (long long) GMB_BLOCKS * GMB_THREADS) {
         const float v = rowx[col];
         if (v < t) continue;
-        const uint32_t r = philox((uint32_t) col, p0, p1, (uint32_t) rc.slot, k0, k1);
-        const float    u = ((float) (r >> 8) + 0.5f) * (1.0f / 16777216.0f);   // (0, 1)
+        const uint32_t r = philox((uint32_t) col, p0, p1, 0u, k0, k1);
+        // 23 bits: (r + 0.5) * 2^-23 is exact in a float and stays inside (0, 1). With 24 bits the top value rounds to
+        // 1.0f, logf(1) = 0 and the key becomes +inf: a random token wins (~1.5% of draws over a 248k vocabulary).
+        const float    u = ((float) (r >> 9) + 0.5f) * 0x1p-23f;
         const float    key = v * it - logf(-logf(u));
         if (key > best) { best = key; bidx = (int32_t) col; }
     }

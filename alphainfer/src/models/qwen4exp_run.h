@@ -89,6 +89,10 @@ public:
 
 private:
     void   ple_rows(int64_t pos0, int64_t T, float * out) const;   // host: [N, T] f32
+    // AI_Q4X_PLE_IO: the round's PLE row reads, de-duplicated; page-cache hits are read inline, the rest queued with
+    // WILLNEED readahead at once, then read inline (decode) or by blocking reader threads too (prefill)
+    struct PleIo;
+    mutable std::unique_ptr<PleIo> ple_io_;
     Tensor round(const int32_t * tokens, int64_t T);                // captured T <= kDoorbellT row round (decode / verify)
     Tensor forward(const Tensor & ids, const Tensor & pos4, const Tensor & cells, const Tensor & mask, const Tensor & ple,
                    int64_t T, int64_t n_kv);

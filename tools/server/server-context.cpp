@@ -52,6 +52,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <utility>
@@ -64,11 +65,56 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>   // close (unique temp files)
 #endif
+#include <cstdlib>    // mkstemp, mkdtemp
 
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Unique temp file path under dir, created empty and owned by this process (POSIX mkstemp: O_EXCL, mode 0600),
+// so a pre-planted file or symlink at a guessable pid-based name cannot redirect the write.
+static std::string alpha_unique_tmp_path(const std::string & dir, const std::string & prefix) {
+#if defined(_WIN32)
+    std::random_device rd;
+    char tag[32];
+    snprintf(tag, sizeof(tag), "%08x%08x", (unsigned) rd(), (unsigned) rd());
+    return dir + "/" + prefix + tag;
+#else
+    std::string tmpl = dir + "/" + prefix + "XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    const int fd = mkstemp(buf.data());
+    if (fd < 0) {
+        return "";
+    }
+    close(fd);
+    return std::string(buf.data());
+#endif
+}
+
+// Unique private temp directory under dir (POSIX mkdtemp: mode 0700), for a group of temp files whose names are
+// derived from one base: no other user can pre-create or symlink a name inside it. Empty if it cannot be created.
+static std::string alpha_unique_tmp_dir(const std::string & dir, const std::string & prefix) {
+#if defined(_WIN32)
+    std::random_device rd;
+    char tag[32];
+    snprintf(tag, sizeof(tag), "%08x%08x", (unsigned) rd(), (unsigned) rd());
+    const std::string path = dir + "/" + prefix + tag;
+    std::error_code ec;
+    return std::filesystem::create_directory(path, ec) ? path : "";
+#else
+    std::string tmpl = dir + "/" + prefix + "XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (mkdtemp(buf.data()) == nullptr) {
+        return "";
+    }
+    return std::string(buf.data());
+#endif
+}
 
 static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
     if (pos_min == -1) {
@@ -1548,6 +1594,9 @@ public:
 
     // Layer 3: Metadata sub-index for structured record precision
     mutable metadata_index chunk_metadata;
+    // Guards chunk_metadata / chunk_entities / chunk_linker / entity_extractor between concurrent
+    // HTTP ingest (/api/corpus/index), finalize and query handlers (chunk_bm25 has its own lock).
+    mutable std::mutex corpus_mtx;
 
     // Unified mode (--context unified): question router + per-class focused assembly.
     unified_index unified;
@@ -3110,20 +3159,28 @@ private:
 
         // Back BM25 chunk text with a private mmap'd file so the ciphertext lives off-RAM instead of
         // holding the full text twice. It stays encrypted at rest.
+        // All ingest temp files live in one private, unique directory (removed after finalize below); if it cannot
+        // be created, the text store, metadata streams and postings spill stay resident.
+        std::string ingest_tmp_dir;
         {
             const char * td = getenv("TMPDIR"); std::string tmpdir = (td && *td) ? td : "/tmp";
-            chunk_bm25.open_text_store(tmpdir + "/alpha_bm25_" + std::to_string((long)getpid()) + ".text.bin");
+            ingest_tmp_dir = alpha_unique_tmp_dir(tmpdir, "alpha_ingest_");
+        }
+        if (!ingest_tmp_dir.empty()) {
+            chunk_bm25.open_text_store(ingest_tmp_dir + "/alpha_bm25.text.bin");
             // Stream the metadata inverted-index postings to temp files too, so the resident maps are
             // not a build-time transient. ALPHA_META_SELFCHECK keeps the maps in parallel and verifies
             // streamed lookup == map for every key at finalize.
             bool self = getenv("ALPHA_META_SELFCHECK") != nullptr;
-            chunk_metadata.enable_streaming(tmpdir + "/alpha_meta_" + std::to_string((long)getpid()), self);
+            chunk_metadata.enable_streaming(ingest_tmp_dir + "/alpha_meta", self);
             // External inversion: in inverted mode, spill BM25 postings to shard files during ingest so
             // the resident forward index is never accumulated. No-op unless ALPHA_BM25_INVERTED is set;
             // falls back to resident inversion if the spill file cannot be opened.
             if (bm25_index::bm25_inverted()) {
-                chunk_bm25.open_postings_spill(tmpdir + "/alpha_bm25_" + std::to_string((long)getpid()) + ".spill");
+                chunk_bm25.open_postings_spill(ingest_tmp_dir + "/alpha_bm25.spill");
             }
+        } else {
+            SRV_WRN("%s", "auto-ingest: could not create a private temp directory; building the indexes in RAM\n");
         }
         chunk_bm25.enable_df_streaming();   // don't build the resident df map; derive df from tf at finalize
 
@@ -3454,8 +3511,9 @@ private:
         // then free the tf arrays. Moves postings off-RAM and turns the query into posting-list
         // traversal. No-op unless the flag is set. Needs the tf arrays, which nothing above frees.
         if (bm25_index::bm25_inverted()) {
-            const char * td = getenv("TMPDIR"); std::string tmpdir = (td && *td) ? td : "/tmp";
-            std::string ppath = tmpdir + "/alpha_bm25_" + std::to_string((long)getpid()) + ".post.bin";
+            // inside the private ingest directory, so the derived ".dict*" names cannot be pre-created either
+            // (no directory: an empty path, and build_inverted stays on the forward path)
+            const std::string ppath = ingest_tmp_dir.empty() ? std::string() : ingest_tmp_dir + "/alpha_bm25.post.bin";
             auto iv0 = std::chrono::steady_clock::now();
             bool was_spill = chunk_bm25.spill_active;
             uint64_t spilled = chunk_bm25.spill_records;
@@ -3475,10 +3533,16 @@ private:
 
         if (unified.built) {
             // records.bin -> a private temp file (not the corpus dir: ingest lists corpus files, and
-            // build() unlinks it right after mmap so nothing is left on disk).
-            const char * td = getenv("TMPDIR"); std::string tmpdir = (td && *td) ? td : "/tmp";
-            unified.records_path = tmpdir + "/alpha_unified_" + std::to_string((long)getpid()) + ".records.bin";
+            // build() unlinks it right after mmap so nothing is left on disk). No private directory: "" (in-memory).
+            unified.records_path = ingest_tmp_dir.empty() ? std::string() : ingest_tmp_dir + "/alpha_unified.records.bin";
             unified.finalize();
+        }
+
+        // Every temp file above is mapped and unlinked, or read into memory, by now: drop the directory and
+        // anything left in it (a text store that received no writes, Windows copies that are never unlinked).
+        if (!ingest_tmp_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(ingest_tmp_dir, ec);
         }
 
         // The finalize_*() calls freed the build-time df/metadata/unified maps, but glibc keeps those
@@ -4911,13 +4975,26 @@ private:
                 {
                     auto & kd = task.kv_data;
 
+                    auto res = std::make_unique<server_task_result_json>();
+                    res->id = task.id;
+                    // llama_batch_get_one decodes into seq 0, which belongs to slot 0
+                    const int n_vocab_chk = llama_vocab_n_tokens(llama_model_get_vocab(model));
+                    if (kd.token_id < 0 || kd.token_id >= n_vocab_chk) {
+                        res->data = {{"error", "token_id out of range"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    if (!slots.empty() && slots[0].is_processing()) {
+                        res->data = {{"error", "seq 0 is in use by an active slot"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
                     llama_token tok = kd.token_id;
                     llama_batch batch = llama_batch_get_one(&tok, 1);
                     int rc = llama_decode(ctx, batch);
                     // batch_get_one: no free needed (stack-allocated, no malloc)
 
-                    auto res = std::make_unique<server_task_result_json>();
-                    res->id = task.id;
                     if (rc != 0) {
                         res->data = {{"error", "decode failed", "rc", rc}};
                     } else {
@@ -4931,7 +5008,7 @@ private:
                         int n_vocab = llama_vocab_n_tokens(vocab_ptr);
                         std::vector<std::pair<float, int>> scored(n_vocab);
                         for (int i = 0; i < n_vocab; i++) scored[i] = {logits[i], i};
-                        int tk = std::min(kd.top_k, n_vocab);
+                        int tk = std::max(1, std::min(kd.top_k, n_vocab));
                         std::partial_sort(scored.begin(), scored.begin() + tk, scored.end(),
                             [](const auto & a, const auto & b) { return a.first > b.first; });
                         json logits_arr = json::array();
@@ -4949,6 +5026,17 @@ private:
                     // chunk_id=-1 -> seq_id=0 (shared), chunk_id>=0 -> seq_id=n_parallel (reused)
                     int np = (int)params_base.n_parallel;
                     llama_seq_id sid = kd.chunk_id < 0 ? 0 : np;
+                    // the chunk seq exists only when the context reserved it (KV-chunk/corpus mode),
+                    // and seq 0 must not be written while slot 0 is generating
+                    if (sid >= (llama_seq_id) llama_n_seq_max(ctx) ||
+                        (sid == 0 && !slots.empty() && slots[0].is_processing())) {
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id = task.id;
+                        res->data = {{"error", sid == 0 ? "seq 0 is in use by an active slot"
+                                                        : "KV-chunk sequence not reserved (start with a corpus/extended context mode)"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
                     int n = (int)kd.tokens.size();
                     int n_batch = llama_n_batch(ctx);
                     if (n_batch <= 0) n_batch = 512;
@@ -4984,6 +5072,14 @@ private:
                     llama_memory_t mem = llama_get_memory(ctx);
                     int np = (int)params_base.n_parallel;
                     int chunk_size = 4096;  // tokens per chunk
+
+                    if (np >= (int) llama_n_seq_max(ctx)) {
+                        auto res = std::make_unique<server_task_result_json>();
+                        res->id = task.id;
+                        res->data = {{"error", "KV-chunk sequence not reserved (start with a corpus/extended context mode)"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
 
                     if (kd.active_chunk_ids.empty()) {
                         // Clear all chunk KV
@@ -5068,6 +5164,15 @@ private:
 
                     int64_t n_embd = k_t->ne[0];
                     int64_t kv_size = k_t->ne[1];
+                    // reject positions outside the cache, and a V layout the row reads below do not fit
+                    if (kd.pos_start < 0 || kd.pos_start >= kv_size || kd.pos_end > kv_size ||
+                        (kd.pos_end > 0 && kd.pos_end <= kd.pos_start) ||
+                        v_t->ne[0] != n_embd || v_t->ne[1] < kv_size) {
+                        res->data = {{"error", "pos_start/pos_end out of range [0, " + std::to_string(kv_size) +
+                                               ") or unsupported KV layout"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
                     int pos_end = kd.pos_end > 0 ? std::min(kd.pos_end, (int)kv_size) : (int)kv_size;
 
                     std::vector<float> centroid_k(n_embd, 0.0f);
@@ -5133,8 +5238,14 @@ private:
                     // Use per-sequence save - chunk seq_id = n_parallel
                     int np = (int)params_base.n_parallel;
                     llama_seq_id save_seq = kd.chunk_id >= 0 ? np : 0;
+                    if (save_seq >= (llama_seq_id) llama_n_seq_max(ctx)) {
+                        res->data = {{"error", "KV-chunk sequence not reserved (start with a corpus/extended context mode)"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
                     size_t bytes = llama_state_seq_save_file(ctx, kd.path.c_str(), save_seq, nullptr, 0);
-                    res->data = {{"saved", bytes > 0}, {"path", kd.path},
+                    // report the file name the client gave, not the server-side --slot-save-path directory
+                    res->data = {{"saved", bytes > 0}, {"path", std::filesystem::path(kd.path).filename().string()},
                                  {"bytes", bytes}, {"seq_id", save_seq}};
                     queue_results.send(std::move(res));
                 } break;
@@ -5146,6 +5257,13 @@ private:
                     // Use per-sequence load - chunk seq_id = n_parallel
                     int np = (int)params_base.n_parallel;
                     llama_seq_id load_seq = kd.chunk_id >= 0 ? np : 0;
+                    if (load_seq >= (llama_seq_id) llama_n_seq_max(ctx) ||
+                        (load_seq == 0 && !slots.empty() && slots[0].is_processing())) {
+                        res->data = {{"error", load_seq == 0 ? "seq 0 is in use by an active slot"
+                                                             : "KV-chunk sequence not reserved (start with a corpus/extended context mode)"}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
                     std::vector<llama_token> tokens_out(4096);
                     size_t n_token_count = 0;
                     auto t0 = std::chrono::high_resolution_clock::now();
@@ -5153,7 +5271,7 @@ private:
                         tokens_out.data(), tokens_out.size(), &n_token_count);
                     auto t1 = std::chrono::high_resolution_clock::now();
                     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    res->data = {{"loaded", bytes > 0}, {"path", kd.path},
+                    res->data = {{"loaded", bytes > 0}, {"path", std::filesystem::path(kd.path).filename().string()},
                                  {"load_time_ms", ms}, {"bytes", bytes},
                                  {"n_tokens", n_token_count}, {"seq_id", load_seq}};
                     queue_results.send(std::move(res));
@@ -7133,6 +7251,7 @@ corpus_tool_context server_context::get_corpus_tool_context() const {
     ctx.entities   = &impl->chunk_entities;
     ctx.linker     = &impl->chunk_linker;
     ctx.extractor  = &impl->entity_extractor;
+    ctx.corpus_mtx = &impl->corpus_mtx;
     ctx.model_name = impl->model_name;
     return ctx;
 }
@@ -9454,7 +9573,10 @@ void server_routes::corpus_augment_messages(json & body) {
 #endif
 
     // 3b. Try metadata sub-index (precise, fast)
-    auto meta_result = ctx_server.chunk_metadata.query(query);
+    auto meta_result = [&] {
+        std::lock_guard<std::mutex> lk(ctx_server.corpus_mtx);
+        return ctx_server.chunk_metadata.query(query);
+    }();
     if (meta_result.used_metadata && !meta_result.records.empty()) {
         for (auto & rec : meta_result.records) {
             std::string text = ctx_server.chunk_bm25.get_text(rec.chunk_id);
@@ -9489,6 +9611,7 @@ void server_routes::corpus_augment_messages(json & body) {
         }
 #endif
         std::vector<int> ranked;
+        std::unique_lock<std::mutex> corpus_lk(ctx_server.corpus_mtx);
         if (use_ner && ctx_server.chunk_entities.n_unique > 0) {
             auto mh = multihop_query(query, bm25_ranked,
                                      ctx_server.chunk_entities,
@@ -9530,6 +9653,7 @@ void server_routes::corpus_augment_messages(json & body) {
                 }
             }
         }
+        corpus_lk.unlock();
 
         // 6. Fill code context (primary budget)
         // With sub-chunk BM25, deduplicate by parent file to avoid
@@ -9772,9 +9896,19 @@ void server_routes::init_kv_chunk_routes() {
         json body = json::parse(req.body);
         auto res = create_response();
         auto & rd = res->rd;
+        // files are confined to --slot-save-path, like the /slots save/restore actions
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("KV cache save is disabled: set --slot-save-path to enable", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const std::string filename = json_value(body, "path", std::string());
+        if (!fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename (a plain file name inside --slot-save-path)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         server_task task(SERVER_TASK_TYPE_KV_SAVE);
         task.id = rd.get_new_id();
-        task.kv_data.path = json_value(body, "path", std::string());
+        task.kv_data.path = params.slot_save_path + filename;
         task.kv_data.chunk_id = json_value(body, "chunk_id", -1);
         rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
@@ -9788,9 +9922,18 @@ void server_routes::init_kv_chunk_routes() {
         json body = json::parse(req.body);
         auto res = create_response();
         auto & rd = res->rd;
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("KV cache load is disabled: set --slot-save-path to enable", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const std::string filename = json_value(body, "path", std::string());
+        if (!fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename (a plain file name inside --slot-save-path)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         server_task task(SERVER_TASK_TYPE_KV_LOAD);
         task.id = rd.get_new_id();
-        task.kv_data.path = json_value(body, "path", std::string());
+        task.kv_data.path = params.slot_save_path + filename;
         task.kv_data.chunk_id = json_value(body, "chunk_id", -1);
         rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
@@ -9801,6 +9944,14 @@ void server_routes::init_kv_chunk_routes() {
 
     // /api/kv_chunk/index - add chunk text to BM25 index with metadata
     this->post_kv_index = [this](const server_http_req & req) {
+        // one chunk per request; cap its size so a single post cannot balloon the in-memory indexes
+        static constexpr size_t max_index_body = 16u << 20;
+        if (req.body.size() > max_index_body) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 413;
+            res->data = safe_json_to_str(json{{"error", "request too large (max 16 MiB per chunk)"}});
+            return res;
+        }
         json body = json::parse(req.body);
         auto res = std::make_unique<server_http_res>();
         int chunk_id = json_value(body, "chunk_id", -1);
@@ -9829,6 +9980,7 @@ void server_routes::init_kv_chunk_routes() {
 
             // Layer 2: NER entity extraction (code corpus only)
             if (params.ctx_mode == ALPHA_CTX_EXTENDED_CODE) {
+                std::lock_guard<std::mutex> lk(ctx_server.corpus_mtx);
                 auto entities = ctx_server.entity_extractor.extract(text);
                 ctx_server.chunk_entities.add(chunk_id, entities);
 
@@ -9865,13 +10017,19 @@ void server_routes::init_kv_chunk_routes() {
 #endif
 
             // Metadata sub-index
+            std::lock_guard<std::mutex> lk(ctx_server.corpus_mtx);
             ctx_server.chunk_metadata.index_chunk(chunk_id, text);
+        }
+        int n_entities = 0;
+        {
+            std::lock_guard<std::mutex> lk(ctx_server.corpus_mtx);
+            n_entities = (int) ctx_server.chunk_entities.n_unique;
         }
         json result = {
             {"indexed", true}, {"chunk_id", chunk_id},
             {"n_chunks", ctx_server.chunk_bm25.N},
             {"n_words", (int)bm25_index::tokenize(text).size()},
-            {"n_entities", ctx_server.chunk_entities.n_unique},
+            {"n_entities", n_entities},
         };
         res->status = 200;
         res->data = safe_json_to_str(result);
@@ -9895,13 +10053,25 @@ void server_routes::init_kv_chunk_routes() {
         ctx_server.chunk_bm25.finalize_df();
 
         float build_ms = 0.0f;
-        if (want_inverted) {
+        if (want_inverted && !ctx_server.chunk_bm25.inverted_active) {
             const char * td = getenv("TMPDIR");
             std::string tmpdir = (td && *td) ? td : "/tmp";
-            std::string ppath = tmpdir + "/alpha_bm25_" + std::to_string((long) getpid()) + ".post.bin";
+            // a private, unique directory: build_inverted also derives ".dict*" temp names from the postings path
+            const std::string pdir = alpha_unique_tmp_dir(tmpdir, "alpha_bm25_post_");
+            if (pdir.empty()) {
+                res->status = 500;
+                res->data = safe_json_to_str(json{{"error", "could not create a temp directory for the postings"}});
+                return res;
+            }
+            const std::string ppath = pdir + "/alpha_bm25.post.bin";
             auto iv0 = std::chrono::steady_clock::now();
             const bool was_spill = ctx_server.chunk_bm25.spill_active;
             ctx_server.chunk_bm25.build_inverted(ppath);
+            {
+                // the postings and dict are mapped and unlinked, or read into memory, by now (or nothing was built)
+                std::error_code ec;
+                std::filesystem::remove_all(pdir, ec);
+            }
             build_ms = (float) std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - iv0).count();
             SRV_INF("BM25 INVERTED (%s, http-finalize): %s - %zu postings bytes, built in %.1fs\n",
@@ -9909,7 +10079,10 @@ void server_routes::init_kv_chunk_routes() {
                     ctx_server.chunk_bm25.inverted_active ? "active" : "FAILED (stayed on forward path)",
                     ctx_server.chunk_bm25.post_mm_len, build_ms / 1000.0f);
         }
-        ctx_server.chunk_metadata.finalize();
+        {
+            std::lock_guard<std::mutex> lk(ctx_server.corpus_mtx);
+            ctx_server.chunk_metadata.finalize();
+        }
 
         json result = {
             {"finalized",          true},
@@ -10196,7 +10369,9 @@ void server_routes::init_kv_chunk_routes() {
         // Multi-hop entity expansion (Layer 2)
         std::vector<int> ranked;
         int hop1 = 0, hop2 = 0, hop3 = 0;
-        if (use_multihop && ctx_server.chunk_entities.n_unique > 0) {
+        std::unique_lock<std::mutex> corpus_lk(ctx_server.corpus_mtx);
+        const auto n_entities_indexed = ctx_server.chunk_entities.n_unique;
+        if (use_multihop && n_entities_indexed > 0) {
             auto mh = multihop_query(query, bm25_ranked,
                                      ctx_server.chunk_entities,
                                      ctx_server.chunk_linker,
@@ -10210,17 +10385,18 @@ void server_routes::init_kv_chunk_routes() {
             ranked = bm25_ranked;
             hop1 = (int)ranked.size();
         }
+        corpus_lk.unlock();
 
         std::string routing_name = ctx_server.routing_strategy == kv_chunk_routing::BM25_EXPAND
                                    ? "bm25+expand" : "bm25_only";
-        if (use_multihop && ctx_server.chunk_entities.n_unique > 0) {
+        if (use_multihop && n_entities_indexed > 0) {
             routing_name += "+entity";
         }
 
         json result = json::object();
         result["chunk_ids"] = ranked;
         result["n_chunks_indexed"] = ctx_server.chunk_bm25.N;
-        result["n_entities_indexed"] = ctx_server.chunk_entities.n_unique;
+        result["n_entities_indexed"] = n_entities_indexed;
         result["routing"] = routing_name;
         result["ctx_extended"] = ctx_server.n_ctx_extended;
         result["hops"] = {{"bm25", hop1}, {"entity", hop2}, {"links", hop3}};
@@ -10298,6 +10474,8 @@ void server_routes::init_kv_chunk_routes() {
     // Used by serve-based profiling to build domain profiles without reloading the model.
     // Call this after a /v1/chat/completions request to get routing data for that prompt.
     // Enable argsort persist so routing data survives after decode.
+    // Internal builds only: it flips a process-wide flag and reads graph tensors off the main thread.
+#ifdef ALPHA_INTERNAL
     this->post_expert_routing = [this](const server_http_req & req) {
         // Ensure argsort data persists for future requests
         alpha_mole_set_argsort_persist(true);
@@ -10365,6 +10543,7 @@ void server_routes::init_kv_chunk_routes() {
         res->data = safe_json_to_str(result);
         return res;
     };
+#endif // ALPHA_INTERNAL
 
 #ifdef ALPHA_DELTANET
     // DeltaNet checkpoint load: dynamically load a checkpoint into recurrent state
@@ -10658,6 +10837,9 @@ void server_routes::init_kv_chunk_routes() {
 
     // POST /api/kv_pool/save - explicitly save current slot state to pool
     // Body: {"slot_id": 0, "session_id": "abc123"}
+    // kv_pool save/load are internal builds only: they read/write slot state on the HTTP thread
+    // while the main loop may be decoding into the same sequences.
+#ifdef ALPHA_INTERNAL
     this->post_kv_pool_save = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json body;
@@ -10777,6 +10959,7 @@ void server_routes::init_kv_chunk_routes() {
         });
         return res;
     };
+#endif // ALPHA_INTERNAL
 
     // Batch Inference API
 

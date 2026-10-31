@@ -3176,7 +3176,7 @@ void alpha_moe_optimizer_load_style_profiles(alpha_moe_optimizer * opt, const ch
         uint8_t fp[APACK_FP_SIZE];
         apack_compute_fingerprint(arch_buf, opt->n_expert, opt->n_expert_used,
                                   opt->n_layer, opt->n_embd, fp);
-        // Try sync from CDN (single attempt, silent failure)
+        // a cached pack, or (ALPHA_PACK_SYNC=1 only) one fetched from the pack server
         apack_sync(fp);
         char pack_path[512];
         if (apack_find_cached(fp, pack_path, sizeof(pack_path))) {

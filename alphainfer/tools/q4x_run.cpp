@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "engine/draft_vocab.h"
 #include "models/qwen4exp_run.h"
+#include "ops/ops.h"
 
 #include <algorithm>
 #include <chrono>
@@ -276,16 +277,25 @@ int main(int argc, char ** argv) {
                 const int64_t T = (int64_t) toks.size();
                 const auto tv0 = std::chrono::steady_clock::now();
                 lg = run.verify(toks.data(), T);
-                all.resize((size_t) (V * T));
-                dev.download(lg, all.data(), 0, all.size() * 4);
+                // the greedy ids reduced on the device (op::argmax, bit-exact with ties), as the server does: the full
+                // logits download (3 MB at T = 3) + host scan cost 0.75 ms/round of GPU idle that serving does not have
+                // (3090 pl6 2026-10-30, nsys graph trace). AI_Q4X_HOST_ARGMAX=1: the old host path.
+                static const bool host_argmax = getenv("AI_Q4X_HOST_ARGMAX") && atoi(getenv("AI_Q4X_HOST_ARGMAX")) != 0;
+                std::vector<int32_t> gq((size_t) T);
+                if (host_argmax || !lg.contiguous()) {
+                    all.resize((size_t) (V * T));
+                    dev.download(lg, all.data(), 0, all.size() * 4);
+                    for (int64_t t = 0; t < T; ++t) {
+                        const float * r = all.data() + (size_t) t * (size_t) V;
+                        gq[(size_t) t] = (int32_t) (std::max_element(r, r + V) - r);
+                    }
+                } else {
+                    const ai::Tensor idx = ai::op::argmax(dev, lg);
+                    dev.download(idx, gq.data(), 0, (size_t) T * 4);
+                }
                 const double vms = 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0).count();
                 verify_s += vms / 1e3;
                 if (spec_auto && T <= 16) vcost[T] = 0.8 * vcost[T] + 0.2 * vms;
-                std::vector<int32_t> gq((size_t) T);
-                for (int64_t t = 0; t < T; ++t) {
-                    const float * r = all.data() + (size_t) t * (size_t) V;
-                    gq[(size_t) t] = (int32_t) (std::max_element(r, r + V) - r);
-                }
                 int64_t a = 0;
                 while (a < T - 1 && toks[(size_t) (a + 1)] == gq[(size_t) a]) ++a;
                 run.commit(a + 1);

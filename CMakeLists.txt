@@ -65,7 +65,8 @@ endif()
 
 option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
 
-# Debug build: includes internal logging strings in binary. OFF for release.
+# Debug logging (--debug, ALPHA_LOG_DBG) compiled in. Defaults to BUILD_SHARED_LIBS, so the shared-library release
+# packages keep it; with it OFF the build also strips symbols and source paths (the hardening block below).
 option(ALPHA_DEBUG_BUILD "Include debug logging strings in binary" ${BUILD_SHARED_LIBS})
 if (ALPHA_DEBUG_BUILD)
     add_compile_definitions(ALPHA_DEBUG_BUILD)

@@ -327,6 +327,9 @@ private:
     // AI_PREFILL_CHUNK: resumable bodies of the two above: run chunks from `off` (advanced); !final skips the tail
     int32_t prefill_range(int stream, const std::vector<int32_t> & prompt, int64_t & off, bool final);
     void    prefill_mtp_range(int stream, const std::vector<int32_t> & prompt, int64_t & off, bool final, Stream & st);
+    // Prefill slot lending (AI_DOOR_LEND_MIB, doorbell offload): a one-shot prefill runs the rows before its last
+    // chunk in larger chunks whose workspace is borrowed from expert slot banks. Returns the rows done (0 = not lent).
+    int64_t lend_prefill(int stream, const std::vector<int32_t> & prompt, bool mtp);
 
     StepOut build_plain(const Qwen35Hybrid::Inputs & in);
     StepOut build_mtp(const Qwen35Hybrid::Inputs & vin, const Qwen35Hybrid::Inputs & hin, int k_out);
@@ -380,6 +383,11 @@ private:
     std::vector<int>     acc_now_;   // scratch: per-round accept counts
 
     Ingress  main_in_, head_in_;
+    // prefill slot lending: the lent chunks' ingress (no host masks: lend_prefill writes them on device into the
+    // borrowed workspace), the largest lent chunk (0 = off), and whether init is done (no lending while calibrating)
+    Ingress  lend_in_, lend_head_in_;
+    int64_t  lend_rows_ = 0;
+    bool     lend_ok_   = false;
     // per-slot kern::SampleParams on the device (read by the captured rounds) and its pinned host copy
     int       samp_buf_  = -1;
     Tensor    samp_dev_;

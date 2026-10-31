@@ -261,6 +261,14 @@ MoeRoute moe_route(Device & d, const Tensor & x, const Tensor & router, const Mo
 // Routed experts over banks whose third axis is pool slots; `slots` is `sel` remapped to slots.
 Tensor   moe_experts(Device & d, const Tensor & x, const Tensor & up, const Tensor & gate, const Tensor & down,
                      const Tensor & slots, const Tensor & weights, int k);
+// The two halves of moe_experts: the unweighted expert outputs f32 [E, k, T], then their weighted sum f32 [E, T]
+// (+ add when given) written to `into` when given (add may alias into: an accumulator). Bitwise equal to the ggml
+// MUL + k-1 ADDs (+ ADD) without materialising the weighted [E, k, T] copy or the k-1 partial sums.
+Tensor   moe_experts_raw(Device & d, const Tensor & x, const Tensor & up, const Tensor & gate, const Tensor & down,
+                         const Tensor & slots);
+Tensor   moe_wsum(Device & d, const Tensor & exps, const Tensor & weights, int k, const Tensor * add = nullptr,
+                  const Tensor * into = nullptr);
+bool     moe_wsum_native();   // AI_MOE_WSUM (default 1); 0 = the ggml MUL + ADD chain
 Tensor   moe_shared(Device & d, const Tensor & x, const MoeWeights & w);
 Tensor   mul(Device & d, const Tensor & a, const Tensor & b);
 

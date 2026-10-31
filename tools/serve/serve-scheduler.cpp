@@ -158,6 +158,16 @@ llama_token scheduler::think_step(serve_slot & s, llama_token tok, bool pending)
     return tok;
 }
 
+// A prompt token. The row that takes logits (the prompt's last) picks the first generated token, so it carries the
+// request's sampling settings as a generating row does; without them every sampled request began with the greedy token.
+static void add_prompt_token(BatchRequest & batch, const serve_slot & slot, llama_token tok, int pos, bool need_logits) {
+    const bool samp = need_logits && slot.needs_sampling();
+    const uint64_t rng = samp ? (slot.rng_base ^ (0x9E3779B97F4A7C15ull * (uint64_t)(slot.n_generated + 1))) : 0;
+    batch.add_token(tok, pos, slot.id, slot.id, need_logits,
+                    samp ? slot.temperature : 0.0f, samp ? slot.top_k : 1, samp ? slot.top_p : 1.0f, rng,
+                    samp ? slot.rng_base : 0ull, (int32_t) slot.n_generated, 0x7fffffff, samp ? slot.min_p : 0.0f);
+}
+
 // ALPHA_TOKEN_TRACE=<file>: the committed token stream, for offline drafter studies (lookup simulators read the same
 // line shapes, without MTP's drafts):  "Q <req> <n> t1..tn" prompt ids | "F <req> <pos> <tok>" first token |
 // "R <req> <pos0> <m> g1..gm" the tokens one engine step committed (an MTP window's accepted run + bonus)
@@ -387,6 +397,7 @@ void scheduler::admit_new_requests() {
                        it->temperature, it->top_k, it->top_p, it->seed,
                        it->stop_words, it->stream);
         target->http_connection = it->http_connection;
+        target->min_p = it->min_p;
         target->last_assign_seq = ++assign_counter_;
         token_trace("Q", it->request_id, 0, it->prompt_tokens.data(), (int) it->prompt_tokens.size());
         if (it->reasoning_budget >= 0 && think_close_ != LLAMA_TOKEN_NULL && !it->think_close.empty()) {
@@ -608,7 +619,8 @@ void scheduler::build_and_send_batch() {
                        rng,
                        samp ? slot.rng_base : 0ull,
                        (int32_t) slot.n_generated,
-                       (int32_t) n_left);
+                       (int32_t) n_left,
+                       samp ? slot.min_p : 0.0f);
         batch.n_slots++;
     }
 
@@ -623,7 +635,7 @@ void scheduler::build_and_send_batch() {
             if (batch.n_tokens > 0) continue;   // next batch
             const int n = (int) slot.prompt_tokens.size();
             for (int i = 0; i < n; i++) {
-                batch.add_token(slot.prompt_tokens[i], i, slot.id, slot.id, i == n - 1);
+                add_prompt_token(batch, slot, slot.prompt_tokens[i], i, i == n - 1);
             }
             slot.prompt_offset = n;
             batch.prompt_end = n;
@@ -678,11 +690,7 @@ void scheduler::build_and_send_batch() {
 
         for (int i = 0; i < (int)chunk.size(); i++) {
             bool need_logits = is_last_chunk && (i == (int)chunk.size() - 1);
-            batch.add_token(chunk[i],
-                           slot.prompt_offset - (int)chunk.size() + i,  // position
-                           slot.id,             // seq_id
-                           slot.id,             // slot_id
-                           need_logits);
+            add_prompt_token(batch, slot, chunk[i], slot.prompt_offset - (int)chunk.size() + i, need_logits);
         }
         batch.n_slots++;
     }

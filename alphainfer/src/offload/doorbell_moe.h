@@ -42,6 +42,8 @@ struct DoorbellConfig {
     std::vector<int> cpus;             // explicit pool cpus (empty = plan_cpus)
     int              admit     = 32;   // admissions per round (0 = static residency)
     int              pf_slots  = 0;    // prefill staging slots per type group (0 = min(n_expert, 64))
+    size_t           lend_bytes = 0;   // prefill slot lending: at least this many bytes of the last banks' slots
+    int              lend_banks_end = -1;   // banks [0, end) may be lent (-1 = all)
 };
 
 class DoorbellMoe {
@@ -66,6 +68,15 @@ public:
     // request's output depends on which experts earlier requests left resident; after a reset it depends on the
     // request alone. Only the slots that changed since the fill are copied again.
     void reset_residency();
+    // Prefill slot lending: the last banks' slot memory (resident experts + fillers) sits in its own buffer, which a
+    // one-shot prefill borrows as its workspace, so it can run chunks several times larger than the workspace sized
+    // for decode allows. lend_begin (no round in flight): publishes in-flight admissions and makes moe_bulk treat the
+    // lent banks as having nothing resident; returns the buffer and its size (false = nothing to lend). The lent banks
+    // must not see a doorbell (moe) call until lend_end. lend_end(used): copies the experts back into every lent bank
+    // the first `used` bytes reached (the highest bank sits first), on the compute stream, then synchronises.
+    size_t lend_bytes() const { return lend_bytes_; }
+    bool   lend_begin(int * buf, size_t * bytes);
+    void   lend_end(size_t used);
     std::string stats_line() const;
     void        reset_stats();
 
@@ -83,6 +94,8 @@ private:
         std::vector<int32_t> owner0;         // owner after the initial fill (reset_residency)
         std::vector<float>   score;          // expert -> decayed use count
         unsigned             last_seq = 0;   // the bell's seq at the previous after_round
+        bool                 lent = false;   // slots carved in the lend buffer (prefill slot lending)
+        size_t               lend_off = 0, lend_len = 0;
     };
     struct Stage { Tensor gate, up, down; int slots = 0; };
     struct Pending { int bank, slot, expert; int64_t job; };
@@ -121,6 +134,12 @@ private:
     uint64_t n_cols_ = 0, n_miss_ = 0, n_admit_ = 0, n_publish_ = 0, n_bulk_cols_ = 0, n_bulk_miss_ = 0;
     uint64_t n_bulk_bytes_ = 0;
     uint64_t n_resets_ = 0, n_restored_ = 0;
+    // prefill slot lending
+    int      lend_buf_ = -1;
+    size_t   lend_bytes_ = 0;
+    bool     lending_ = false;
+    uint64_t n_lends_ = 0, n_lend_bytes_ = 0;
+    double   lend_ms_ = 0;
 };
 
 }  // namespace ai::offload

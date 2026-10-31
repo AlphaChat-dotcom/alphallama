@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <stdexcept>
 #include <thread>
@@ -35,6 +36,7 @@ WeightSet::~WeightSet() {
         munmap(m.first, m.second);
     }
     for (int fd : fds_) ::close(fd);
+    for (int fd : dfds_) if (fd >= 0) ::close(fd);
     if (gguf_) {
         gguf_free(gguf_);
     }
@@ -631,6 +633,61 @@ bool WeightSet::host_pread(const void * p, void * dst, size_t n) const {
         return true;
     }
     return false;
+}
+
+bool WeightSet::host_pread_direct(const void * p, void * dst, size_t n) const {
+    const uintptr_t a = (uintptr_t) p;
+    for (size_t i = 0; i < maps_.size() && i < paths_.size(); ++i) {
+        const uintptr_t mb = (uintptr_t) maps_[i].first;
+        if (a < mb || a + n > mb + maps_[i].second) continue;
+        int fd;
+        {
+            std::lock_guard<std::mutex> lk(dfd_mu_);
+            if (dfds_.empty()) dfds_.assign(paths_.size(), -2);
+            if (dfds_[i] == -2) dfds_[i] = ::open(paths_[i].c_str(), O_RDONLY | O_DIRECT);
+            fd = dfds_[i];
+        }
+        if (fd < 0) return false;
+        const uint64_t off = a - mb, b0 = off & ~(uint64_t) 4095, b1 = (off + n + 4095) & ~(uint64_t) 4095;
+        const size_t   len = (size_t) (b1 - b0);
+        thread_local void * blk = nullptr;
+        thread_local size_t cap = 0;
+        if (cap < len) {
+            free(blk);
+            blk = nullptr;
+            cap = 0;
+            if (posix_memalign(&blk, 4096, len) != 0) return false;
+            cap = len;
+        }
+        size_t done = 0;
+        while (done < len) {
+            const ssize_t r = pread(fd, (char *) blk + done, len - done, (off_t) (b0 + done));
+            if (r <= 0) break;   // EOF (the last block of the file) or an error
+            done += (size_t) r;
+        }
+        if (done < (size_t) (off - b0) + n) return false;
+        memcpy(dst, (const char *) blk + (off - b0), n);
+        return true;
+    }
+    return false;
+}
+
+int WeightSet::host_pread_nowait(const void * p, void * dst, size_t n) const {
+#if defined(RWF_NOWAIT)
+    const uintptr_t a = (uintptr_t) p;
+    for (size_t i = 0; i < maps_.size() && i < fds_.size(); ++i) {
+        const uintptr_t mb = (uintptr_t) maps_[i].first;
+        if (a < mb || a + n > mb + maps_[i].second) continue;
+        struct iovec iov = { dst, n };
+        const ssize_t r = preadv2(fds_[i], &iov, 1, (off_t) (a - mb), RWF_NOWAIT);
+        if (r == (ssize_t) n) return 1;
+        if (r >= 0 || errno == EAGAIN) return 0;   // short: part of the range is not cached
+        return -1;
+    }
+#else
+    (void) p; (void) dst; (void) n;
+#endif
+    return -1;
 }
 
 bool WeightSet::host_prefetch(const void * p, size_t n) const {

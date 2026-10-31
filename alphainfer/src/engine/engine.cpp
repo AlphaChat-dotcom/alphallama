@@ -822,6 +822,23 @@ bool Engine::init(const EngineConfig & cfg) {
         h_conf_   = (float *) dev_.alloc_pinned((size_t) (B * K) * 4);
         acc_.fill(0.7);
     }
+    // prefill slot lending (AI_DOOR_LEND_MIB): ingress for chunks of up to AI_DOOR_LEND_CHUNK rows (default 8192, a
+    // multiple of the chunk); their masks are written on device into the borrowed workspace, so no mask buffer here.
+    // A chunk must stay above the doorbell's t_max so that it runs the bulk path.
+    if (prog_.offload_lend_bytes() > 0 && !host_embd && !df2_ && cfg_.chunk > prog_.offload_t_max()) {
+        const int64_t want = getenv("AI_DOOR_LEND_CHUNK") ? atoll(getenv("AI_DOOR_LEND_CHUNK")) : 8192;
+        lend_rows_ = std::max<int64_t>(cfg_.chunk, want / cfg_.chunk * cfg_.chunk);
+        if (lend_rows_ > cfg_.chunk) {
+            lend_in_.mask_on_device = true;
+            lend_in_.alloc(dev_, lend_rows_, 0, 1, "ingress.lend");
+            if (K > 0) {
+                lend_head_in_.mask_on_device = true;
+                lend_head_in_.alloc(dev_, lend_rows_, 0, 1, "ingress.lend.head");
+            }
+        } else {
+            lend_rows_ = 0;
+        }
+    }
     if (df2_) {
         df2_->alloc(dev_, cfg_.max_ctx);
     }
@@ -879,6 +896,19 @@ bool Engine::init(const EngineConfig & cfg) {
         ws_auto_calibrate();
         ws_calibrated_now_ = true;
     }
+    // Only on a start whose workspace is a measurement (the cached calibration, or a fixed --ws-mib): the lent chunk
+    // size is derived from it, and the chunk boundaries -- so the output -- must not depend on whether this start
+    // calibrated (a calibrating start sizes from the derived estimate and would pick other boundaries). The
+    // calibration's own prefills must measure the normal chunk's peak, so they never lend either.
+    lend_ok_ = lend_rows_ > 0 && !ws_cal_pending_;
+    if (lend_rows_ > 0 && cfg.verbose) {
+        if (lend_ok_) {
+            fprintf(stderr, "[ai] prefill slot lending: one-shot prefills run chunks of up to %lld rows in %.2f GiB of "
+                            "borrowed expert slots\n", (long long) lend_rows_, prog_.offload_lend_bytes() / 1073741824.0);
+        } else {
+            fprintf(stderr, "[ai] prefill slot lending: off on this start (workspace calibrating); on from the next\n");
+        }
+    }
     return true;
 }
 
@@ -905,7 +935,9 @@ bool Engine::set_sampling(int stream, float temperature, int top_k, float top_p,
         return false;
     }
     kern::SampleParams p{};
-    p.temperature = temperature > 0.0f ? temperature : 0.0f;
+    // below 1e-6 1/T overflows the scaled logits (and the draw is the argmax anyway): greedy; above 1e4 the draw is
+    // uniform over the surviving tokens already, and an infinite T would make 1/T = 0, the kernel's greedy marker
+    p.temperature = temperature >= 1e-6f ? std::min(temperature, 1e4f) : 0.0f;
     p.top_k       = top_k > 0 ? top_k : 0;
     p.top_p       = top_p > 0.0f && top_p < 1.0f ? top_p : 1.0f;
     p.min_p       = min_p > 0.0f && min_p <= 1.0f ? min_p : 0.0f;
@@ -1024,6 +1056,11 @@ int32_t Engine::prefill_feed(int stream, const int32_t * tokens, int64_t n, bool
     if (last && s.pf.empty()) {
         reset_stream(stream);
         throw std::runtime_error("prefill_feed: empty prompt");
+    }
+    // prefill slot lending: with one stream no other decode runs between the pieces, so a partial prompt is only
+    // buffered and the final call prefills it in one shot (lend_prefill places its boundaries from the whole length)
+    if (!last && lend_ok_ && streams_.size() == 1 && s.pf_off == 0) {
+        return -1;
     }
     dev_.ws_tag("prefill");
     if (cfg_.mtp_k > 0) {
@@ -1431,6 +1468,83 @@ int32_t Engine::prefill(int stream, const std::vector<int32_t> & prompt) {
     return prefill_range(stream, prompt, off, true);
 }
 
+// Prefill slot lending (AI_DOOR_LEND_MIB). The rows before a one-shot prefill's last chunk run in chunks of up to
+// lend_rows_ whose workspace is borrowed from the last layers' expert slot banks (DoorbellMoe::lend_begin; those
+// layers' experts are all staged meanwhile), and the experts are copied back before the last chunk, which runs as
+// usual: it takes the logits and, with MTP, the draft chain, which reads the head's bank (never lent). Boundaries
+// depend on the prompt length only, so a plain and an MTP prefill of one prompt split it identically. The chunk size
+// is the largest the borrowed bytes hold: the workspace per row measured at the normal chunk (the calibrated
+// workspace less its margin), with 20% to spare, plus the f16 [n_kv, T] masks written on device. Returns the rows
+// prefilled; 0 = nothing lent (the caller runs every chunk).
+int64_t Engine::lend_prefill(int stream, const std::vector<int32_t> & prompt, bool mtp) {
+    const int64_t n = (int64_t) prompt.size();
+    if (!lend_ok_ || !chunk_eager() || (mm_.embd && mm_.n_rows > 0) || dev_.ws_redirected()) {
+        return 0;
+    }
+    const int64_t L = n - ((n - 1) % cfg_.chunk + 1);   // the last chunk (1..chunk rows) runs normally
+    static const int64_t min_rows = getenv("AI_DOOR_LEND_MIN") ? atoll(getenv("AI_DOOR_LEND_MIN")) : 0;
+    if (L < std::max<int64_t>(2 * cfg_.chunk, min_rows)) {
+        return 0;
+    }
+    const double  cap     = (double) prog_.offload_lend_bytes();
+    const double  per_row = std::max(0.0, ((double) dev_.ws_capacity() - (double) (32 << 20)) / 1.25) / (double) cfg_.chunk;
+    const double  nkv_max = (double) prog_.visible_cells(0, L);
+    auto need = [&](int64_t T) {
+        return 1.2 * per_row * (double) T + (mtp ? 2.0 : 1.0) * 2.0 * nkv_max * (double) T + (double) (64 << 20);
+    };
+    int64_t C = std::min(lend_rows_, L);
+    while (C > cfg_.chunk && need(C) > cap) {
+        C -= cfg_.chunk;
+    }
+    if (C <= cfg_.chunk) {
+        return 0;
+    }
+    int    buf   = -1;
+    size_t bytes = 0;
+    if (!prog_.offload_lend_begin(&buf, &bytes)) {
+        return 0;
+    }
+    dev_.ws_redirect(buf, 0, bytes);
+    size_t used = bytes;
+    try {
+        for (int64_t off = 0; off < L; off += C) {
+            const int64_t T = std::min(C, L - off);
+            dev_.ws_reset(0);
+            const int64_t nkv = prog_.visible_cells(off, T);
+            stage_rows(lend_in_, stream, 0, T, prompt.data() + off, T, off, nkv, false);
+            lend_in_.upload(dev_, T, 1, nkv);
+            Qwen35Hybrid::Inputs in = lend_in_.view(T, 1, nkv, stream);
+            in.chunk = true;
+            in.mask  = dev_.ws_alloc(F16, nkv, T, 1, 1);
+            op::decode_causal_mask(dev_, in.mask, lend_in_.base_view(1), T, 1, nkv, false);
+            static char tag[96];
+            snprintf(tag, sizeof(tag), "lent prefill T=%lld off=%lld", (long long) T, (long long) off);
+            dev_.ws_tag(tag);
+            Tensor hidden = prog_.forward(dev_, in, mtp);
+            if (mtp) {
+                // head columns at positions off+1..off+T from (h[off+i], x[off+i+1]), as prefill_mtp_range's
+                const int64_t hkv = prog_.visible_cells(off + 1, T);
+                stage_rows(lend_head_in_, stream, 0, T, prompt.data() + off + 1, T, off + 1, hkv, true);
+                lend_head_in_.upload(dev_, T, 1, hkv);
+                auto hin = lend_head_in_.view(T, 1, hkv, stream);
+                hin.mask = dev_.ws_alloc(F16, hkv, T, 1, 1);
+                op::decode_causal_mask(dev_, hin.mask, lend_head_in_.base_view(1), T, 1, hkv, true);
+                prog_.mtp(dev_, hin.ids, hidden, hin, Qwen35Hybrid::HeadRows::None);
+            }
+        }
+        used = dev_.ws_lent_high();
+    } catch (...) {
+        dev_.ws_restore();
+        prog_.offload_lend_end(bytes);
+        kern::q8_stage_clear();
+        throw;
+    }
+    dev_.ws_restore();
+    prog_.offload_lend_end(used);
+    kern::q8_stage_clear();   // its entries keyed on borrowed addresses would now alias expert weights
+    return L;
+}
+
 // The body of the whole-prompt prefill, resumable (AI_PREFILL_CHUNK): it runs the chunks from `off` (advanced in
 // place) at the same boundaries as a one-shot prefill (multiples of cfg_.chunk from 0). When !final it runs only
 // chunks that end before the buffer does, so the last chunk -- the one that takes the logits -- is always run by the
@@ -1438,6 +1552,9 @@ int32_t Engine::prefill(int stream, const std::vector<int32_t> & prompt) {
 int32_t Engine::prefill_range(int stream, const std::vector<int32_t> & prompt, int64_t & off, bool final) {
     const int64_t n = (int64_t) prompt.size();
     int32_t tok = -1;
+    if (off == 0 && final) {
+        off = lend_prefill(stream, prompt, false);   // a one-shot prefill: all but the last chunk on borrowed slots
+    }
     for (; off < n; off += cfg_.chunk) {
         const int64_t T    = std::min(cfg_.chunk, n - off);
         if (!final && off + T >= n) {
@@ -1492,10 +1609,26 @@ void Engine::score(const std::vector<int32_t> & tokens,
     std::vector<float> host((size_t) (slice * V));
 
     const auto t0 = clock_t_::now();
-    for (int64_t off = 0; off < n; off += cfg_.chunk) {
+    // AI_SCORE_TAIL=1 (quality checks): logits for the last chunk only; the rows before it are prefilled as a one-shot
+    // prefill does them (on borrowed slots when prefill slot lending is on), so the tail's NLL measures that prefill
+    static const bool tail = getenv("AI_SCORE_TAIL") && atoi(getenv("AI_SCORE_TAIL")) != 0;
+    const int64_t     L    = tail ? n - ((n - 1) % cfg_.chunk + 1) : 0;
+    for (int64_t off = tail ? lend_prefill(0, tokens, false) : 0; off < n; off += cfg_.chunk) {
         const int64_t T = std::min(cfg_.chunk, n - off);
         dev_.ws_reset(0);
         auto in = stage_chunk(0, tokens.data() + off, T, off, prog_.visible_cells(off, T));
+        if (off < L) {   // AI_SCORE_TAIL: a prefill chunk before the scored one, no logits
+            if (chunk_eager()) {
+                prog_.forward(dev_, in, false);
+            } else {
+                op::Round round(dev_);
+                round.begin();
+                prog_.forward(dev_, in, false);
+                round.end();
+                round.launch();
+            }
+            continue;
+        }
         Tensor hidden;
         if (chunk_eager()) {
             hidden = prog_.forward(dev_, in, true);

@@ -18,6 +18,12 @@ namespace fs = std::filesystem;
 // internal helpers
 //
 
+// Locks the server's corpus mutex (if the context has one) for reads of the entity index, linker and
+// extractor, which /api/kv_chunk/index updates from other HTTP threads.
+static std::unique_lock<std::mutex> corpus_lock(const corpus_tool_context & ctx) {
+    return ctx.corpus_mtx ? std::unique_lock<std::mutex>(*ctx.corpus_mtx) : std::unique_lock<std::mutex>();
+}
+
 static std::vector<char *> to_cstr_vec(const std::vector<std::string> & v) {
     std::vector<char *> r;
     r.reserve(v.size() + 1);
@@ -740,10 +746,13 @@ struct server_tool_search_code : server_tool {
         auto hits = corpus.bm25->top_k(query, k);
 
         // Multihop expansion if entity index available
-        if (corpus.entities && corpus.extractor && corpus.entities->n_unique > 0) {
-            auto mh = multihop_query(query, hits,
-                *corpus.entities, *corpus.linker, *corpus.extractor, k);
-            hits = mh.chunk_ids;
+        {
+            auto lk = corpus_lock(corpus);
+            if (corpus.entities && corpus.linker && corpus.extractor && corpus.entities->n_unique > 0) {
+                auto mh = multihop_query(query, hits,
+                    *corpus.entities, *corpus.linker, *corpus.extractor, k);
+                hits = mh.chunk_ids;
+            }
         }
 
         json results = json::array();
@@ -818,6 +827,8 @@ struct server_tool_trace_dependencies : server_tool {
         if (text.empty()) {
             return {{"error", "file not found in corpus: " + file}};
         }
+
+        auto lk = corpus_lock(corpus);
 
         // Extract imports using NER
         json deps = json::array();

@@ -21,10 +21,15 @@
 
 // Sampling entry points, weak: an in-tree AlphaInfer (statically linked, symbols not exported) resolves them at link
 // time, where dlsym(RTLD_DEFAULT) would not find them; an older external library without them leaves them null.
+#if defined(_MSC_VER)
+#define ALPHA_AI_WEAK
+#else
+#define ALPHA_AI_WEAK __attribute__((weak))
+#endif
 extern "C" {
-int ai_engine_supports_sampling(const ai_engine * e) __attribute__((weak));
+int ai_engine_supports_sampling(const ai_engine * e) ALPHA_AI_WEAK;
 int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int top_k, float top_p, float min_p,
-                           uint64_t seed) __attribute__((weak));
+                           uint64_t seed) ALPHA_AI_WEAK;
 }
 
 namespace alphaserve {
@@ -114,13 +119,12 @@ bool ai_gpu_engine::init(const ai_engine_params & params,
     prompt_.assign(n_streams_, {});
     open_.assign(n_streams_, false);
     midpf_.assign(n_streams_, false);
-    // Chunked prefill: newer libalphainfer takes a prompt a chunk at a time, so the other slot's decode rounds run
-    // between chunks instead of freezing for the whole prefill. The engine only allows it with at most one other
-    // live stream, so it is used for n_streams <= 2; older libraries keep the buffered single-call path.
-#if defined(__linux__)
-    if (n_streams_ <= 2 && !getenv("ALPHA_AI_NO_CHUNKED_PREFILL")) prefill_chunk_fn_ = dlsym(RTLD_DEFAULT, "ai_engine_prefill_chunk");
-    prefill_mm_fn_ = dlsym(RTLD_DEFAULT, "ai_engine_prefill_mm");
-#endif
+    // Chunked prefill: the engine takes a prompt a chunk at a time, so the other slot's decode rounds run between chunks
+    // instead of freezing for the whole prefill. The engine only allows it with at most one other live stream, so it
+    // is used for n_streams <= 2. The in-tree engine is linked statically and its symbols are not exported, so these are
+    // taken directly: a dlsym(RTLD_DEFAULT) lookup returned null and left both features off.
+    if (n_streams_ <= 2 && !getenv("ALPHA_AI_NO_CHUNKED_PREFILL")) prefill_chunk_fn_ = (void *) &ai_engine_prefill_chunk;
+    prefill_mm_fn_ = (void *) &ai_engine_prefill_mm;
     // sampling: newer libraries draw sampled target tokens on the device; Flash-Next and older libraries are greedy only
     if (ai_engine_supports_sampling && ai_engine_set_sampling && ai_engine_supports_sampling(eng_) == 1) {
         set_sampling_fn_ = (void *) &ai_engine_set_sampling;
@@ -128,12 +132,10 @@ bool ai_gpu_engine::init(const ai_engine_params & params,
     fprintf(stderr, "[ai-engine] sampling: %s\n", set_sampling_fn_ ? "ON (temperature / top_k / top_p / seed on the device)"
                                                                     : "greedy only (temperature > 0 is served greedy)");
     if (g_serve_mtmd) {
-        fprintf(stderr, "[ai-engine] image input: %s\n", prefill_mm_fn_ ? "ON (ai_engine_prefill_mm)"
-                                                                         : "REFUSED (this libalphainfer has no ai_engine_prefill_mm)");
+        fprintf(stderr, "[ai-engine] image input: ON (ai_engine_prefill_mm)\n");
     }
     fprintf(stderr, "[ai-engine] chunked prefill: %s\n", prefill_chunk_fn_ ? "ON (ai_engine_prefill_chunk)" :
-            n_streams_ > 2 ? "off (more than 2 streams)" : getenv("ALPHA_AI_NO_CHUNKED_PREFILL") ? "off (ALPHA_AI_NO_CHUNKED_PREFILL)" :
-            "off (library has no ai_engine_prefill_chunk)");
+            n_streams_ > 2 ? "off (more than 2 streams)" : "off (ALPHA_AI_NO_CHUNKED_PREFILL)");
     mtp_k_ = 0;
     int exact = 0;
     if (params.mtp_k > 0) {
@@ -183,21 +185,11 @@ int64_t ai_gpu_engine::free_vram_mib() const {
 //   ai_engine_calibration_state: 0 settled, 1 recalibrated this start, 2 bootstrap (clamped context), -1 NULL engine
 //   ai_engine_ctx_cells:         the per-stream context the engine actually holds (a bootstrap start clamps it)
 int ai_gpu_engine::calibration_state() const {
-#if defined(__linux__)
-    using fn_t = int (*)(void *);
-    static const fn_t fn = (fn_t) dlsym(RTLD_DEFAULT, "ai_engine_calibration_state");
-    if (fn && eng_) return fn((void *) eng_);
-#endif
-    return -2;
+    return eng_ ? ai_engine_calibration_state(eng_) : -2;
 }
 
 int64_t ai_gpu_engine::ctx_cells() const {
-#if defined(__linux__)
-    using fn_t = long long (*)(void *);
-    static const fn_t fn = (fn_t) dlsym(RTLD_DEFAULT, "ai_engine_ctx_cells");
-    if (fn && eng_) return (int64_t) fn((void *) eng_);
-#endif
-    return -1;
+    return eng_ ? (int64_t) ai_engine_ctx_cells(eng_) : -1;
 }
 
 // Reject anything this increment cannot honour. Each of these, if ignored, produces
@@ -239,7 +231,7 @@ bool ai_gpu_engine::check_supported(const BatchRequest & req) {
     }
     // an image prompt's tokens are placeholders: prefilled as text they would give fluent nonsense about no image
     if (req.mm && (!prefill_mm_fn_ || !g_serve_mtmd)) {
-        last_error_ = "image input needs a libalphainfer with ai_engine_prefill_mm and a loaded --mmproj projector.";
+        last_error_ = "image input needs a loaded --mmproj projector.";
         return false;
     }
     return true;
@@ -251,15 +243,7 @@ bool ai_gpu_engine::prefill_mm(const BatchRequest & req, int s, int32_t & first)
     using n_embd_t = int (*)(const ai_engine *);
     mtmd_context * mc = g_serve_mtmd;
     const mtmd_input_chunks * chunks = req.mm->chunks;
-#if defined(__linux__)
-    static void * n_embd_fn = dlsym(RTLD_DEFAULT, "ai_engine_n_embd");
-#else
-    static void * n_embd_fn = nullptr;
-#endif
-    if (!n_embd_fn) {
-        last_error_ = "this libalphainfer has no ai_engine_n_embd";
-        return false;
-    }
+    static void * n_embd_fn = (void *) &ai_engine_n_embd;
     const int E = ((n_embd_t) n_embd_fn)(eng_);   // == llama_model_n_embd_inp, which mtmd checked the projector against
     std::vector<int32_t> tok, t, y, x, z, rows;
     std::vector<float>   embd;
@@ -393,9 +377,11 @@ bool ai_gpu_engine::process_one() {
             const float    t    = i < req.samp_temp.size()  ? req.samp_temp[i]  : 0.0f;
             const int      k    = i < req.samp_top_k.size() ? req.samp_top_k[i] : 0;
             const float    p    = i < req.samp_top_p.size() ? req.samp_top_p[i] : 1.0f;
-            const uint64_t base = i < req.samp_rng_base.size() ? req.samp_rng_base[i] : 0;
-            const uint64_t seed = base ? base : (i < req.samp_rng.size() ? req.samp_rng[i] : 0);
-            ((set_t) set_sampling_fn_)(eng_, s, t, k, p, 0.0f, seed);
+            const float    mp   = i < req.samp_min_p.size() ? req.samp_min_p[i] : 0.0f;
+            // the request's seed (rng_base: the client's seed, or a random one), constant over the request -- seed 0 too.
+            // samp_rng is per token, and a per-token key would break exact MTP == plain decode.
+            const uint64_t seed = i < req.samp_rng_base.size() ? req.samp_rng_base[i] : 0;
+            ((set_t) set_sampling_fn_)(eng_, s, t, k, p, mp, seed);
         }
     }
 

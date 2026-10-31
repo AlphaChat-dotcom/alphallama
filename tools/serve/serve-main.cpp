@@ -210,8 +210,39 @@ static bool alpha_mm_has_images(const nlohmann::json & msgs) {
     }
     return false;
 }
+// Width and height from a PNG / GIF / BMP / JPEG header, before anything is decoded (0 x 0 when not recognised), so a
+// small file that would decode to gigabytes is refused without being decoded.
+static void alpha_img_dims(const std::string & b, uint32_t & w, uint32_t & h) {
+    w = h = 0;
+    const auto u8  = [&](size_t i) -> uint32_t { return i < b.size() ? (uint8_t) b[i] : 0u; };
+    const auto be16 = [&](size_t i) { return (u8(i) << 8) | u8(i + 1); };
+    const auto le16 = [&](size_t i) { return u8(i) | (u8(i + 1) << 8); };
+    if (b.size() >= 24 && b.compare(1, 3, "PNG") == 0) {
+        w = (u8(16) << 24) | (u8(17) << 16) | (u8(18) << 8) | u8(19);
+        h = (u8(20) << 24) | (u8(21) << 16) | (u8(22) << 8) | u8(23);
+    } else if (b.size() >= 10 && b.compare(0, 3, "GIF") == 0) {
+        w = le16(6); h = le16(8);
+    } else if (b.size() >= 26 && b.compare(0, 2, "BM") == 0) {
+        w = u8(18) | (u8(19) << 8) | (u8(20) << 16) | (u8(21) << 24);
+        const int32_t sh = (int32_t) (u8(22) | (u8(23) << 8) | (u8(24) << 16) | (u8(25) << 24));
+        h = (uint32_t) (sh < 0 ? -(int64_t) sh : sh);
+    } else if (b.size() >= 4 && u8(0) == 0xFF && u8(1) == 0xD8) {
+        for (size_t i = 2; i + 9 < b.size();) {   // walk the segments to the first SOF marker
+            if (u8(i) != 0xFF) { ++i; continue; }
+            const uint32_t mk = u8(i + 1);
+            if (mk >= 0xC0 && mk <= 0xCF && mk != 0xC4 && mk != 0xC8 && mk != 0xCC) { h = be16(i + 5); w = be16(i + 7); break; }
+            if (mk == 0xD8 || mk == 0x01 || (mk >= 0xD0 && mk <= 0xD7)) { i += 2; continue; }
+            i += 2 + be16(i + 2);
+        }
+    }
+}
+
 // rewrites image parts into marker text parts; false + err on a part it cannot read
 static bool alpha_mm_extract(nlohmann::json & msgs, alpha_mm_bitmaps & out, std::string & err) {
+    // limits: images per request, encoded size, and pixels per image (checked from the header before decoding)
+    const size_t   max_images = 16;
+    const size_t   max_bytes  = (size_t) 32 << 20;
+    const uint64_t max_pixels = (uint64_t) 8192 * 8192;
     for (auto & m : msgs) {
         if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
         for (auto & part : m["content"]) {
@@ -226,7 +257,16 @@ static bool alpha_mm_extract(nlohmann::json & msgs, alpha_mm_bitmaps & out, std:
             if (url.rfind("data:", 0) != 0) { err = "image_url must be a data: URL (data:image/...;base64,...); remote URLs are not fetched"; return false; }
             const size_t comma = url.find(',');
             if (comma == std::string::npos || url.substr(0, comma).find(";base64") == std::string::npos) { err = "image_url data: URL must be base64-encoded"; return false; }
+            if (out.v.size() >= max_images) { err = "too many images (at most " + std::to_string(max_images) + " per request)"; return false; }
+            if ((url.size() - comma - 1) / 4 * 3 > max_bytes) { err = "image " + std::to_string(out.v.size() + 1) + " is larger than 32 MB"; return false; }
             const std::string bytes = alpha_b64_decode(url.substr(comma + 1));
+            uint32_t iw = 0, ih = 0;
+            alpha_img_dims(bytes, iw, ih);
+            if ((uint64_t) iw * ih > max_pixels) {
+                err = "image " + std::to_string(out.v.size() + 1) + " is " + std::to_string(iw) + " x " + std::to_string(ih) +
+                      " pixels; at most 8192 x 8192 is accepted";
+                return false;
+            }
             mtmd_bitmap * bm = bytes.empty() ? nullptr :
                 mtmd_helper_bitmap_init_from_buf(alphaserve::g_serve_mtmd, (const unsigned char *) bytes.data(), bytes.size());
             if (!bm) { err = "could not decode image " + std::to_string(out.v.size() + 1) + " (png / jpeg / bmp / gif expected)"; return false; }
@@ -1027,7 +1067,8 @@ int main(int argc, char ** argv) {
 #endif
     // Parse args
     const char * model_path = nullptr;
-    const char * host = "0.0.0.0";
+    const char * host = "127.0.0.1";   // loopback by default; --host 0.0.0.0 (with --api-key) to serve a network
+    std::string api_key = getenv("ALPHA_API_KEY") ? getenv("ALPHA_API_KEY") : "";   // --api-key / --api-key-file
     const char * backend_str = "local";
     const char * backend_url = nullptr;
     const char * backend_key = nullptr;
@@ -1058,6 +1099,12 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) host = argv[++i];
+        else if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) api_key = argv[++i];
+        else if (strcmp(argv[i], "--api-key-file") == 0 && i + 1 < argc) {
+            std::ifstream kf(argv[++i]);
+            if (!kf || !std::getline(kf, api_key)) { fprintf(stderr, "[serve] --api-key-file: cannot read %s\n", argv[i]); return 1; }
+            while (!api_key.empty() && (api_key.back() == '\r' || api_key.back() == ' ')) api_key.pop_back();
+        }
         else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) mmproj_path = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) { n_gpu_layers = atoi(argv[++i]); ngl_explicit = true; }
@@ -1112,13 +1159,21 @@ int main(int argc, char ** argv) {
     else if (strcmp(backend_str, "sglang") == 0) mode = MODE_SGLANG;
     else if (strcmp(backend_str, "vllm") == 0) mode = MODE_VLLM;
     else if (strcmp(backend_str, "auto") == 0) mode = MODE_AUTO;
-    else if (strcmp(backend_str, "flashinfer") == 0 || strcmp(backend_str, "fi") == 0) mode = MODE_FLASHINFER;
+    else if (strcmp(backend_str, "flashinfer") == 0 || strcmp(backend_str, "fi") == 0) {
+#ifdef ALPHA_HAS_FLASHINFER
+        mode = MODE_FLASHINFER;
+#else
+        fprintf(stderr, "[serve] --backend flashinfer: this binary was built without FlashInfer "
+                        "(Linux + CUDA, vendor/flashinfer present, -DALPHA_FLASHINFER=ON)\n");
+        return 1;
+#endif
+    }
     else if (strcmp(backend_str, "alphainfer") == 0 || strcmp(backend_str, "ai") == 0) {
 #ifdef ALPHA_HAS_ALPHAINFER
         mode = MODE_ALPHAINFER;
 #else
         fprintf(stderr, "[serve] --backend alphainfer: this binary was built without AlphaInfer "
-                        "(configure with -DALPHA_ALPHAINFER=ON -DALPHAINFER_ROOT=<bundle>)\n");
+                        "(Linux + CUDA only: configure with -DALPHA_ALPHAINFER=ON)\n");
         return 1;
 #endif
     }
@@ -1403,9 +1458,14 @@ int main(int argc, char ** argv) {
         if (is_moe) {
             fprintf(stderr, "[serve] auto: MoE (n_expert=%d) → local fused-infer/ALL_GPU (batches; FI-MoE slower)\n", n_expert_peek);
         } else if (!is_quant && n_slots > 1) {
+#ifdef ALPHA_HAS_FLASHINFER
             mode = MODE_FLASHINFER;
             auto_routed = true;
             fprintf(stderr, "[serve] auto: dense FP16/BF16, %d slots → FlashInfer (batched decode)\n", n_slots);
+#else
+            // without FlashInfer the batched dense path would load no model and exit: serve it locally instead
+            fprintf(stderr, "[serve] auto: dense FP16/BF16 → local (this build has no FlashInfer)\n");
+#endif
         } else {
             fprintf(stderr, "[serve] auto: %s → local (fastest here; FI Q4_K dequant path n/a). --backend fi to force FI.\n",
                     is_quant ? "quantized dense" : "single-slot dense");
@@ -1450,7 +1510,9 @@ int main(int argc, char ** argv) {
             "  --corpus-dir DIR      Enable intelligence layer (BM25 + NER retrieval)\n"
             "  --redis-kv HOST:PORT  Enable Redis KV cache (cross-session prefix reuse)\n"
             "  --port PORT           HTTP port (default: 8080)\n"
-            "  --host HOST           Bind address (default: 0.0.0.0)\n"
+            "  --host HOST           Bind address (default: 127.0.0.1; 0.0.0.0 to serve a network)\n"
+            "  --api-key KEY         Require 'Authorization: Bearer KEY' (or X-Api-Key) on every route but /health\n"
+            "  --api-key-file FILE   Same, key read from the first line of FILE (env: ALPHA_API_KEY)\n"
             "  -np N                 Number of local slots (default: 4)\n"
             "  -ngl N                GPU layers (default: 99)\n"
             "  -c N                  Context per slot (default: 2048)\n"
@@ -2770,6 +2832,40 @@ int main(int argc, char ** argv) {
     httplib::Server http;
     http.set_payload_max_length((size_t) 128 << 20);   // base64 images
 
+    // A request field of the wrong type (e.g. "max_tokens": "abc") throws from the JSON accessors: answer 400 with the
+    // reason instead of a bare 500.
+    http.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
+        std::string msg = "internal error";
+        int status = 500;
+        try { std::rethrow_exception(ep); }
+        catch (const nlohmann::json::exception & e) { status = 400; msg = std::string("invalid request: ") + e.what(); }
+        catch (const std::exception & e) { msg = e.what(); }
+        catch (...) {}
+        res.status = status;
+        res.set_content(json{{"error", {{"message", msg}, {"type", status == 400 ? "invalid_request_error" : "server_error"}}}}.dump(
+                            -1, ' ', false, json::error_handler_t::replace), "application/json");
+    });
+
+    // --api-key: every route except /health needs "Authorization: Bearer <key>" or "X-Api-Key: <key>"
+    if (!api_key.empty()) {
+        http.set_pre_routing_handler([api_key](const httplib::Request & req, httplib::Response & res) {
+            if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            std::string got = req.get_header_value("X-Api-Key");
+            const std::string auth = req.get_header_value("Authorization");
+            if (got.empty() && auth.rfind("Bearer ", 0) == 0) got = auth.substr(7);
+            unsigned char diff = got.size() == api_key.size() ? 0 : 1;   // compare without an early exit
+            for (size_t i = 0; i < got.size() && i < api_key.size(); i++) diff |= (unsigned char) (got[i] ^ api_key[i]);
+            if (diff == 0) return httplib::Server::HandlerResponse::Unhandled;
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"invalid or missing API key\",\"type\":\"authentication_error\"}}", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+        fprintf(stderr, "[serve] API key required on every route but /health\n");
+    } else if (strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0 && strcmp(host, "::1") != 0) {
+        fprintf(stderr, "[serve] WARNING: listening on %s with no API key: anyone who can reach this port can use the "
+                        "server. Set --api-key (or ALPHA_API_KEY) or bind 127.0.0.1.\n", host);
+    }
+
     // ALPHA_SERVE_WARMUP: /health reports "loading" (503) until the startup warm-up request has finished
     static std::atomic<bool> g_warm_ready{true};
 
@@ -2864,6 +2960,7 @@ int main(int argc, char ** argv) {
         if (q.empty()) { res.status = 400; res.set_content("{\"error\":\"missing 'query'\"}", "application/json"); return; }
         if (span_chars < 32)   span_chars = 32;
         if (span_chars > 4096) span_chars = 4096;
+        k = std::max(1, std::min(k, 1000));   // one request cannot page out the whole corpus
         std::vector<int> ids = intel_ctx.bm25->top_k(q, k);
         if (want_union) {
             std::unordered_set<int> seen(ids.begin(), ids.end());
@@ -2906,7 +3003,8 @@ int main(int argc, char ** argv) {
             results.push_back(r);
         }
         json out = { {"query", q}, {"count", (int) ids.size()}, {"union", want_union}, {"results", results} };
-        res.set_content(out.dump(), "application/json");
+        // a span cut at a byte offset can split a UTF-8 character: replace it rather than throw
+        res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
 
 #ifdef ALPHA_DELTANET
@@ -3134,6 +3232,7 @@ int main(int argc, char ** argv) {
             ireq.temperature = body.value("temperature", 0.7f);
             ireq.top_k = body.value("top_k", 40);
             ireq.top_p = body.value("top_p", 0.95f);
+            ireq.min_p = body.value("min_p", 0.0f);
             ireq.seed = body.value("seed", -1);
             #ifdef ALPHA_HAS_ALPHAINFER
             // AlphaInfer is greedy-only: absent sampling fields mean greedy (not the 0.7 / 40 / 0.95 defaults above), and an
@@ -3478,6 +3577,7 @@ int main(int argc, char ** argv) {
         ireq.temperature = body.value("temperature", 0.7f);
         ireq.top_k = body.value("top_k", 40);
         ireq.top_p = body.value("top_p", 0.95f);
+        ireq.min_p = body.value("min_p", 0.0f);
         ireq.seed = body.value("seed", -1);
         #ifdef ALPHA_HAS_ALPHAINFER
         // AlphaInfer is greedy-only: absent sampling fields mean greedy (not the 0.7 / 40 / 0.95 defaults above), and an

@@ -1171,6 +1171,11 @@ void Qwen35Hybrid::alloc_expert_pool(Device & dev, int n_slots, bool with_head, 
         dc.threads  = getenv("AI_DOOR_THREADS") ? atoi(getenv("AI_DOOR_THREADS")) : 0;
         dc.pf_slots = getenv("AI_DOOR_PF_SLOTS") ? atoi(getenv("AI_DOOR_PF_SLOTS")) : 0;
         if (const char * pr = getenv("AI_PROFILE")) dc.profile = pr;
+        // AI_DOOR_LEND_MIB (default 4608, 0 = off): prefill slot lending (the engine's one-shot prefill borrows this
+        // much of the last layers' slot banks as workspace for larger chunks); the MTP head's bank is never lent (its
+        // chain runs in the prefill)
+        dc.lend_bytes     = (size_t) std::max(0, getenv("AI_DOOR_LEND_MIB") ? atoi(getenv("AI_DOOR_LEND_MIB")) : 4608) << 20;
+        dc.lend_banks_end = spec_.n_layer;
         door_ = std::make_unique<offload::DoorbellMoe>(dev, banks, slots, spec_.n_expert, spec_.n_expert_used,
                                                        spec_.n_embd, dc);
         return;

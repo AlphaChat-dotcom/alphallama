@@ -53,7 +53,14 @@ public:
     void         ws_tag(const char * t) { ws_tag_ = t; }
     const char * ws_high_tag() const { return ws_high_tag_.c_str(); }
     size_t ws_capacity() const { return ws_cap_; }
-    void * ws_base() const { return ws_buf_ >= 0 ? buffer_base(ws_buf_) : nullptr; }
+    void * ws_base() const { return ws_buf_ >= 0 ? (char *) buffer_base(ws_buf_) + ws_base_off_ : nullptr; }
+    // Prefill slot lending: the workspace becomes `cap` bytes of buffer `buf` from byte `off` (borrowed device memory)
+    // until ws_restore(), which puts the normal workspace back with its offset and high-water mark untouched (the
+    // calibration never sees a borrowed peak). ws_lent_high() = the bytes of the borrowed range written so far.
+    void   ws_redirect(int buf, size_t off, size_t cap);
+    void   ws_restore();
+    bool   ws_redirected() const { return ws_saved_.buf >= 0; }
+    size_t ws_lent_high() const { return ws_redirected() ? ws_high_ : 0; }
     // AI_WS_TRACE: name the most recent raw allocation (adapter graph nodes: op and shape)
     void   ws_trace_note(int type, const int64_t * ne, const std::string & label);
     bool   ws_trace_on() const { return ws_trace_on_; }
@@ -104,6 +111,8 @@ private:
     size_t ws_cap_  = 0;
     size_t ws_off_  = 0;
     size_t ws_high_ = 0;
+    size_t ws_base_off_ = 0;   // ws_redirect: the borrowed range's start within ws_buf_
+    struct WsSaved { int buf = -1; size_t cap = 0, off = 0, high = 0, base_off = 0; std::string high_tag; } ws_saved_;
     const char * ws_tag_ = "";
     std::string  ws_high_tag_;
     // AI_WS_TRACE: the live allocations at the moment the high-water mark was set (offset, bytes, shape)

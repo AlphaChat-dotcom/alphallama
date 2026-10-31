@@ -2385,8 +2385,62 @@ MoeRoute moe_route(Device & d, const Tensor & x, const Tensor & router, const Mo
     return r;
 }
 
+bool moe_wsum_native() {
+    static const bool v = !getenv("AI_MOE_WSUM") || atoi(getenv("AI_MOE_WSUM")) != 0;
+    return v;
+}
+
+Tensor moe_experts_raw(Device & d, const Tensor & x, const Tensor & up, const Tensor & gate, const Tensor & down,
+                       const Tensor & slots) {
+    Call c(d);
+    ggml_context * g = c.ctx();
+    const int64_t T = x.ne[1];
+    const int64_t E = x.ne[0];
+    ggml_tensor * ids  = c.in(slots, "slots");
+    ggml_tensor * cur  = ggml_reshape_3d(g, c.in(x, "moe_in"), E, 1, T);
+    ggml_tensor * u    = ggml_mul_mat_id(g, c.in(up, "up_pool"), cur, ids);
+    ggml_tensor * gt   = ggml_mul_mat_id(g, c.in(gate, "gate_pool"), cur, ids);
+    ggml_tensor * act  = ggml_swiglu_split(g, gt, u);
+    return c.run(ggml_mul_mat_id(g, c.in(down, "down_pool"), act, ids));
+}
+
+Tensor moe_wsum(Device & d, const Tensor & exps, const Tensor & weights, int k, const Tensor * add, const Tensor * into) {
+    const int64_t E = exps.ne[0], T = exps.ne[2];
+    if (!moe_wsum_native() || !exps.contiguous() || !weights.contiguous() || weights.type != F32 ||
+        (add && (!add->contiguous() || add->type != F32))) {
+        Call c(d);
+        ggml_context * g = c.ctx();
+        ggml_tensor * ex  = ggml_mul(g, c.in(exps, "moe_exps"), c.in(weights, "moe_w"));
+        ggml_tensor * moe = ggml_view_2d(g, ex, E, T, ex->nb[2], 0);
+        for (int i = 1; i < k; ++i) {
+            moe = ggml_add(g, moe, ggml_view_2d(g, ex, E, T, ex->nb[2], (size_t) i * ex->nb[1]));
+        }
+        if (add) moe = ggml_add(g, moe, c.in(*add, "moe_add"));
+        Tensor out = c.run(moe);
+        if (into) {
+            copy_into(d, out, *into, "moe_wsum into");
+            return *into;
+        }
+        return out;
+    }
+    Tensor out = into ? *into : d.ws_alloc(F32, E, T);
+    if (out.type != F32 || !out.contiguous() || out.ne[0] != E || out.ne[1] != T) {
+        throw std::runtime_error("moe_wsum: into must be f32 [E, T] contiguous");
+    }
+    const float * ep = (const float *) exps.data;
+    const float * wp = (const float *) weights.data;
+    const float * ap = add ? (const float *) add->data : nullptr;
+    float *       yp = (float *) out.data;
+    Device *      dv = &d;
+    adapter::native(d, [=]() { kern::moe_weighted_sum(adapter::stream(*dv), ep, wp, ap, yp, E, k, T); });
+    return out;
+}
+
 Tensor moe_experts(Device & d, const Tensor & x, const Tensor & up, const Tensor & gate, const Tensor & down,
                    const Tensor & slots, const Tensor & weights, int k) {
+    if (moe_wsum_native() && weights.contiguous()) {
+        return moe_wsum(d, moe_experts_raw(d, x, up, gate, down, slots), weights, k);
+    }
     Call c(d);
     ggml_context * g = c.ctx();
     const int64_t T = x.ne[1];

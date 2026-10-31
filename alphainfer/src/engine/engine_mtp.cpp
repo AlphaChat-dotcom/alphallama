@@ -139,6 +139,9 @@ void Engine::prefill_mtp(int stream, const std::vector<int32_t> & prompt, Stream
 void Engine::prefill_mtp_range(int stream, const std::vector<int32_t> & prompt, int64_t & off, bool final, Stream & st) {
     const int     k = cfg_.mtp_k;
     const int64_t n = (int64_t) prompt.size();
+    if (off == 0 && final) {
+        off = lend_prefill(stream, prompt, true);   // a one-shot prefill: all but the last chunk on borrowed slots
+    }
     for (; off < n; off += cfg_.chunk) {
         const int64_t T    = std::min(cfg_.chunk, n - off);
         if (!final && off + T >= n) {

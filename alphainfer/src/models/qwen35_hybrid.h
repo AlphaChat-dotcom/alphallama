@@ -98,6 +98,33 @@ public:
         if (door_) door_->reset_residency();
 #endif
     }
+    // prefill slot lending (AI_DOOR_LEND_MIB): see DoorbellMoe::lend_begin / lend_end; false / no-op otherwise
+    bool offload_lend_begin(int * buf, size_t * bytes) {
+#if defined(AI_DOORBELL)
+        if (door_) return door_->lend_begin(buf, bytes);
+#endif
+        (void) buf;
+        (void) bytes;
+        return false;
+    }
+    void offload_lend_end(size_t used) {
+#if defined(AI_DOORBELL)
+        if (door_) door_->lend_end(used);
+#endif
+        (void) used;
+    }
+    size_t offload_lend_bytes() const {
+#if defined(AI_DOORBELL)
+        if (door_) return door_->lend_bytes();
+#endif
+        return 0;
+    }
+    int64_t offload_t_max() const {
+#if defined(AI_DOORBELL)
+        if (door_) return door_->t_max();
+#endif
+        return 0;
+    }
     // Streamed-MoE host steps: time blocked on the device (compute + queued copies) and host CPU time.
     // overlap_*: routed experts of a step that the same layer also used in its previous step.
     struct OffloadProf {

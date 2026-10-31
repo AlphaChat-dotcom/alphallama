@@ -67,9 +67,9 @@ bool apack_cache_dir(char * buf, size_t buf_size);
 // Checks ~/.alphachat/packs/{fingerprint_hex}.apack
 bool apack_find_cached(const uint8_t fp[APACK_FP_SIZE], char * path, size_t path_size);
 
-// Sync: fetch pack from remote if not cached. Returns true if pack is now available.
-// Uses opaque URL path and generic User-Agent. TLS-only. Single attempt, no retry.
-// If fetch fails, returns false silently (caller falls back to embedded data).
+// Sync: returns true if the pack is in the cache. Only with ALPHA_PACK_SYNC=1 does it fetch a missing pack from
+// https://d.alphachat.ai over HTTPS (logged, one attempt); otherwise it makes no network request. On failure the
+// caller falls back to embedded data.
 bool apack_sync(const uint8_t fp[APACK_FP_SIZE]);
 
 #ifdef __cplusplus

@@ -93,6 +93,16 @@ void q4x_rt_mark(int which, void * stream) {
 
 // GPU miss share: a GPU-taken missed expert e arrives on the bell as -(e + 2) - kGpuTagH (= kernels/offload.cu kGpuTag)
 static constexpr int32_t kGpuTagH = 1 << 20;
+// [AI_Q4X_HIT_STATS] hits / entries, all ranks and ranks 0..6; printed once at exit
+static unsigned long long g_hits[4];
+static struct HitStatsPrint {
+    ~HitStatsPrint() {
+        if (g_hits[1] == 0) return;
+        fprintf(stderr, "[q4x] decode hit rate: %.1f%% of %llu routed entries; ranks 0-6: %.1f%% of %llu%c",
+                100.0 * (double) g_hits[0] / (double) g_hits[1], g_hits[1], 100.0 * (double) g_hits[2] / (double) std::max(1ULL, g_hits[3]),
+                g_hits[3], 10);
+    }
+} g_hit_stats_print;
 
 static constexpr int kRopeImrope = 40;   // interleaved M-RoPE, NEOX ordering (as qwen35_hybrid.cpp)
 
@@ -268,6 +278,119 @@ bool Qwen4ExpRun::restore_checkpoint() {
     return true;
 }
 
+// [AI_Q4X_PLE_IO] the PLE rows' host reads. Rows are hashed n-grams spread over the 29 GB table and the page cache holds
+// only what was read since the tier fill dropped it. One blocking pread per row, serially on the decode thread, cost
+// 8.7-10.3 ms of host time per round on the 3090 starts whose disk was slow (tier read 36-40 s; 63-78 vs 91-105 tok/s,
+// dg1 2026-10-30) and 7.2 ms under an O_DIRECT read ballast (pl1). Per call:
+//   1. the row ids are de-duplicated (55.7% of a call's rows repeat another's: pl1);
+//   2. every unique row is tried with preadv2 RWF_NOWAIT -- a page-cache hit costs what the serial pread did;
+//   3. the rows that would wait for the disk are all queued with WILLNEED readahead at once, then read: inline below
+//      AI_Q4X_PLE_IO_MIN rows (a decode round), else by blocking reader threads too (AI_Q4X_PLE_IO, default 16; on the
+//      host cpus, never the launch core or the spinning pool).
+// A row cache across calls was tried and dropped: 0.3% hits (the next round's rows are never this round's), and waking
+// the readers for page-cache hits cost +0.4 ms/round quiet (pl1). Same bytes, same to_float: the output does not change.
+struct Qwen4ExpRun::PleIo {
+    const WeightSet & ws;
+    size_t            rb;
+    struct Job { const char * src; char * dst; };
+    std::vector<Job>         jobs;
+    std::atomic<size_t>      next{0};
+    std::atomic<size_t>      left{0};
+    std::mutex               mu, call_mu;
+    std::condition_variable  cv, done_cv;
+    uint64_t                 gen = 0;
+    int                      draining = 0;
+    bool                     stop = false;
+    // [AI_Q4X_PLE_IO_MIN, default 64] fewer disk rows than this are read inline (a decode round's ~20: waking the
+    // readers cost more than it saved); a prefill chunk's thousands go to the readers
+    const int                min_par = getenv("AI_Q4X_PLE_IO_MIN") ? std::max(2, atoi(getenv("AI_Q4X_PLE_IO_MIN"))) : 64;
+    // [AI_Q4X_PLE_SLOW_MS, default 2] the inline path's slow mode: on a start whose disk is slow and page cache under
+    // reclaim, WILLNEED did not land and the inline reads waited one NVMe latency each -- PLE 10.2 ms/round, 74 vs 98.6
+    // tok/s (3090 sd1 b3, MTP 3: ~27 disk rows per round, under min_par). A call whose reads took longer than this sends
+    // the next calls' disk rows to the readers too (any count >= 2); every 256 calls the inline path is tried again.
+    const double             slow_ms = getenv("AI_Q4X_PLE_SLOW_MS") ? atof(getenv("AI_Q4X_PLE_SLOW_MS")) : 2.0;
+    int                      slow_left = 0;   // calls left in the slow mode
+    uint64_t                 n_slow = 0;      // calls that switched it on
+    bool                     direct = false;  // this call's jobs read through O_DIRECT (see ple_rows)
+    uint64_t                 n_direct = 0;    // rows read that way
+    std::vector<std::thread> thr;
+    std::vector<char>        buf;    // one raw row per unique id of the call
+    std::vector<uint64_t>    key;    // open addressing over the call's ids: id + 1 (0 = empty)
+    std::vector<uint32_t>    slot;   //   -> its row in buf
+    // stats (AI_Q4X_HIT_STATS)
+    uint64_t n_rows = 0, n_unique = 0, n_cached = 0, n_disk = 0, n_woke = 0;
+
+    PleIo(const WeightSet & w, size_t row_bytes, int n_thr, const std::vector<int> & cpus) : ws(w), rb(row_bytes) {
+        for (int i = 0; i < n_thr; ++i) thr.emplace_back([this, cpus]() {
+            if (!cpus.empty()) offload::pin_this_thread(cpus);
+            uint64_t seen = 0;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&]() { return stop || gen != seen; });
+                    if (stop) return;
+                    seen = gen;
+                    ++draining;
+                }
+                drain();
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    --draining;
+                }
+                done_cv.notify_all();
+            }
+        });
+    }
+    ~PleIo() {
+        if (getenv("AI_Q4X_HIT_STATS") && n_rows)
+            fprintf(stderr, "[q4x] PLE io: %llu rows, %.1f%% unique; of those %.1f%% in the page cache, %llu read from disk (%llu calls woke the readers, slow mode entered %llu times, %llu rows O_DIRECT)\n",
+                    (unsigned long long) n_rows, 100.0 * n_unique / n_rows, n_unique ? 100.0 * n_cached / n_unique : 0.0,
+                    (unsigned long long) n_disk, (unsigned long long) n_woke, (unsigned long long) n_slow,
+                    (unsigned long long) n_direct);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : thr) t.join();
+    }
+    void drain() {
+        for (size_t i; (i = next.fetch_add(1)) < jobs.size();) {
+            const Job & j = jobs[i];
+            if (direct && ws.host_pread_direct(j.src, j.dst, rb)) { left.fetch_sub(1); continue; }
+            if (!ws.host_pread(j.src, j.dst, rb)) memcpy(j.dst, j.src, rb);   // not a shard's range: the mapping
+            left.fetch_sub(1);
+        }
+    }
+    // read every job; returns once all are in place and no reader is inside drain()
+    void run() {
+        if (jobs.empty()) return;
+        const bool slow = slow_left > 0 || direct;   // direct reads always go to the readers (one NVMe latency each)
+        if (slow_left > 0) --slow_left;
+        if (thr.empty() || jobs.size() < (size_t) (slow ? 2 : min_par)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            next = 0; left = jobs.size();
+            drain();
+            if (!thr.empty() && slow_ms > 0 &&
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > slow_ms) {
+                slow_left = 256;
+                ++n_slow;
+            }
+            return;
+        }
+        ++n_woke;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            next = 0; left = jobs.size();
+            ++gen;
+        }
+        cv.notify_all();
+        drain();
+        std::unique_lock<std::mutex> lk(mu);
+        done_cv.wait(lk, [&]() { return left.load() == 0 && draining == 0; });
+    }
+};
+
 // PLE n-gram hash rows (alphallama llm_graph_input_ple::set_input, qwen4exp.cpp:860-930): for each position the
 // window [t, t-1, .., t-ngram+1] with predecessors from this sequence's history; a missing one, or anything at or
 // before an EOS in the window, reads as EOS (the token's own EOS does not cut). Rows dequantised with ggml's to_float.
@@ -278,7 +401,7 @@ void Qwen4ExpRun::ple_rows(int64_t pos0, int64_t T, float * out) const {
     const int64_t hd = s.ple_head_dim, eos = s.ple_eos;
     const auto * tt = ggml_get_type_traits((ggml_type) tbl.type);
     std::vector<int64_t> ctx((size_t) n_gram);
-    struct Row { const char * src; float * dst; };
+    struct Row { const char * src; float * dst; uint64_t r; const char * raw; };
     std::vector<Row> rows;
     rows.reserve((size_t) (T * n_heads));
     for (int64_t i = 0; i < T; ++i) {
@@ -298,28 +421,85 @@ void Qwen4ExpRun::ple_rows(int64_t pos0, int64_t T, float * out) const {
             for (int64_t g = 0; g < per_gram && base + g < n_heads; ++g) {
                 const int64_t h   = base + g;
                 const uint64_t r  = mixed % (uint64_t) s.ple_head_vocab[(size_t) h] + (uint64_t) s.ple_head_offsets[(size_t) h];
-                rows.push_back({ (const char *) tbl.data + (size_t) r * tbl.nb[1], out + (i * n_heads + h) * hd });
+                rows.push_back({ (const char *) tbl.data + (size_t) r * tbl.nb[1], out + (i * n_heads + h) * hd, r, nullptr });
             }
         }
     }
     const size_t rb = (size_t) tbl.nb[1];
-    // AI_Q4X_PLE_PREFETCH (default 1): ask the kernel for every row of the round before reading any. The rows are
-    // hashed n-grams spread over a table of tens of GB that the page cache holds only partly (the model files are
-    // evicted after the tier fill), so one pread per row would wait for one NVMe read each before the GPU could
-    // start. WILLNEED queues them all at once.
+    auto to_f32 = [&](const char * src, float * dst) {
+        if (tbl.type == F32) memcpy(dst, src, (size_t) hd * 4);
+        else tt->to_float(src, dst, hd);
+    };
+    // [AI_Q4X_PLE_PREAD, default 1] the row through pread: the 29 GB table's pages are then never mapped into this
+    // process, so compaction migrating them cannot IPI the pool (WeightSet::host_pread)
+    static const bool ple_pread = !getenv("AI_Q4X_PLE_PREAD") || atoi(getenv("AI_Q4X_PLE_PREAD")) != 0;
+    static const int  io_thr    = getenv("AI_Q4X_PLE_IO") ? std::max(0, atoi(getenv("AI_Q4X_PLE_IO"))) : 16;
+    if (ple_pread && io_thr > 0) {
+        if (!ple_io_) {
+            ple_io_.reset(new PleIo(prog_.weights(), rb, io_thr, host_cpus_));
+            fprintf(stderr, "[q4x] PLE io: page-cache-first reads, %d reader threads for the rest%s\n", io_thr,
+                    host_cpus_.empty() ? "" : (" on " + offload::cpu_list_str(host_cpus_)).c_str());
+        }
+        PleIo & io = *ple_io_;
+        std::lock_guard<std::mutex> call_lk(io.call_mu);   // the prefill's PLE thread and the decode never overlap
+        size_t cap = 16;
+        while (cap < 2 * rows.size()) cap <<= 1;
+        io.key.assign(cap, 0);
+        io.slot.resize(cap);
+        if (io.buf.size() < rows.size() * rb) io.buf.resize(rows.size() * rb);
+        io.jobs.clear();
+        // [AI_Q4X_PLE_DIRECT, default 512 rows; 0 = off] a call this small (a decode / verify round) reads every unique
+        // row through O_DIRECT on the readers, past the page cache. On 2 in 10 fresh 3090 starts the buffered reads ran
+        // ~10x slower for the whole run (PLE 8.6-10.5 ms/round vs 0.8; 74-78 vs ~100 tok/s), and 16 parallel readers did
+        // not help (sd2: the same 10 ms) -- the page-cache path under reclaim (kswapd stole 1.4-1.8M pages a run on a
+        // 62 GB box with a 40 GB pinned tier), not disk latency. Strata reads these rows with --ple-io direct. Larger
+        // calls (prefill chunks) keep the page cache: neighbouring rows share pages there.
+        static const int direct_max = getenv("AI_Q4X_PLE_DIRECT") ? std::max(0, atoi(getenv("AI_Q4X_PLE_DIRECT"))) : 512;
+        io.direct = direct_max > 0 && rows.size() <= (size_t) direct_max;
+        std::vector<uint32_t> at(rows.size());
+        uint32_t n_u = 0;
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const uint64_t id = rows[k].r + 1;
+            size_t h = (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (cap - 1);
+            while (io.key[h] != 0 && io.key[h] != id) h = (h + 1) & (cap - 1);
+            if (io.key[h] == 0) {
+                io.key[h] = id;
+                io.slot[h] = n_u;
+                char * dst = io.buf.data() + (size_t) n_u * rb;
+                if (io.direct) io.jobs.push_back({ rows[k].src, dst });
+                else {
+                    const int r = prog_.weights().host_pread_nowait(rows[k].src, dst, rb);
+                    if (r == 1) ++io.n_cached;
+                    else io.jobs.push_back({ rows[k].src, dst });   // on disk (0) or not readable that way (-1): blocking pread
+                }
+                ++n_u;
+            }
+            at[k] = io.slot[h];
+        }
+        io.n_rows += rows.size();
+        io.n_unique += n_u;
+        io.n_disk += io.jobs.size();
+        if (io.direct) io.n_direct += io.jobs.size();
+        // every row that would wait is queued with the kernel at once (WILLNEED readahead: the serial path's deep queue,
+        // which beat 8 blocking readers on a cold table -- pl4: decode 0.66 vs 1.05 ms/round, prefill 8.6 vs 9.9 s, and
+        // 9.0 vs 15.2 s under a read ballast); the reads then mostly find the pages arriving
+        if (!io.direct) for (const PleIo::Job & j : io.jobs) prog_.weights().host_prefetch(j.src, rb);
+        io.run();
+        for (size_t k = 0; k < rows.size(); ++k) to_f32(io.buf.data() + (size_t) at[k] * rb, rows[k].dst);
+        return;
+    }
+    // the serial path (AI_Q4X_PLE_IO=0, or AI_Q4X_PLE_PREAD=0)
+    // [AI_Q4X_PLE_PREFETCH, default 1] ask the kernel for EVERY row of the round before reading any (3.7 ms of host time
+    // per V_v_bugs_dv round on the 3090 2026-10-25 before it). WILLNEED queues them all at once.
     static const bool ple_prefetch = !getenv("AI_Q4X_PLE_PREFETCH") || atoi(getenv("AI_Q4X_PLE_PREFETCH")) != 0;
     if (ple_prefetch) {
         for (const Row & w : rows) prog_.weights().host_prefetch(w.src, rb);
     }
-    // AI_Q4X_PLE_PREAD (default 1): read each row through pread, so the table's pages are never mapped into this
-    // process and compaction migrating them cannot IPI the pool (WeightSet::host_pread)
-    static const bool ple_pread = !getenv("AI_Q4X_PLE_PREAD") || atoi(getenv("AI_Q4X_PLE_PREAD")) != 0;
     for (const Row & w : rows) {
         const char * src = w.src;
         char         row[8192];
         if (ple_pread && rb <= sizeof row && prog_.weights().host_pread(src, row, rb)) src = row;
-        if (tbl.type == F32) memcpy(w.dst, src, (size_t) hd * 4);
-        else tt->to_float(src, w.dst, hd);
+        to_f32(src, w.dst);
     }
 }
 
@@ -1440,6 +1620,14 @@ void Qwen4ExpRun::admit_after_round() {
             if (e < 0 || e >= s.n_expert) continue;
             B.score[(size_t) e] += 1.0f;
             if ((m >= 0 || gpu) && B.table_h[(size_t) e] < 0) cand.push_back({ B.score[(size_t) e], (int) il, e });
+            // [AI_Q4X_HIT_STATS=1] decode hit counters: all routed entries, and ranks 0..6 (Strata's lookups leave out
+            // the tail-skipped ranks)
+            static const bool hit_stats = getenv("AI_Q4X_HIT_STATS") && atoi(getenv("AI_Q4X_HIT_STATS")) != 0;
+            if (hit_stats) {
+                const bool hit = m < 0 && !gpu;
+                g_hits[0] += hit; g_hits[1] += 1;
+                if (c % k < 7) { g_hits[2] += hit; g_hits[3] += 1; }
+            }
         }
     }
     int issued = 0;

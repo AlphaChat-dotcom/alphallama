@@ -36,6 +36,10 @@ void moe_merge_residual_gated(void * stream, const float * exps, const float * w
                               float * y, int64_t E, int64_t k, int64_t T);
 void moe_merge_residual(void * stream, const float * exps, const float * w, const float * shared,
                         const float * res, float * y, int64_t E, int64_t k, int64_t T);
+// y = (sum_j exps[.., j, ..] * w[j]) [+ add] in expert order: bitwise equal to MUL + k-1 ADDs (+ ADD). add may be
+// nullptr or alias y (an accumulator).
+void moe_weighted_sum(void * stream, const float * exps, const float * w, const float * add, float * y, int64_t E,
+                      int64_t k, int64_t T);
 // Same, plus the next layer's input RMS norm: out = rms_norm(y) * norm_w. One block per row.
 // Cooperative variant: keeps the merge spread across the grid and pays two grid-wide barriers for
 // the reduction, instead of collapsing to one block per row. Returns false if the launch is

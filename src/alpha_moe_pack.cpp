@@ -631,28 +631,11 @@ bool apack_find_cached(const uint8_t fp[APACK_FP_SIZE], char * path, size_t path
     return false;
 }
 
-// HTTP sync: fetch the pack from the CDN if not cached.
-//
-// Security design:
-// - URL: /d/{sha256_hex}, an opaque path with no extension or descriptive segments
-// - User-Agent: generic browser string (not "alphachat")
-// - TLS only (HTTPS)
-// - Single attempt, no retry (prevents timing analysis)
-// - Response validated by AES-GCM auth tag (tamper-proof)
-// - No log messages reveal purpose (silent success/failure)
-// - Cache dir uses opaque hex filename, no metadata sidecar
-//
-// What a network observer sees: HTTPS GET to CDN for a SHA-256 named blob.
-// Indistinguishable from any content-addressed storage fetch.
-
-// Sync endpoint, obfuscated against casual string extraction
-// Actual URL: https://d.alphachat.ai/d/{hash}
-// Stored as two parts to avoid a single searchable string
-static const char * _sync_host() {
-    static char h[64] = {};
-    if (!h[0]) { snprintf(h, sizeof(h), "%s.%s.%s", "d", "alphachat", "ai"); }
-    return h;
-}
+// Pack download (opt-in): with ALPHA_PACK_SYNC=1, a pack missing from the cache is fetched once from
+// https://d.alphachat.ai/d/{fingerprint_hex} over HTTPS, checked against its AES-GCM tag before it is kept, and the
+// fetch is logged. Without it the engine makes no network requests and uses packs already in the cache directory.
+static const char * k_sync_host = "d.alphachat.ai";
+static const char * k_user_agent = "alphallama";
 
 static bool _ensure_dir(const char * dir) {
 #ifdef _WIN32
@@ -685,12 +668,12 @@ static bool _ensure_dir(const char * dir) {
 #ifdef _WIN32
 
 static bool _http_fetch(const char * host, const char * path, const char * out_path) {
-    // WinHTTP: HTTPS GET with generic User-Agent
+    // WinHTTP: HTTPS GET
     wchar_t whost[128], wpath[256];
     MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 128);
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 256);
 
-    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    HINTERNET hSession = WinHttpOpen(L"alphallama", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
 
@@ -779,7 +762,7 @@ static bool _http_fetch(const char * host, const char * path, const char * out_p
 
     fn_setopt(ch, (CURLoption)CURLOPT_URL, url);
     fn_setopt(ch, (CURLoption)CURLOPT_WRITEDATA, fp);
-    fn_setopt(ch, (CURLoption)CURLOPT_USERAGENT, "Mozilla/5.0");
+    fn_setopt(ch, (CURLoption)CURLOPT_USERAGENT, k_user_agent);
     fn_setopt(ch, (CURLoption)CURLOPT_TIMEOUT, (long)30);
     fn_setopt(ch, (CURLoption)CURLOPT_CONNECTTIMEOUT, (long)15);
     fn_setopt(ch, (CURLoption)CURLOPT_FOLLOWLOCATION, (long)1);
@@ -805,7 +788,10 @@ bool apack_sync(const uint8_t fp[APACK_FP_SIZE]) {
     char path[512];
     if (apack_find_cached(fp, path, sizeof(path))) return true;
 
-    // Build opaque URL path: /d/{hash} (no extension, no descriptive segments)
+    // Network access is opt-in: without ALPHA_PACK_SYNC=1 only packs already in the cache are used.
+    const char * opt_in = getenv("ALPHA_PACK_SYNC");
+    if (!opt_in || atoi(opt_in) == 0) return false;
+
     char hex[65];
     apack_fingerprint_hex(fp, hex);
     char url_path[128];
@@ -821,9 +807,10 @@ bool apack_sync(const uint8_t fp[APACK_FP_SIZE]) {
     snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp", dir, hex);
     snprintf(path, sizeof(path), "%s/%s.apack", dir, hex);
 
-    // Single fetch attempt, no retry
-    bool fetched = _http_fetch(_sync_host(), url_path, tmp_path);
+    fprintf(stderr, "[pack] ALPHA_PACK_SYNC=1: fetching https://%s%s\n", k_sync_host, url_path);
+    bool fetched = _http_fetch(k_sync_host, url_path, tmp_path);
     if (!fetched) {
+        fprintf(stderr, "[pack] fetch failed; continuing without the pack\n");
         remove(tmp_path);
         return false;
     }
@@ -831,6 +818,7 @@ bool apack_sync(const uint8_t fp[APACK_FP_SIZE]) {
     // Validate: try to decrypt before accepting
     apack_contents test = apack_load(tmp_path, fp);
     if (!test.valid) {
+        fprintf(stderr, "[pack] the fetched pack failed its integrity check; discarded\n");
         remove(tmp_path); // corrupted or tampered
         return false;
     }

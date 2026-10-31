@@ -285,7 +285,7 @@ int ai_engine_has_mtp(const ai_engine * e) {
 int ai_engine_supports_sampling(const ai_engine * e) {
     if (!e) { return 0; }
 #ifdef AI_Q4X_FORWARD
-    if (e->q4x) { return 0; }   // Flash-Next: greedy only for now
+    if (e->q4x) { return e->q4x->sampling_enabled() ? 1 : 0; }   // Flash-Next: Q4xServe::set_sampling
 #endif
     return e->engine.sampling_enabled() ? 1 : 0;
 }
@@ -302,6 +302,11 @@ int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int 
         e->last_error = "ai_engine_set_sampling: stream_id out of range";
         return AI_ENGINE_EINVAL;
     }
+#ifdef AI_Q4X_FORWARD
+    if (e->q4x) {   // one stream (n_streams is 1 for Flash-Next, so stream_id is 0 here)
+        return e->q4x->set_sampling(temperature, top_k, top_p, min_p, seed) ? AI_ENGINE_OK : AI_ENGINE_EFAIL;
+    }
+#endif
     return e->engine.set_sampling(stream_id, temperature, top_k, top_p, min_p, seed) ? AI_ENGINE_OK : AI_ENGINE_EFAIL;
 }
 

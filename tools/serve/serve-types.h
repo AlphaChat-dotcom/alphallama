@@ -33,6 +33,7 @@ struct BatchRequest {
     std::vector<float>    samp_temp;   // temperature (<=0 => greedy argmax)
     std::vector<int32_t>  samp_top_k;  // 0 or >=vocab => no top-k cap; 1 => argmax
     std::vector<float>    samp_top_p;  // >=1 => no nucleus cap
+    std::vector<float>    samp_min_p;  // <=0 => off; keep tokens with p >= min_p * p_max
     std::vector<uint64_t> samp_rng;    // per-token RNG seed for this token (see samp_rng_base)
 
     // ALPHA_MTP: the seed schedule, not just this token's seed. MTP emits several tokens from one
@@ -77,6 +78,7 @@ struct BatchRequest {
         samp_temp.clear();
         samp_top_k.clear();
         samp_top_p.clear();
+        samp_min_p.clear();
         samp_rng.clear();
         samp_rng_base.clear();
         samp_n_gen.clear();
@@ -94,7 +96,7 @@ struct BatchRequest {
 
     void add_token(llama_token tok, llama_pos pos, int32_t seq_id, int slot_id, bool need_logits,
                    float temp = 0.0f, int32_t top_k = 1, float top_p = 1.0f, uint64_t rng = 0,
-                   uint64_t rng_base = 0, int32_t n_gen = 0, int32_t n_left = 0x7fffffff) {
+                   uint64_t rng_base = 0, int32_t n_gen = 0, int32_t n_left = 0x7fffffff, float min_p = 0.0f) {
         tokens.push_back(tok);
         positions.push_back(pos);
         seq_ids.push_back(seq_id);
@@ -103,6 +105,7 @@ struct BatchRequest {
         samp_temp.push_back(temp);
         samp_top_k.push_back(top_k);
         samp_top_p.push_back(top_p);
+        samp_min_p.push_back(min_p);
         samp_rng.push_back(rng);
         samp_rng_base.push_back(rng_base);
         samp_n_gen.push_back(n_gen);
@@ -160,6 +163,7 @@ struct InferenceRequest {
     float temperature = 0.7f;
     int   top_k = 40;
     float top_p = 0.95f;
+    float min_p = 0.0f;
     int   seed = -1;
     int   max_tokens = 200;
 

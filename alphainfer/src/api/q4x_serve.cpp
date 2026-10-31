@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "engine/draft_vocab.h"
+#include "kernels/kernels.h"
 #include "models/qwen4exp.h"
 #include "models/qwen4exp_run.h"
 #include "ops/ops.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <stdexcept>
 #include <string>
@@ -92,18 +94,33 @@ struct Q4xServe::Impl {
     std::vector<int32_t>         hist;        // prompt + every emitted token (the suffix copy's history)
     std::vector<float>           logits;
     std::vector<int32_t>         stop_ids;    // end-of-turn tokens: a decode round commits nothing past one
+    // [sampling] the stream's kern::SampleParams on the device (ops sample_into reads it) and its host copy; samp_on =
+    // temperature > 0. Greedy launches nothing extra: sample_into gets nullptr and the argmax stands, bit-identical.
+    int                          samp_buf = -1;
+    Tensor                       samp_dev;
+    kern::SampleParams           samp_host{};
+    bool                         samp_on = false;
 
-    int32_t argmax_row(const Tensor & lg, int64_t row) {
+    // pos: the position of the token this row picks (the sampler's Philox counter; unused when greedy)
+    int32_t argmax_row(const Tensor & lg, int64_t row, int64_t pos) {
         const Tensor r = lg.view(V, 1, 1, 1, (size_t) V * 4, (size_t) V * 4, (size_t) V * 4, (size_t) row * (size_t) V * 4);
-        return argmax_cols(r, 1)[0];
+        return argmax_cols(r, 1, pos)[0];
     }
 
-    // Greedy token of each of the T logit columns, reduced on the device (op::argmax, bit-exact with ties): T ids cross
-    // PCIe instead of T x n_vocab floats, and no host scan runs with the GPU idle each round.
-    // AI_Q4X_HOST_ARGMAX=1 downloads the logits and takes the argmax on the host instead (default 0).
-    std::vector<int32_t> argmax_cols(const Tensor & lg, int64_t T) {
+    // [AI_Q4X_HOST_ARGMAX=1: the old host path] greedy token of each of the T logit columns, reduced on the device
+    // (op::argmax, bit-exact with ties): T ids cross PCIe instead of T x 248320 floats (3 MB at T = 3) and the host
+    // argmax is gone -- that download + scan ran with the GPU idle every round (V: 21.1 ms of kernels in a 26 ms round)
+    // With sampling on, column c's token is drawn (op::sample_into) for position pos0 + c, still on the device.
+    std::vector<int32_t> argmax_cols(const Tensor & lg, int64_t T, int64_t pos0) {
         static const bool host = env_int("AI_Q4X_HOST_ARGMAX", 0) != 0;
         std::vector<int32_t> g((size_t) T);
+        if (samp_on) {
+            if (!lg.contiguous()) throw std::runtime_error("q4x sampling: the logits are not contiguous");
+            const Tensor idx = op::argmax(dev, lg);
+            op::sample_into(dev, lg, idx, T, 0, nullptr, pos0, samp_dev.data);
+            dev.download(idx, g.data(), 0, (size_t) T * 4);
+            return g;
+        }
         if (host || !lg.contiguous()) {
             logits.resize((size_t) (V * T));
             dev.download(lg, logits.data(), 0, logits.size() * 4);
@@ -299,6 +316,19 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
         if (env_int("AI_DRAFT_VOCAB", 1) != 0) m.vocab_cls = classify_gguf_tokens(m.prog.weights().get_str_array("tokenizer.ggml.tokens"));
     }
     m.dev.init_workspace(ws << 20);
+    // [sampling] one kern::SampleParams on the device for this stream (AI_SAMPLING=0: none, greedy only); all-greedy
+    if (env_int("AI_SAMPLING", 1) != 0) {
+        m.samp_buf = m.dev.alloc_buffer(256, "q4x.sample");
+        m.samp_dev.buf  = m.samp_buf;
+        m.samp_dev.type = I32;
+        m.samp_dev.ne[0] = (int64_t) (sizeof(kern::SampleParams) / 4);
+        set_contiguous_strides(m.samp_dev);
+        m.samp_dev.data = m.dev.buffer_base(m.samp_buf);
+        m.samp_host     = kern::SampleParams{};
+        m.samp_host.top_p = 1.0f;
+        m.dev.upload(m.samp_dev, &m.samp_host, 0, sizeof(m.samp_host));
+        m.dev.synchronize();
+    }
     fprintf(stderr, "[ai-api] q4x engine: 1 stream, ctx %lld, %d expert slots, workspace %zu MiB, %s; FAST decode "
                     "(not token-identical to plain decode)\n", (long long) m.ctx, slots, ws,
             !m.mtp ? "plain decode" : m.copy_min > 0 ? "MTP + suffix copy" : "MTP drafts");
@@ -347,7 +377,8 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
         int64_t                      common = 0;
         while (common < hn && common < n && h[(size_t) common] == tokens[common]) ++common;
         const int64_t ck = m.run->checkpoint_len();
-        if (ck > 0 && n == ck && common >= ck && ck_first_ >= 0 && m.run->restore_checkpoint()) {
+        // (greedy only: with sampling the first token is a fresh draw for this request's seed, so it is prefilled)
+        if (!m.samp_on && ck > 0 && n == ck && common >= ck && ck_first_ >= 0 && m.run->restore_checkpoint()) {
             // the same prompt again (a regenerate): its end state and its first token are the checkpoint's
             m.hist.assign(tokens, tokens + n);
             m.hist.push_back(ck_first_);
@@ -372,7 +403,7 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
         m.run->set_draft_rows(sel, rows);
     }
     const Tensor  lg    = m.run->prefill(tokens + start, n - start);
-    const int32_t first = m.argmax_row(lg, lg.ne[1] - 1);
+    const int32_t first = m.argmax_row(lg, lg.ne[1] - 1, m.run->position());   // the token after the prompt
     if (reuse) {   // the state at the end of this prompt: the rewind point of the next request
         m.run->checkpoint();
         ck_first_ = first;
@@ -403,7 +434,7 @@ int32_t Q4xServe::decode_plain(int32_t pending) {
     Impl & m = *p_;
     if (m.run->position() + 1 >= m.ctx) throw std::runtime_error("q4x decode: context full");
     const Tensor  lg  = m.run->decode(pending);
-    const int32_t tok = m.argmax_row(lg, 0);
+    const int32_t tok = m.argmax_row(lg, 0, m.run->position());   // pending is in the history: the next position
     m.hist.push_back(tok);
     return tok;
 }
@@ -442,7 +473,8 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     if ((int64_t) toks.size() > room) toks.resize((size_t) room);
     const int64_t T  = (int64_t) toks.size();
     const Tensor  lg = m.run->verify(toks.data(), T);
-    const std::vector<int32_t> gq = m.argmax_cols(lg, T);
+    // verify put the T rows in the history: column c picks the token at position (position() - T) + 1 + c
+    const std::vector<int32_t> gq = m.argmax_cols(lg, T, m.run->position() - T + 1);
     int64_t a = 0;
     for (; a < T; ++a) {
         const int32_t g = gq[(size_t) a];
@@ -469,6 +501,29 @@ void Q4xServe::reset() {
     // With AI_Q4X_PREFIX_REUSE the state is kept for the next prompt (prefill decides what of it to reuse); a stream is
     // still not decodable until that prefill
     if (env_int("AI_Q4X_PREFIX_REUSE", 1) == 0) p_->run->reset();
+}
+
+bool Q4xServe::sampling_enabled() const { return p_->samp_buf >= 0; }
+
+// Same normalisation as Engine::set_sampling. Stream-ordered on the compute stream (upload_async): the next prefill or
+// round reads it, one in flight does not. Call before the request's prefill (its first token is drawn there).
+bool Q4xServe::set_sampling(float temperature, int top_k, float top_p, float min_p, uint64_t seed) {
+    Impl & m = *p_;
+    if (m.samp_buf < 0) return !(temperature > 0.0f);
+    kern::SampleParams p{};
+    // as Engine::set_sampling: below 1e-6 greedy (1/T would overflow the scaled logits), above 1e4 capped (1/T = 0 is
+    // the kernel's greedy marker)
+    p.temperature = temperature >= 1e-6f ? std::min(temperature, 1e4f) : 0.0f;
+    p.top_k       = top_k > 0 ? top_k : 0;
+    p.top_p       = top_p > 0.0f && top_p < 1.0f ? top_p : 1.0f;
+    p.min_p       = min_p > 0.0f && min_p <= 1.0f ? min_p : 0.0f;
+    p.seed_lo     = (uint32_t) seed;
+    p.seed_hi     = (uint32_t) (seed >> 32);
+    m.samp_on     = p.temperature > 0.0f;
+    if (memcmp(&m.samp_host, &p, sizeof(p)) == 0) return true;
+    m.samp_host = p;
+    m.dev.upload_async(m.samp_dev, &m.samp_host, 0, sizeof(p));
+    return true;
 }
 
 }  // namespace ai
