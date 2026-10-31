@@ -949,8 +949,8 @@ smallm_a16_q8_0(const char * __restrict__ W, int64_t row_bytes, int64_t rows, co
     }
 }
 
-// [ALPHA_SMALLM_A16=1, with ALPHA_SMALLM_TC & 16] q6_K x f16-activation tensor-core GEMV for 1..8 columns ("K3",
-// plan 2026-10-18): the 35B LM head (248320 x 2048 Q6_K). On an RTX 5090: the verify head costs 269 us/round at 1
+// [ALPHA_SMALLM_A16=1, with ALPHA_SMALLM_TC & 16] q6_K x f16-activation tensor-core GEMV for 1..8 columns:
+// the 35B LM head (248320 x 2048 Q6_K). On an RTX 5090: the verify head costs 269 us/round at 1
 // column and 462 at 4, NInfer's q6_a16 MMA 252. Same discipline as smallm_a16_q8_0:
 //  * one mma.m16n8k16 per 16-value scale group, so the group's int8 scale applies once, in the f32 epilogue:
 //    acc = fma(d * sc, group_dot, acc) in fixed group order (q x sc reaches 4096, beyond f16's exact range);
@@ -1461,7 +1461,7 @@ smallm_a16k2(const char * __restrict__ W, int64_t row_bytes, int64_t rows, const
     }
 }
 
-// [ALPHA_SMALLM_STUB=1] DELETION BOUND (rental A, plan 2026-10-18): reads every weight byte with 16-byte loads and
+// [ALPHA_SMALLM_STUB=1] DELETION BOUND: reads every weight byte with 16-byte loads and
 // writes a finite garbage result, in ONE launch and with no activation quantisation -- the in-engine floor any
 // dense kernel of this shape could reach. Output is WRONG by design: time it, never use its text.
 __global__ void __launch_bounds__(256)

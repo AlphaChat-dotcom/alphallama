@@ -9,7 +9,7 @@
 //   3. Cache size optimization (how many slots needed for target hit rate)
 //
 // Profiles are generated from calibration data (offline) and stored
-// locally at ~/.alpha-mole/profiles/ or fetched from Platform KB.
+// as local profile files.
 //
 // Generic: works for any MoE model, any expert count, any top-K.
 
