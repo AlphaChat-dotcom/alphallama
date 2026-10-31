@@ -30,8 +30,10 @@ first; we merge from upstream regularly.
 
 ## Developer Certificate of Origin
 
-Contributions are accepted under the license of the files they change: the MIT License, or the Apache License 2.0
-for the parts listed in [NOTICE](NOTICE) (their files carry an SPDX header). Each commit must be signed off to certify the
+Contributions are accepted under the Apache License 2.0 (section 5 of [LICENSE](LICENSE); no separate contributor
+agreement). Changes to files that come from llama.cpp / ggml are accepted under the MIT License with the rest of
+those files, so they can go back upstream ([NOTICE](NOTICE) has the details). New source files should start with
+`// SPDX-License-Identifier: Apache-2.0`. Each commit must be signed off to certify the
 [Developer Certificate of Origin](https://developercertificate.org/):
 
 ```sh

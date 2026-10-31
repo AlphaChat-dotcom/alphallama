@@ -222,7 +222,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
 
     description = "Inference of LLaMA model in pure C/C++${descriptionSuffix}";
     homepage = "https://github.com/ggml-org/llama.cpp/";
-    license = lib.licenses.mit;
+    license = with lib.licenses; [ asl20 mit ];   # Apache-2.0 project; files from llama.cpp / ggml stay MIT
 
     # Accommodates `nix run` and `lib.getExe`
     mainProgram = "llama-cli";

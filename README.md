@@ -83,7 +83,6 @@ the MIT License; see [NOTICE](NOTICE). Documentation in [docs/](docs) is llama.c
 
 ## License
 
-MIT License, see [LICENSE](LICENSE), except the AlphaInfer engine ([alphainfer/](alphainfer)), the AlphaServe
-server ([tools/serve/](tools/serve)) and the fused-infer expert-offload code, which are Apache License 2.0. The
-exact file list is in [NOTICE](NOTICE). Third-party code and licenses are listed in [NOTICE](NOTICE) and
-[licenses/](licenses).
+Apache License 2.0, see [LICENSE](LICENSE). Files that come from llama.cpp / ggml keep the MIT License, including
+our changes to them, so fixes there can go back upstream. Third-party code and licenses are listed in
+[NOTICE](NOTICE) and [licenses/](licenses).

@@ -1,9 +1,16 @@
 AlphaLlama
 Copyright 2026 The AlphaLlama authors
 
-This product is licensed under the MIT License (see LICENSE), except for the parts below, which are
-licensed under the Apache License, Version 2.0 (see licenses/LICENSE-apache-2.0). Each of their source
-files carries an "SPDX-License-Identifier: Apache-2.0" header.
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Files that come from llama.cpp / ggml, and the other third-party code listed below, keep their own
+licenses. In particular every file that originates from llama.cpp or ggml stays under the MIT License,
+including the changes we made to it (for example the fused-infer code inside ggml-cuda.cu and mmvq.cu),
+so those changes can go back upstream unchanged. Our changes to MIT files are covered by
+licenses/LICENSE-mit (Copyright (c) 2026 The AlphaLlama authors).
+
+Our own engine code is Apache-2.0. Most of it carries an "SPDX-License-Identifier: Apache-2.0" header,
+among it:
 
 - alphainfer/                  the AlphaInfer engine, including AlphaInfer 2 (the Qwen3.8 Flash-Next
                                engine with expert offload v2: src/models/qwen4exp*, src/kernels/q4x_*,
@@ -13,9 +20,6 @@ files carries an "SPDX-License-Identifier: Apache-2.0" header.
   moe-down9.cu, moe-down9.cuh  fused-infer expert offload kernels
 - src/alpha_expert_cache.*, src/alpha_moe_optimizer*, src/alpha_expert_stacker.*,
   src/alpha_hw_planner.*       fused-infer expert cache, offload planning and hardware detection
-
-Fused-infer code that lives inside files from llama.cpp / ggml (for example ggml-cuda.cu, mmvq.cu)
-stays under the MIT License with the rest of those files.
 
 It is a fork of llama.cpp and ggml and includes or adapts code from the projects below. Their
 license texts are in licenses/.
@@ -32,7 +36,7 @@ license texts are in licenses/.
 
 - Marlin (IST-DASLab, as modified in vLLM / Neural Magic), Apache License 2.0.
   tools/serve/marlin/ and tools/serve/serve-marlin.cu keep their Apache-2.0 headers.
-  See licenses/LICENSE-apache-2.0.
+  See LICENSE.
 
 - NInfer. The shape of the MoE down-projection kernel in ggml/src/ggml-cuda/moe-down9.cu
   follows its kernels; the code is original.
