@@ -211,7 +211,7 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
-# Alpha-MoLE tests
+# AlphaLlama tests
 llama_build(test-alpha-mole.cpp)
 target_include_directories(test-alpha-mole PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-alpha-mole)

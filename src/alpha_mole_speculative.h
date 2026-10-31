@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Speculative Execution with Verified Rollback
+// AlphaLlama: Speculative Execution with Verified Rollback
 //
 // Implements speculate -> verify -> rollback for MoE expert cache.
 //

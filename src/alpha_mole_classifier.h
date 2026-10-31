@@ -1,5 +1,5 @@
 #pragma once
-// Alpha-MoLE: Hybrid prompt type classifier
+// AlphaLlama: Hybrid prompt type classifier
 // 1. Fast keyword scan (0ms) - catches obvious domain matches
 // 2. 0.8B model fallback (~130ms) - semantic understanding for ambiguous prompts
 //

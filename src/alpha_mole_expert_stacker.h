@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Alpha-MoLE: Per-Expert Tensor Stacker
+// AlphaLlama: Per-Expert Tensor Stacker
 //
 // Some GGUF converters (antirez V4, some HuggingFace tools) store MoE experts
 // as individual tensors (ffn.experts.0.w1, ffn.experts.1.w1, ...) instead of

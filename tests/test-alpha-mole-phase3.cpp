@@ -1,4 +1,4 @@
-// Alpha-MoLE Phase 2-3 Tests
+// AlphaLlama Phase 2-3 Tests
 //
 // Targets:
 // - ggml compute graph router (alpha_mole_graph.h/.cpp)
@@ -6,7 +6,7 @@
 // - LoRA dispatch graph construction
 // - Hardening validations (F32 check, 2D check, bias validation, top_k clamp)
 // - Python conversion script round-trip (GGUF written by Python, loaded by C++)
-// - MoLE llama model builder compilation verification
+// - LoRA-mixture llama model builder compilation verification
 //
 // Build:
 //   cmake --build build --config Release --target test-alpha-mole-phase3

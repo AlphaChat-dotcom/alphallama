@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Mixture of LoRA Experts
+// AlphaLlama: Mixture of LoRA Experts
 // Per-token LoRA routing for llama.cpp
 
 #include "llama.h"
@@ -47,14 +47,14 @@ struct alpha_mole_routing_info {
     struct alpha_mole_token_route * routes;                         // array of n_tokens entries
 };
 
-// Initialize MoLE context with base model context + LoRA adapters + optional router
+// Initialize LoRA-mixture context with base model context + LoRA adapters + optional router
 // Returns NULL on failure
 LLAMA_API struct alpha_mole_context * alpha_mole_init(
         struct llama_model   * model,
         struct llama_context * ctx,
         struct alpha_mole_params params);
 
-// Decode a batch with MoLE routing
+// Decode a batch with LoRA-mixture routing
 // In dynamic routing mode: routes each token to top-K LoRAs
 // In static mode: applies fixed-weight LoRA blend
 // Returns 0 on success, negative on error
@@ -79,7 +79,7 @@ LLAMA_API enum alpha_mole_strategy alpha_mole_get_strategy(
 // Get strategy name as string
 LLAMA_API const char * alpha_mole_strategy_name(enum alpha_mole_strategy s);
 
-// Free MoLE context (does not free the underlying llama_context or model)
+// Free LoRA-mixture context (does not free the underlying llama_context or model)
 LLAMA_API void alpha_mole_free(struct alpha_mole_context * mctx);
 
 #ifdef __cplusplus

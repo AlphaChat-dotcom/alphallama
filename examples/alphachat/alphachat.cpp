@@ -8,7 +8,7 @@
 #endif
 #endif
 
-// AlphaChat CLI - wraps Alpha Engine (MoLE)
+// AlphaChat CLI - wraps the AlphaLlama engine
 //
 // Ollama-compatible commands + training, benchmarking, provider mode.
 //

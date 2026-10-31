@@ -873,7 +873,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     // arch-specific KVs
     switch (arch) {
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_MOLE_LLAMA: // Alpha-MoLE: same weight format as llama
+        case LLM_ARCH_MOLE_LLAMA: // AlphaLlama: same weight format as llama
         case LLM_ARCH_LLAMA_EMBED:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3315,7 +3315,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
 
-            // Alpha-MoLE: backbone/expert separation for MoE models
+            // AlphaLlama: backbone/expert separation for MoE models
             // Backbone (attention, norms, shared expert) -> GPU for all layers
             // Routed expert tensors ("exps" in name) -> CPU (staged by optimizer)
             if (params.force_experts_gpu && tn.bid >= 0 && !pimpl->gpu_buft_list.empty()) {
@@ -3368,7 +3368,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         switch (arch) {
             case LLM_ARCH_LLAMA:
-            case LLM_ARCH_MOLE_LLAMA: // Alpha-MoLE: same tensors as llama
+            case LLM_ARCH_MOLE_LLAMA: // AlphaLlama: same tensors as llama
             case LLM_ARCH_REFACT:
             case LLM_ARCH_MINICPM:
             case LLM_ARCH_GRANITE:
@@ -9323,7 +9323,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_MOLE_LLAMA:
             {
-                // Alpha-MoLE: uses MoLE-aware graph builder with per-token LoRA routing
+                // AlphaLlama: uses LoRA-mixture-aware graph builder with per-token LoRA routing
                 llm = std::make_unique<llm_build_mole_llama>(*this, params);
             } break;
         case LLM_ARCH_LLAMA4:

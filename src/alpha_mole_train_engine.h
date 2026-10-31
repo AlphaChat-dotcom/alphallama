@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Exact-Gradient LoRA Training Engine
+// AlphaLlama: Exact-Gradient LoRA Training Engine
 //
 // Trains LoRA on models much larger than VRAM.
 // - Layer streaming: only 2 layers in GPU at once (double-buffered)

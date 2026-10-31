@@ -894,8 +894,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * expert_remap = nullptr, // Alpha-MoLE: gate/up cache IDs
-             ggml_tensor * expert_remap_down = nullptr, // Alpha-MoLE: down cache IDs (tiered)
+             ggml_tensor * expert_remap = nullptr, // AlphaLlama: gate/up cache IDs
+             ggml_tensor * expert_remap_down = nullptr, // AlphaLlama: down cache IDs (tiered)
              ggml_tensor * forced_experts = nullptr) const; // DeepSeek V4 hash routing: override selection
 
     ggml_tensor * build_moe_ffn(
@@ -922,8 +922,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * expert_remap = nullptr, // Alpha-MoLE: gate/up cache IDs
-             ggml_tensor * expert_remap_down = nullptr, // Alpha-MoLE: down cache IDs (tiered)
+             ggml_tensor * expert_remap = nullptr, // AlphaLlama: gate/up cache IDs
+             ggml_tensor * expert_remap_down = nullptr, // AlphaLlama: down cache IDs (tiered)
              ggml_tensor * forced_experts = nullptr) const; // DeepSeek V4 hash routing: override selection
 
     //

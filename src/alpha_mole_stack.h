@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: LoRA weight stacking for ggml_mul_mat_id dispatch
+// AlphaLlama: LoRA weight stacking for ggml_mul_mat_id dispatch
 //
 // Pre-stacks all LoRA A and B matrices for each target weight tensor
 // into contiguous 3D tensors. Required by ggml_mul_mat_id for per-token

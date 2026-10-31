@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Router MLP implementation
+// AlphaLlama: Router MLP implementation
 
 #include "llama.h"
 

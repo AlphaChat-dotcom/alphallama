@@ -53,7 +53,7 @@
 extern "C" void marlin_hook_enable();
 extern "C" void marlin_reset_locks(void *);
 
-// Alpha-MoLE: persistent expert cache for GPU-accelerated MoE offloading
+// AlphaLlama: persistent expert cache for GPU-accelerated MoE offloading
 typedef bool   (*ggml_expert_pcache_fn_t)(void*, void*, const void*, size_t, int64_t, int64_t, size_t);
 typedef void   (*ggml_expert_pcache_flush_fn_t)(void*);
 typedef void * (*ggml_expert_pcache_redirect_fn_t)(void*, void*);

@@ -889,7 +889,7 @@ enum llm_arch llama_model_loader::get_arch() const {
     return llm_kv.arch;
 }
 
-// Alpha-MoLE: tensor name aliases for cross-converter compatibility.
+// AlphaLlama: tensor name aliases for cross-converter compatibility.
 // Different GGUF converters produce different names for the same tensor.
 // Try the primary name first, then fall back to aliases.
 static const std::vector<std::pair<std::string, std::string>> tensor_name_aliases = {
@@ -1013,7 +1013,7 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
             }
         }
 
-        // Alpha-MoLE: per-expert tensor handling.
+        // AlphaLlama: per-expert tensor handling.
         // When expecting stacked [dim1, dim2, n_expert] but found single [dim1, dim2]
         // (per-expert layout from antirez-style converters), accept if first 2 dims match.
         // The stacking from individual expert tensors is handled during data loading.

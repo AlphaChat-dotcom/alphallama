@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Alpha-MoLE: Internal MoE optimizer structures
+// AlphaLlama: Internal MoE optimizer structures
 //
 // Shared between alpha_mole_moe_optimizer.cpp and alpha_mole_speculative.cpp.
 // Not part of the public API - these are implementation details.

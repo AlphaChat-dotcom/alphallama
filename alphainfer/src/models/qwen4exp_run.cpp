@@ -888,7 +888,7 @@ void Qwen4ExpRun::init_doorbell(int slots) {
             // the launch thread owns its physical core. [AI_Q4X_RESERVE_CORES] it is pinned at its first decode or
             // prefill call (pin_launch_thread), not here: in a server the thread that builds the engine is not the one
             // that decodes, and pinning the builder while the decoder was confined with ~38 other server threads onto
-            // the launch core lost ~1/3 of decode (4080 AlphaServe 2026-10-28, MoLE: set A 71.9 vs ai-api-gen 110.3)
+            // the launch core lost ~1/3 of decode (RTX 4080, AlphaServe: set A 71.9 vs ai-api-gen 110.3 tok/s)
             launch_cpus_ = plan.launch;
             host_cpus_   = plan.host;
             if (plan.host.empty()) offload::pin_this_thread(plan.launch);   // the old rule

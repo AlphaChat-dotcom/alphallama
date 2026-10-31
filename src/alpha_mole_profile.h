@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Expert Profile System
+// AlphaLlama: Expert Profile System
 //
 // Manages expert activation profiles for MoE models. Profiles contain
 // per-layer hot expert lists, enabling:

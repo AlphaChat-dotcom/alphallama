@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Smart KV Paging
+// AlphaLlama: Smart KV Paging
 //
 // Extends effective context beyond VRAM by paging cold KV entries to CPU RAM.
 // Uses a compressed attention index for fast approximate scoring to identify

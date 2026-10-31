@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: paged expert cache
+// AlphaLlama: paged expert cache
 //
 // Splits MoE expert weight matrices into fixed-size pages (default 64KB).
 // Benefits over full-expert caching:

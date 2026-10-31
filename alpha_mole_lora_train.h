@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Native LoRA Training
+// AlphaLlama: Native LoRA Training
 //
 // Bypasses ggml's broken build_backward_expand (upstream issue #18805).
 // Uses MeZO (Memory-efficient Zeroth-Order) optimization:

@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Hardware auto-detection and configuration
+// AlphaLlama: Hardware auto-detection and configuration
 //
 // Detects GPU type, VRAM, system RAM, and automatically configures:
 // - n_gpu_layers: how many layers to offload

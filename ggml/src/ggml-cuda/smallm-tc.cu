@@ -737,7 +737,7 @@ __global__ void smallm_tc_reduce(const float * __restrict__ part, int nsplit, in
 
 // ALPHA_SMALLM_TC: 0 off; 1 = all; or a bitmask with 2 = q4_K, 4 = q5_K, 8 = iq4_xs, 16 = q6_K, 32 = q8_0 to A/B per type
 // [ALPHA_SMALLM_A16=1, with ALPHA_SMALLM_TC & 32] q8_0 x f16-activation tensor-core GEMV for 1..8 columns ("K2", plan
-// 2026-10-18). Rental 7 (5090): our verify round at full width (4 columns) is 4764 us vs NInfer's 4234; the dense
+// 2026-10-18). On an RTX 5090: our verify round at full width (4 columns) is 4764 us vs NInfer's 4234; the dense
 // Q8_0 MMVQ grows 1239 -> 1644 us/round from 1 to 4 columns, while NInfer's q8_a16 MMA is flat in M.
 //  * ONE launch. Activations are read as the f32 src1 and converted to f16 in registers: no quantize_q8_1 launch
 //    (125 us/round on the 5090) and no int8 activation error (f16 keeps 11 mantissa bits vs q8_1's 8).
@@ -950,7 +950,7 @@ smallm_a16_q8_0(const char * __restrict__ W, int64_t row_bytes, int64_t rows, co
 }
 
 // [ALPHA_SMALLM_A16=1, with ALPHA_SMALLM_TC & 16] q6_K x f16-activation tensor-core GEMV for 1..8 columns ("K3",
-// plan 2026-10-18): the 35B LM head (248320 x 2048 Q6_K). Rental 7 (5090): the verify head costs 269 us/round at 1
+// plan 2026-10-18): the 35B LM head (248320 x 2048 Q6_K). On an RTX 5090: the verify head costs 269 us/round at 1
 // column and 462 at 4, NInfer's q6_a16 MMA 252. Same discipline as smallm_a16_q8_0:
 //  * one mma.m16n8k16 per 16-value scale group, so the group's int8 scale applies once, in the f32 epilogue:
 //    acc = fma(d * sc, group_dot, acc) in fixed group order (q x sc reaches 4096, beyond f16's exact range);

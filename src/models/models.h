@@ -6,7 +6,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 
-struct alpha_mole_graph_router; // forward declaration for MoLE
+struct alpha_mole_graph_router; // forward declaration for LoRA-mixture
 
 //
 // base classes
@@ -435,7 +435,7 @@ struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params);
 };
 
-// Alpha-MoLE: llama with per-token LoRA routing
+// AlphaLlama: llama with per-token LoRA routing
 struct llm_build_mole_llama : public llm_graph_context {
     llm_build_mole_llama(const llama_model & model, const llm_graph_params & params);
     static const struct alpha_mole_graph_router * mole_router;

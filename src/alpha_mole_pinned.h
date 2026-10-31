@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Pinned Memory Registration
+// AlphaLlama: Pinned Memory Registration
 //
 // Registers CPU-resident model weight buffers as pinned (page-locked) memory.
 // This enables faster DMA transfers between CPU and GPU (~24% speedup).

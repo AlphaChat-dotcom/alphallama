@@ -1,4 +1,4 @@
-// Alpha-MoLE Challenging QA Tests
+// AlphaLlama Challenging QA Tests
 //
 // Goes beyond the 8 basic tests. Targets:
 // - Numerical edge cases (NaN, Inf, denormals, underflow)

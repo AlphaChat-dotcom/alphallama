@@ -776,7 +776,7 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
-// Alpha-MoLE: access to Q2_K multi-r values (defined in ggml-quants.c)
+// AlphaLlama: access to Q2_K multi-r values (defined in ggml-quants.c)
 extern void ggml_q2k_get_r_values(float r[4]);
 
 // Select r bin from per-sub-group scale and min
@@ -881,7 +881,7 @@ void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
-// Alpha-MoLE: access to Q3_K/Q4_K multi-r values (defined in ggml-quants.c)
+// AlphaLlama: access to Q3_K/Q4_K multi-r values (defined in ggml-quants.c)
 extern void ggml_q3k_get_r_values(float r[4]);
 extern void ggml_q4k_get_r_values(float r[4]);
 

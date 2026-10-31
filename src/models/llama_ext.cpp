@@ -1,4 +1,4 @@
-// Alpha-MoLE Llama model builder
+// AlphaLlama Llama model builder
 // Based on src/models/llama.cpp with per-token LoRA routing added
 // Upstream base: llama.cpp b8840
 //
@@ -48,12 +48,12 @@ llm_build_mole_llama::llm_build_mole_llama(const llama_model & model, const llm_
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // === MoLE: Compute per-token routing decisions for this layer ===
+        // === LoRA-mixture: Compute per-token routing decisions for this layer ===
         alpha_mole_route_tensors layer_route = {};
         if (mole_router) {
             layer_route = alpha_mole_build_router_graph(ctx0, mole_router, cur);
         }
-        // === End MoLE routing ===
+        // === End LoRA-mixture routing ===
 
         // self-attention
         {

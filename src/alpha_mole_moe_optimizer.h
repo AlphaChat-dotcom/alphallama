@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Alpha-MoLE: MoE Optimizer
+// AlphaLlama: MoE Optimizer
 //
 // Integrates expert LRU cache with llama.cpp's MoE execution.
 // Uses the eval callback to observe expert routing decisions and

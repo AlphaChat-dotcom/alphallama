@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: 3-Tier Memory Pipeline for Training
+// AlphaLlama: 3-Tier Memory Pipeline for Training
 //
 // Tier 0: GPU VRAM - 2 layer compute buffers (double-buffered) + LoRA + gradients
 // Tier 1: CPU RAM - full model (mmap), activation checkpoints, Adam states

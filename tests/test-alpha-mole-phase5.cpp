@@ -1,4 +1,4 @@
-// Alpha-MoLE Phase 5 — QA Challenging Tests
+// AlphaLlama Phase 5 — QA Challenging Tests
 //
 // Tests LoRA weight stacking edge cases, architecture registration verification,
 // and CLI validation beyond the dev's test cases.

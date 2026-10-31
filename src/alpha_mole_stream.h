@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Layer Streaming
+// AlphaLlama: Layer Streaming
 //
 // When a model barely exceeds VRAM, streaming trades context length for
 // more GPU layers. Instead of running layers on CPU (slow), we maximize

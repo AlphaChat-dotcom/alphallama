@@ -1,4 +1,4 @@
-// Alpha-MoLE Bug Fix Verification Tests
+// AlphaLlama Bug Fix Verification Tests
 //
 // Verifies the P1 fix: graph router top_k clamping to n_loras.
 // 15 test cases across 4 groups:

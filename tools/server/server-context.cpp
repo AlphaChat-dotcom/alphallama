@@ -31,7 +31,7 @@
 #include <regex>
 #include <chrono>   // auto-ingest phase profiling (ALPHA_INGEST_PROFILE)
 
-// Alpha-MoLE: MoE optimization for server mode
+// AlphaLlama: MoE optimization for server mode
 #include "../../src/alpha_mole_moe_optimizer.h"
 #include "../../src/alpha_mole_speculative.h"
 #include "../../src/alpha_moe_portfolio.h"
@@ -1742,7 +1742,7 @@ private:
 
     llama_model_ptr model_dft;
 
-    // Alpha-MoLE: MoE optimization state
+    // AlphaLlama: MoE optimization state
     alpha_moe_optimizer * moe_opt = nullptr;
     alpha_moe_profile moe_portfolio = {};
     bool moe_lut_active = false;
@@ -1813,7 +1813,7 @@ private:
     bool sleeping = false;
 
     void destroy() {
-        // Alpha-MoLE cleanup
+        // AlphaLlama cleanup
         if (moe_opt) {
             alpha_moe_optimizer_free(moe_opt);
             moe_opt = nullptr;
@@ -2547,7 +2547,7 @@ private:
             }
         }
 
-        // Alpha-MoLE: Initialize MoE optimizer for expert cache + LUT-direct
+        // AlphaLlama: Initialize MoE optimizer for expert cache + LUT-direct
         // Skip init if already done via moe_direct_load path (expert cache allocated early)
         {
             alpha_hw_plan hw = alpha_hw_plan_create(params_base.model.path.c_str(), -1);
@@ -6092,7 +6092,7 @@ private:
 
         int32_t i_next = 0;
 
-        // Alpha-MoLE: if somehow still in draft mode during multi-token prompt,
+        // AlphaLlama: if somehow still in draft mode during multi-token prompt,
         // exit it. This should rarely happen now - pin_domain_experts exits draft
         // immediately to avoid the topology change that caused ~134 MiB/req leak.
         // Safety net only.
@@ -6266,7 +6266,7 @@ private:
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
 
-            // Alpha-MoLE: Per-token cache warming during cpu-moe prefill.
+            // AlphaLlama: Per-token cache warming during cpu-moe prefill.
             // After each decode, load fired experts into cache via reload_from_argsort.
             // This progressively warms the cache with prompt-specific experts,
             // replacing tiling (24s) with per-token DMA (~2s total).
@@ -6293,7 +6293,7 @@ private:
                 }
             }
 
-            // Alpha-MoLE: Per-token progressive cache warming during LUT prefill.
+            // AlphaLlama: Per-token progressive cache warming during LUT prefill.
             // After each ubatch decode, check if the token had high miss rate.
             // If so, re-decode with cpu-moe and load actual experts into cache.
             if (moe_opt) {
@@ -6398,7 +6398,7 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
-                    // Alpha-MoLE: LUT prefill quality check + auto-repair
+                    // AlphaLlama: LUT prefill quality check + auto-repair
                     // After LUT prefill, check if expert coverage was sufficient.
                     // If bad tokens found, re-prefill from that position with cpu-moe.
                     // Reset prefill mode + topk when entering generation
@@ -6407,7 +6407,7 @@ private:
                             slot.moe_lut_prefill = false;
                             alpha_moe_optimizer_set_lut_prefill(moe_opt, false);
                         }
-                        // Alpha-MoLE expert-skip probe: ALPHA_GEN_TOPK=K forces
+                        // AlphaLlama expert-skip probe: ALPHA_GEN_TOPK=K forces
                         // generation-time top-K (drop lowest-weight experts + renorm via
                         // the standard norm_w path). 0/unset = model default (unchanged).
                         // The model builders ignore values >= n_expert_used, so no clamp.
@@ -6463,7 +6463,7 @@ private:
                         // LUT prefill passed QC - topk already reset above
                     }
 
-                    // Alpha-MoLE: portfolio-driven warmup after prompt processing
+                    // AlphaLlama: portfolio-driven warmup after prompt processing
                     // Skip for ALL_GPU models (K=0, all experts on GPU - no cache to warm)
                     // Skip for cpu_moe requests (repair pass - keep cache disabled, use all experts)
                     if (g_cpu_moe_active && moe_opt) {

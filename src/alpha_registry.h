@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Runtime Registry
+// AlphaLlama: Runtime Registry
 //
 // Extends compiled-in architecture support with a JSON registry file
 // at ~/.alphachat/registry.json. Allows adding new tensor aliases,

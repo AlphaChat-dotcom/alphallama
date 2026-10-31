@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Novel Layer Training Support
+// AlphaLlama: Novel Layer Training Support
 //
 // Enables training of custom/novel layer types using only a forward function.
 // No backward derivation needed - the system selects the strategy automatically:

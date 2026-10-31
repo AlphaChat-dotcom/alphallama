@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Alpha-MoLE: Expert LRU Cache for MoE Models
+// AlphaLlama: Expert LRU Cache for MoE Models
 //
 // MoE models (Qwen3.5-122B) have 64 experts per layer but only activate 4.
 // Loading all experts from CPU per token wastes bandwidth. This cache keeps

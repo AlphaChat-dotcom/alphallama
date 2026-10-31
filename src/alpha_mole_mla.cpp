@@ -1,4 +1,4 @@
-// Alpha-MoLE: MLA (Multi-head Latent Attention) graph builder
+// AlphaLlama: MLA (Multi-head Latent Attention) graph builder
 // This file contains the MLA attention path for DeepSeek V2/V3/V4 models.
 // To be integrated into the deepseek2 model builder (src/models/deepseek2.cpp)
 // or equivalent graph building code.

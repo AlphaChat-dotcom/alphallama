@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Graph-based router and per-token LoRA dispatch
+// AlphaLlama: Graph-based router and per-token LoRA dispatch
 // Uses ggml compute graph ops for GPU-accelerated routing
 
 #include "llama.h"
@@ -45,7 +45,7 @@ LLAMA_API alpha_mole_route_tensors alpha_mole_build_router_graph(
         ggml_tensor               * hidden);
 
 // Build per-token multi-LoRA application using ggml_mul_mat_id
-// Replaces build_lora_mm for MoLE mode
+// Replaces build_lora_mm for LoRA-mixture mode
 // base_result: output of base matmul (w @ cur)
 // cur:         input tensor
 // stacked:     pre-stacked LoRA A/B matrices

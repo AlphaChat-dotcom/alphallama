@@ -1615,7 +1615,7 @@ static void quantize_row_q2_K_impl(const float * GGML_RESTRICT x, block_q2_K * G
     }
 }
 
-// Alpha-MoLE: Calibrate optimal r values for Q2_K non-uniform reconstruction
+// AlphaLlama: Calibrate optimal r values for Q2_K non-uniform reconstruction
 // Call after initial quantization to find best r per dmin/d bin
 void ggml_q2k_calibrate_r(const float * src_data, const block_q2_K * blocks,
                            int64_t n_blocks, int64_t n_per_row, float r_out[4]) {

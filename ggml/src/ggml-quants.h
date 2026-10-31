@@ -13,7 +13,7 @@ extern "C" {
 
 // NOTE: these functions are defined as GGML_API because they used by the CPU backend
 
-// Alpha-MoLE: K-quant non-uniform reconstruction levels (multi-r)
+// AlphaLlama: K-quant non-uniform reconstruction levels (multi-r)
 GGML_API void ggml_q2k_set_r_values(const float r[4]);
 GGML_API void ggml_q2k_get_r_values(float r[4]);
 GGML_API void ggml_q3k_set_r_values(const float r[4]);
@@ -23,7 +23,7 @@ GGML_API void ggml_q4k_get_r_values(float r[4]);
 GGML_API void ggml_q2k_calibrate_r(const float * src_data, const block_q2_K * blocks,
                                      int64_t n_blocks, int64_t n_per_row, float r_out[4]);
 
-// Alpha-MoLE: DSQ series shift r (global center offset)
+// AlphaLlama: DSQ series shift r (global center offset)
 GGML_API void ggml_dsq_set_shift_r(const float r[4]);
 GGML_API void ggml_dsq_get_shift_r(float r[4]);
 

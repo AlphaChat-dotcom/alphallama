@@ -13,7 +13,7 @@
 enum llm_arch {
     LLM_ARCH_CLIP,
     LLM_ARCH_LLAMA,
-    LLM_ARCH_MOLE_LLAMA, // Alpha-MoLE: llama with per-token LoRA routing
+    LLM_ARCH_MOLE_LLAMA, // AlphaLlama: llama with per-token LoRA routing
     LLM_ARCH_LLAMA4,
     LLM_ARCH_DECI,
     LLM_ARCH_FALCON,

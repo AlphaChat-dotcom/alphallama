@@ -1,6 +1,6 @@
 #pragma once
 
-// Alpha-MoLE: Layer Pipeline Manager
+// AlphaLlama: Layer Pipeline Manager
 //
 // Enhances llama.cpp's partial offload for optimal large model inference.
 //
