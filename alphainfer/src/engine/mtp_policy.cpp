@@ -96,11 +96,13 @@ bool apply_mtp_policy(EngineConfig & cfg, int mode) {
     // prefill's last chunk (prompt length mod chunk in 2..16) and in multi-stream rounds; without them plain and
     // exact diverge from the first decoded position. Single-stream decode (M = 1) is unaffected.
     // AI_PLAIN_EXACT=0 disables.
-    // Dense models take them too on Blackwell (cc >= 12), where the exact verify takes the pins below
-    // (ALPHA_FA_BI_PB among them). On sm_86 the dense plain path already matches exact without them.
+    // Dense models take them too from Ada on (cc >= 8.9; on Blackwell the exact verify also takes the pins below,
+    // ALPHA_FA_BI_PB among them). On sm_86 the dense plain path already matches exact without them; on sm_89 it does
+    // not: a plain prefill's last chunk of 2..16 rows ran another attention geometry than the exact verify, and the
+    // 27B diverged from exact at a near-tie on 1 prompt of 25 (identical with the pins, same plain speed).
     const bool plain_exact = cfg.mtp_k == 0 && cfg.expert_slots == 0 && cfg.dflash2_path.empty() &&
                              !(getenv("AI_PLAIN_EXACT") && atoi(getenv("AI_PLAIN_EXACT")) == 0) &&
-                             (!gguf_is_dense(cfg.model_path) || kern::device_cc_major() >= 12);
+                             (!gguf_is_dense(cfg.model_path) || kern::device_cc() >= 89);
     if (plain_exact) {
         setenv("ALPHA_FA_BI_MAXQ", "16", 0);
         setenv("ALPHA_MMVF_BI_MAXQ", "16", 0);

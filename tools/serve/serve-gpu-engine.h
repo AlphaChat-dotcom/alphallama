@@ -15,7 +15,7 @@
 
 #include <functional>
 #include "serve-types.h"
-#include "alpha_mole_speculative.h"
+#include "alpha_speculative.h"
 #include "serve-spsc-queue.h"
 #include "llama.h"
 

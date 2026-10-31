@@ -1,5 +1,5 @@
 #include "alpha_moe_portfolio.h"
-#include "alpha_mole_moe_optimizer.h"  // for ALPHA_LOG_DBG
+#include "alpha_moe_optimizer.h"  // for ALPHA_LOG_DBG
 #include "ggml.h"
 #include <cstdio>
 #include <cstring>

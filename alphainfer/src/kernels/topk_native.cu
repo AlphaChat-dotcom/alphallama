@@ -224,4 +224,14 @@ int device_cc_major() {
     return major;
 }
 
+int device_cc() {
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        return 0;
+    }
+    return major * 10 + minor;
+}
+
 }   // namespace ai::kern

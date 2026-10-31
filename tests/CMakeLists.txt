@@ -212,29 +212,29 @@ llama_build_and_test(
 llama_build_and_test(test-regex-partial.cpp)
 
 # AlphaLlama tests
-llama_build(test-alpha-mole.cpp)
-target_include_directories(test-alpha-mole PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole)
+llama_build(test-lora-mix.cpp)
+target_include_directories(test-lora-mix PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix)
 
-llama_build(test-alpha-mole-challenging.cpp)
-target_include_directories(test-alpha-mole-challenging PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole-challenging)
+llama_build(test-lora-mix-challenging.cpp)
+target_include_directories(test-lora-mix-challenging PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix-challenging)
 
-llama_build(test-alpha-mole-phase3.cpp)
-target_include_directories(test-alpha-mole-phase3 PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole-phase3)
+llama_build(test-lora-mix-phase3.cpp)
+target_include_directories(test-lora-mix-phase3 PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix-phase3)
 
-llama_build(test-alpha-mole-phase3-challenging.cpp)
-target_include_directories(test-alpha-mole-phase3-challenging PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole-phase3-challenging)
+llama_build(test-lora-mix-phase3-challenging.cpp)
+target_include_directories(test-lora-mix-phase3-challenging PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix-phase3-challenging)
 
-llama_build(test-alpha-mole-bugfix.cpp)
-target_include_directories(test-alpha-mole-bugfix PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole-bugfix)
+llama_build(test-lora-mix-bugfix.cpp)
+target_include_directories(test-lora-mix-bugfix PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix-bugfix)
 
-llama_build(test-alpha-mole-phase5.cpp)
-target_include_directories(test-alpha-mole-phase5 PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_test(test-alpha-mole-phase5)
+llama_build(test-lora-mix-phase5.cpp)
+target_include_directories(test-lora-mix-phase5 PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-lora-mix-phase5)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")

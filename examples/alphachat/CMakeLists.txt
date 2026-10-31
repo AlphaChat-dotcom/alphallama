@@ -1,7 +1,7 @@
 set(TARGET alphachat)
 add_executable(${TARGET}
     alphachat.cpp
-    ${PROJECT_SOURCE_DIR}/alpha_mole_lora_train.cpp
+    ${PROJECT_SOURCE_DIR}/alpha_lora_train.cpp
 )
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE llama llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})

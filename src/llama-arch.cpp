@@ -9,7 +9,7 @@
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_CLIP,             "clip"             }, // dummy, only used by llama-quantize
     { LLM_ARCH_LLAMA,            "llama"            },
-    { LLM_ARCH_MOLE_LLAMA,       "mole_llama"       },
+    { LLM_ARCH_LORA_MIX_LLAMA,       "lora_mix_llama"       },
     { LLM_ARCH_LLAMA4,           "llama4"           },
     { LLM_ARCH_DECI,             "deci"             },
     { LLM_ARCH_FALCON,           "falcon"           },

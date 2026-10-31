@@ -41,10 +41,10 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
-            alpha_mole.cpp
-            alpha_mole.h
-            alpha_mole_autoconfig.cpp
-            alpha_mole_autoconfig.h
+            alpha_lora_mix.cpp
+            alpha_lora_mix.h
+            alpha_autoconfig.cpp
+            alpha_autoconfig.h
             alpha_hw_planner.cpp
             alpha_hw_planner.h
             alpha_train_graph.cpp
@@ -57,40 +57,40 @@ add_library(llama
             alpha_train_qat.h
             alpha_registry.cpp
             alpha_registry.h
-            alpha_mole_graph.cpp
-            alpha_mole_kv_paging.cpp
-            alpha_mole_kv_paging.h
-            alpha_mole_pipeline.cpp
-            alpha_mole_pipeline.h
-            alpha_mole_stream.cpp
-            alpha_mole_stream.h
-            alpha_mole_expert_cache.cpp
-            alpha_mole_expert_cache.h
+            alpha_lora_mix_graph.cpp
+            alpha_kv_paging.cpp
+            alpha_kv_paging.h
+            alpha_pipeline.cpp
+            alpha_pipeline.h
+            alpha_stream.cpp
+            alpha_stream.h
+            alpha_expert_cache.cpp
+            alpha_expert_cache.h
             alpha_crypto.cpp
             alpha_crypto.h
-            alpha_mole_moe_optimizer.cpp
-            alpha_mole_moe_optimizer.h
-            alpha_mole_speculative.cpp
-            alpha_mole_speculative.h
-            alpha_mole_train_backward.cpp
-            alpha_mole_train_backward.h
-            alpha_mole_train_engine.cpp
-            alpha_mole_train_engine.h
+            alpha_moe_optimizer.cpp
+            alpha_moe_optimizer.h
+            alpha_speculative.cpp
+            alpha_speculative.h
+            alpha_train_backward.cpp
+            alpha_train_backward.h
+            alpha_train_engine.cpp
+            alpha_train_engine.h
             alpha_train_combined.cpp
             alpha_train_combined.h
             alpha_train_novel.cpp
             alpha_train_novel.h
-            alpha_mole_train_pipeline.cpp
-            alpha_mole_train_pipeline.h
-            alpha_mole_train_optim.cpp
-            alpha_mole_train_optim.h
+            alpha_train_tiered.cpp
+            alpha_train_tiered.h
+            alpha_train_optim.cpp
+            alpha_train_optim.h
             alpha_train_chunked.cpp
             alpha_train_chunked.h
-            alpha_mole_pinned.cpp
-            alpha_mole_pinned.h
-            alpha_mole_graph.h
-            alpha_mole_stack.cpp
-            alpha_mole_stack.h
+            alpha_pinned.cpp
+            alpha_pinned.h
+            alpha_lora_mix_graph.h
+            alpha_lora_mix_stack.cpp
+            alpha_lora_mix_stack.h
             alpha_router.cpp
             alpha_router.h
             alpha_moe_portfolio.cpp

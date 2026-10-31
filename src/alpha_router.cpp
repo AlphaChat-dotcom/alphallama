@@ -1,5 +1,5 @@
 #include "alpha_router.h"
-#include "alpha_mole.h"
+#include "alpha_lora_mix.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -13,17 +13,17 @@
 #include <vector>
 
 // GGUF metadata keys for router format
-static const char * ALPHA_MOLE_KEY_VERSION       = "alpha_mole.version";
-static const char * ALPHA_MOLE_KEY_N_LORAS       = "alpha_mole.n_loras";
-static const char * ALPHA_MOLE_KEY_TOP_K         = "alpha_mole.top_k";
-static const char * ALPHA_MOLE_KEY_ROUTER_HIDDEN = "alpha_mole.router_hidden";
-static const char * ALPHA_MOLE_KEY_SHARED        = "alpha_mole.shared";
+static const char * ALPHA_LORA_MIX_KEY_VERSION       = "alpha_lora_mix.version";
+static const char * ALPHA_LORA_MIX_KEY_N_LORAS       = "alpha_lora_mix.n_loras";
+static const char * ALPHA_LORA_MIX_KEY_TOP_K         = "alpha_lora_mix.top_k";
+static const char * ALPHA_LORA_MIX_KEY_ROUTER_HIDDEN = "alpha_lora_mix.router_hidden";
+static const char * ALPHA_LORA_MIX_KEY_SHARED        = "alpha_lora_mix.shared";
 
 // Tensor names
-static const char * ALPHA_MOLE_TENSOR_DOWN       = "alpha_mole.router.down.weight";
-static const char * ALPHA_MOLE_TENSOR_UP         = "alpha_mole.router.up.weight";
-static const char * ALPHA_MOLE_TENSOR_DOWN_BIAS  = "alpha_mole.router.down.bias";
-static const char * ALPHA_MOLE_TENSOR_UP_BIAS    = "alpha_mole.router.up.bias";
+static const char * ALPHA_LORA_MIX_TENSOR_DOWN       = "alpha_lora_mix.router.down.weight";
+static const char * ALPHA_LORA_MIX_TENSOR_UP         = "alpha_lora_mix.router.up.weight";
+static const char * ALPHA_LORA_MIX_TENSOR_DOWN_BIAS  = "alpha_lora_mix.router.down.bias";
+static const char * ALPHA_LORA_MIX_TENSOR_UP_BIAS    = "alpha_lora_mix.router.up.bias";
 
 alpha_router * alpha_router_load(const char * path) {
     if (!path) {
@@ -50,9 +50,9 @@ alpha_router * alpha_router_load(const char * path) {
     };
 
     // Read metadata
-    int version_idx = gguf_find_key(gguf_ctx, ALPHA_MOLE_KEY_VERSION);
+    int version_idx = gguf_find_key(gguf_ctx, ALPHA_LORA_MIX_KEY_VERSION);
     if (version_idx < 0) {
-        fprintf(stderr, "alpha_router: missing '%s' in '%s'\n", ALPHA_MOLE_KEY_VERSION, path);
+        fprintf(stderr, "alpha_router: missing '%s' in '%s'\n", ALPHA_LORA_MIX_KEY_VERSION, path);
         cleanup();
         return nullptr;
     }
@@ -83,10 +83,10 @@ alpha_router * alpha_router_load(const char * path) {
         return idx >= 0 ? gguf_get_val_bool(gguf_ctx, idx) : default_val;
     };
 
-    int  n_loras       = get_i32(ALPHA_MOLE_KEY_N_LORAS, 0);
-    int  top_k         = get_i32(ALPHA_MOLE_KEY_TOP_K, 2);
-    int  router_hidden = get_i32(ALPHA_MOLE_KEY_ROUTER_HIDDEN, 64);
-    bool shared        = get_bool(ALPHA_MOLE_KEY_SHARED, true);
+    int  n_loras       = get_i32(ALPHA_LORA_MIX_KEY_N_LORAS, 0);
+    int  top_k         = get_i32(ALPHA_LORA_MIX_KEY_TOP_K, 2);
+    int  router_hidden = get_i32(ALPHA_LORA_MIX_KEY_ROUTER_HIDDEN, 64);
+    bool shared        = get_bool(ALPHA_LORA_MIX_KEY_SHARED, true);
 
     if (n_loras <= 0 || router_hidden <= 0) {
         fprintf(stderr, "alpha_router: invalid config (n_loras=%d, router_hidden=%d)\n", n_loras, router_hidden);
@@ -96,11 +96,11 @@ alpha_router * alpha_router_load(const char * path) {
 
     // Clamp loaded top_k to valid range (hardening #3)
     if (top_k < 1) top_k = 1;
-    if (top_k > ALPHA_MOLE_MAX_TOP_K) top_k = ALPHA_MOLE_MAX_TOP_K;
+    if (top_k > ALPHA_LORA_MIX_MAX_TOP_K) top_k = ALPHA_LORA_MIX_MAX_TOP_K;
 
     // Find tensors
-    struct ggml_tensor * t_down = ggml_get_tensor(ggml_ctx, ALPHA_MOLE_TENSOR_DOWN);
-    struct ggml_tensor * t_up   = ggml_get_tensor(ggml_ctx, ALPHA_MOLE_TENSOR_UP);
+    struct ggml_tensor * t_down = ggml_get_tensor(ggml_ctx, ALPHA_LORA_MIX_TENSOR_DOWN);
+    struct ggml_tensor * t_up   = ggml_get_tensor(ggml_ctx, ALPHA_LORA_MIX_TENSOR_UP);
 
     if (!t_down || !t_up) {
         fprintf(stderr, "alpha_router: missing required tensors in '%s'\n", path);
@@ -159,8 +159,8 @@ alpha_router * alpha_router_load(const char * path) {
     memcpy(router->w_up.data(),   t_up->data,   up_size   * sizeof(float));
 
     // Load biases if present
-    struct ggml_tensor * t_down_bias = ggml_get_tensor(ggml_ctx, ALPHA_MOLE_TENSOR_DOWN_BIAS);
-    struct ggml_tensor * t_up_bias   = ggml_get_tensor(ggml_ctx, ALPHA_MOLE_TENSOR_UP_BIAS);
+    struct ggml_tensor * t_down_bias = ggml_get_tensor(ggml_ctx, ALPHA_LORA_MIX_TENSOR_DOWN_BIAS);
+    struct ggml_tensor * t_up_bias   = ggml_get_tensor(ggml_ctx, ALPHA_LORA_MIX_TENSOR_UP_BIAS);
 
     if (t_down_bias) {
         // Validate bias dimensions (hardening #2)
@@ -201,7 +201,7 @@ alpha_route_result alpha_router_forward(
 
     if (top_k < 1) top_k = 1;
     if (top_k > router->n_loras) top_k = router->n_loras;
-    if (top_k > ALPHA_MOLE_MAX_TOP_K) top_k = ALPHA_MOLE_MAX_TOP_K;
+    if (top_k > ALPHA_LORA_MIX_MAX_TOP_K) top_k = ALPHA_LORA_MIX_MAX_TOP_K;
 
     const int H = router->hidden_dim;
     const int R = router->router_hidden;

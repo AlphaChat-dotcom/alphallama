@@ -24,8 +24,8 @@ extern std::atomic<bool> g_alpha_freq_profiling;
 // so reload_from_argsort can read valid data after decode (batch verification).
 std::atomic<bool> g_alpha_argsort_persist{false};
 
-void alpha_mole_set_argsort_persist(bool v) { g_alpha_argsort_persist.store(v, std::memory_order_relaxed); }
-bool alpha_mole_get_argsort_persist() { return g_alpha_argsort_persist.load(std::memory_order_relaxed); }
+void alpha_lora_mix_set_argsort_persist(bool v) { g_alpha_argsort_persist.store(v, std::memory_order_relaxed); }
+bool alpha_lora_mix_get_argsort_persist() { return g_alpha_argsort_persist.load(std::memory_order_relaxed); }
 
 // Per-layer argsort output, expert weight and FFN input tensor pointers.
 // Written by build_moe_ffn on the inference thread, read by the optimizer after decode and by
@@ -38,28 +38,28 @@ static ggml_tensor * g_moe_gating_probs[256] = {};  // gating softmax probs per 
 static std::atomic<int> g_moe_argsort_count{0};
 static std::atomic<int> g_moe_gating_count{0};
 
-void alpha_mole_clear_argsort_outputs() {
+void alpha_lora_mix_clear_argsort_outputs() {
     g_moe_argsort_count.store(0, std::memory_order_relaxed);
     g_moe_gating_count.store(0, std::memory_order_relaxed);
 }
 
-int alpha_mole_get_argsort_count() {
+int alpha_lora_mix_get_argsort_count() {
     return g_moe_argsort_count;
 }
 
-ggml_tensor * alpha_mole_get_argsort_output(int layer) {
+ggml_tensor * alpha_lora_mix_get_argsort_output(int layer) {
     return (layer >= 0 && layer < g_moe_argsort_count) ? g_moe_argsort_outputs[layer] : nullptr;
 }
 
-ggml_tensor * alpha_mole_get_weight_output(int layer) {
+ggml_tensor * alpha_lora_mix_get_weight_output(int layer) {
     return (layer >= 0 && layer < g_moe_argsort_count) ? g_moe_weight_outputs[layer] : nullptr;
 }
 
-ggml_tensor * alpha_mole_get_ffn_input(int layer) {
+ggml_tensor * alpha_lora_mix_get_ffn_input(int layer) {
     return (layer >= 0 && layer < g_moe_argsort_count) ? g_moe_ffn_inputs[layer] : nullptr;
 }
 
-ggml_tensor * alpha_mole_get_gating_probs(int layer) {
+ggml_tensor * alpha_lora_mix_get_gating_probs(int layer) {
     return (layer >= 0 && layer < g_moe_gating_count) ? g_moe_gating_probs[layer] : nullptr;
 }
 
@@ -1109,7 +1109,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
-        alpha_mole_clear_argsort_outputs();  // reset per graph build - build_moe_ffn() writes fresh pointers
+        alpha_lora_mix_clear_argsort_outputs();  // reset per graph build - build_moe_ffn() writes fresh pointers
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {

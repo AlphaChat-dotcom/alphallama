@@ -11,12 +11,12 @@
 // - V2: Route in-graph per layer using hidden states, dispatch via ggml_mul_mat_id
 
 #include "models.h"
-#include "../alpha_mole_graph.h"
+#include "../alpha_lora_mix_graph.h"
 
 // Static member initialization
-const alpha_mole_graph_router * llm_build_mole_llama::mole_router = nullptr;
+const alpha_lora_mix_graph_router * llm_build_lora_mix_llama::lora_mix_router = nullptr;
 
-llm_build_mole_llama::llm_build_mole_llama(const llama_model & model, const llm_graph_params & params)
+llm_build_lora_mix_llama::llm_build_lora_mix_llama(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -49,9 +49,9 @@ llm_build_mole_llama::llm_build_mole_llama(const llama_model & model, const llm_
         cb(cur, "attn_norm", il);
 
         // === LoRA-mixture: Compute per-token routing decisions for this layer ===
-        alpha_mole_route_tensors layer_route = {};
-        if (mole_router) {
-            layer_route = alpha_mole_build_router_graph(ctx0, mole_router, cur);
+        alpha_lora_mix_route_tensors layer_route = {};
+        if (lora_mix_router) {
+            layer_route = alpha_lora_mix_build_router_graph(ctx0, lora_mix_router, cur);
         }
         // === End LoRA-mixture routing ===
 

@@ -20,19 +20,19 @@
 //   alphachat bench deepseek-v4-flash
 //   alphachat info
 
-#include "alpha_mole.h"
-#include "alpha_mole_autoconfig.h"
-#include "alpha_mole_expert_cache.h"
+#include "alpha_lora_mix.h"
+#include "alpha_autoconfig.h"
+#include "alpha_expert_cache.h"
 #include "alpha_hw_planner.h"
 #include "alpha_registry.h"
 #include "llama-arch.h"
 #include "llama-model.h"
 #include "common.h"
 #include "download.h"
-#include "alpha_mole_moe_optimizer.h"
-#include "alpha_mole_speculative.h"
-#include "alpha_mole_lora_train.h"
-#include "alpha_mole_train_engine.h"
+#include "alpha_moe_optimizer.h"
+#include "alpha_speculative.h"
+#include "alpha_lora_train.h"
+#include "alpha_train_engine.h"
 #include "alpha_train_combined.h"
 #include "alpha_train_full.h"
 #include "alpha_train_chunked.h"
@@ -468,7 +468,7 @@ static float g_top_p = 0.95f;      // set by --top-p in main()
 static float g_min_p = 0.0f;       // set by --min-p in main()
 static float g_presence_penalty = 1.5f;  // set by --presence-penalty (matches Ollama default)
 static float g_frequency_penalty = 0.0f; // set by --frequency-penalty
-// g_alpha_debug is declared in alpha_mole_moe_optimizer.h, set by --debug
+// g_alpha_debug is declared in alpha_moe_optimizer.h, set by --debug
 static bool g_cpu_moe = false;      // set by --cpu-moe or --mode cpu-moe in main()
 static alpha_inference_mode g_alpha_mode = ALPHA_MODE_STANDARD; // set by --mode in main()
 
@@ -1096,7 +1096,7 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
             #endif
         }
         for (auto & [layer, ids] : expert_overrides) {
-            if (alpha_mole_set_layer_experts(moe_opt, layer, ids.data(), nullptr, (int)ids.size()) == 0) {
+            if (alpha_lora_mix_set_layer_experts(moe_opt, layer, ids.data(), nullptr, (int)ids.size()) == 0) {
                 ALPHA_LOG_DBG("[override] layer %d: %d experts overridden\n", layer, (int)ids.size());
             } else {
                 ALPHA_LOG_DBG("[override] layer %d: FAILED (invalid layer or expert count)\n", layer);
@@ -1183,7 +1183,7 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
         if (profile_experts_fp) {
             if (!file_exists) {
                 // Header: n_moe_layers (int32), n_expert_used (int32)
-                int32_t hdr[2] = { alpha_mole_get_argsort_count() > 0 ? alpha_mole_get_argsort_count() : 43, 6 };
+                int32_t hdr[2] = { alpha_lora_mix_get_argsort_count() > 0 ? alpha_lora_mix_get_argsort_count() : 43, 6 };
                 fwrite(hdr, sizeof(int32_t), 2, profile_experts_fp);
             }
             ALPHA_LOG_DBG("[PROFILE] %s expert routing to %s\n",
@@ -2316,9 +2316,9 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
             // Expert routing profiling: write per-layer top-k expert IDs to binary file
             // Works in any mode (cpu-moe, expert-cache, direct) - reads graph argsort outputs
             if (profile_experts_fp) {
-                int n_argsort = alpha_mole_get_argsort_count();
+                int n_argsort = alpha_lora_mix_get_argsort_count();
                 for (int m = 0; m < n_argsort; m++) {
-                    ggml_tensor * argsort = alpha_mole_get_argsort_output(m);
+                    ggml_tensor * argsort = alpha_lora_mix_get_argsort_output(m);
                     if (!argsort || !argsort->buffer) continue;
                     int n_used = std::min((int)argsort->ne[0], 6);
                     int32_t ids[6] = {};
@@ -2339,7 +2339,7 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
                 float total_entropy = 0;
                 int n_moe = 0;
                 for (int il = 0; il < n_layer; il++) {
-                    ggml_tensor * gating = alpha_mole_get_gating_probs(il);
+                    ggml_tensor * gating = alpha_lora_mix_get_gating_probs(il);
                     if (!gating || !gating->buffer) continue;
                     int n_exp = (int)gating->ne[0];
                     if (il == 0) n_expert_for_max = n_exp;
@@ -2395,7 +2395,7 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
             if (log_confidence && moe_opt && alpha_moe_optimizer_is_moe(moe_opt)) {
                 int n_layer = llama_model_n_layer(model);
                 float max_ent = logf((float)n_expert_for_max);
-                int n_argsort = alpha_mole_get_argsort_count();
+                int n_argsort = alpha_lora_mix_get_argsort_count();
                 int moe_idx = 0;
                 for (int il = 0; il < n_layer; il++) {
                     // Use real gate entropy from layer_entropy[]
@@ -2437,7 +2437,7 @@ static int cmd_run(const std::string & model_name, const std::string & prompt,
                             fprintf(stderr, "%s%d", k > 0 ? "," : "", routing[k]);
                     } else if (moe_idx < n_argsort) {
                         // Fallback: read argsort tensor directly
-                        ggml_tensor * argsort = alpha_mole_get_argsort_output(moe_idx);
+                        ggml_tensor * argsort = alpha_lora_mix_get_argsort_output(moe_idx);
                         if (argsort && argsort->buffer) {
                             int n_rd = std::min((int)argsort->ne[0], 8);
                             int32_t ids[16] = {};

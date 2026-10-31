@@ -873,7 +873,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     // arch-specific KVs
     switch (arch) {
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_MOLE_LLAMA: // AlphaLlama: same weight format as llama
+        case LLM_ARCH_LORA_MIX_LLAMA: // AlphaLlama: same weight format as llama
         case LLM_ARCH_LLAMA_EMBED:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3368,7 +3368,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         switch (arch) {
             case LLM_ARCH_LLAMA:
-            case LLM_ARCH_MOLE_LLAMA: // AlphaLlama: same tensors as llama
+            case LLM_ARCH_LORA_MIX_LLAMA: // AlphaLlama: same tensors as llama
             case LLM_ARCH_REFACT:
             case LLM_ARCH_MINICPM:
             case LLM_ARCH_GRANITE:
@@ -9321,10 +9321,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_llama<false>>(*this, params);
             } break;
-        case LLM_ARCH_MOLE_LLAMA:
+        case LLM_ARCH_LORA_MIX_LLAMA:
             {
                 // AlphaLlama: uses LoRA-mixture-aware graph builder with per-token LoRA routing
-                llm = std::make_unique<llm_build_mole_llama>(*this, params);
+                llm = std::make_unique<llm_build_lora_mix_llama>(*this, params);
             } break;
         case LLM_ARCH_LLAMA4:
             {
@@ -10012,7 +10012,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_MOLE_LLAMA:
+        case LLM_ARCH_LORA_MIX_LLAMA:
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_DECI:

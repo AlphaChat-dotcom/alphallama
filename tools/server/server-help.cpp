@@ -248,7 +248,7 @@ std::string alpha_error_assistant::explain(const std::string & error_msg,
             ALPHA_XS("AlphaChat"),
             ALPHA_XS("alphachat"),
             ALPHA_XS("alpha.chat"),
-            ALPHA_XS("alpha_mole"),
+            ALPHA_XS("alpha_lora_mix"),
             ALPHA_XS("alpha_hw"),
             ALPHA_XS("alpha_crypto")
         };

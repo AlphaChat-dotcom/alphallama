@@ -850,10 +850,14 @@ static const alpha_ai_validated k_ai_validated[] = {
     // load-time requant would be faster but fails the per-language NLL gate, so the weights stay as shipped. Fast MTP
     // drafting 5 deep plus prompt-lookup drafts up to 16 wide (AI_LOOKUP, shadow-armed at 8 matched tokens, so
     // non-copy text runs exactly as MTP-5). Lookup at 32 wide is no better than 16.
+    // Plain and exact decode run the narrow exact kernels (AI_WIDE_EXACT=0, exact verify K = 3): the width-invariant
+    // wide-exact path needs more workspace than 640 MiB at 8192 cells and aborted mid-request (workspace overflow in
+    // the exact verify round), while 640 + 60 MiB no longer leaves the 256 MiB VRAM floor. Narrow exact peaks at 505
+    // MiB here. Plain takes the same kernels so exact stays token-identical to plain; fast MTP does not read it.
     { "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482", 16464440224LL, 8, 9, 1, 8192, "fast", 16, nullptr,
       nullptr, 0, "q4_0", nullptr,
       "AI_HOST_EMBD=1 AI_FFN_CPU=4 AI_MTP_DRAFT_Q=off AI_KV_MARGIN_MB=128 AI_CHUNK=128 ALPHA_AI_WS_MIB=640 ALPHA_AI_MTP_K=16 "
-      "AI_MTP_CHAIN=5 AI_LOOKUP=1 AI_LOOKUP_NMIN=4",
+      "AI_MTP_CHAIN=5 AI_LOOKUP=1 AI_LOOKUP_NMIN=4 AI_WIDE_EXACT=0",
       "Qwen3.8-27B-UD-Q4_K_M (RTX 4080, 4 FFN layers on the CPU, FAST)" },
 };
 

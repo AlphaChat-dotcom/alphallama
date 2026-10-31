@@ -32,8 +32,8 @@
 #include <chrono>   // auto-ingest phase profiling (ALPHA_INGEST_PROFILE)
 
 // AlphaLlama: MoE optimization for server mode
-#include "../../src/alpha_mole_moe_optimizer.h"
-#include "../../src/alpha_mole_speculative.h"
+#include "../../src/alpha_moe_optimizer.h"
+#include "../../src/alpha_speculative.h"
 #include "../../src/alpha_moe_portfolio.h"
 #include "../../src/alpha_hw_planner.h"
 #include "../../src/alpha_dense_pipeline.h"
@@ -2394,7 +2394,7 @@ private:
                 eu_log_enabled = true;
                 const char * lv = getenv("ALPHA_LOG_EXPERT_USAGE");
                 eu_log_verbose = (lv && lv[0] == '2');
-                alpha_mole_set_argsort_persist(true);
+                alpha_lora_mix_set_argsort_persist(true);
                 const char * p = getenv("ALPHA_LOG_EXPERT_USAGE_PATH");
                 std::string path = (p && *p) ? p : "expert_usage.jsonl";
                 eu_log_fp = fopen(path.c_str(), "a");
@@ -4359,7 +4359,7 @@ private:
     // each decode forward emits one token, so the argsort's last row is exactly that token's routing.
     void eu_accumulate(server_slot & slot) {
         if (!eu_log_enabled || eu_n_expert_total <= 0) return;
-        int nl = alpha_mole_get_argsort_count();
+        int nl = alpha_lora_mix_get_argsort_count();
         if (nl <= 0) return;
         if (slot.eu_counts.empty()) {
             slot.eu_n_layer  = nl;
@@ -4369,7 +4369,7 @@ private:
         if (nl != slot.eu_n_layer) return;   // graph layout changed unexpectedly; skip this token
         int used = 0;
         for (int l = 0; l < nl; l++) {
-            ggml_tensor * a = alpha_mole_get_argsort_output(l);
+            ggml_tensor * a = alpha_lora_mix_get_argsort_output(l);
             if (!a || !a->buffer) continue;
             int nu = (int)a->ne[0];          // n_expert_used
             int nt = (int)a->ne[1];          // tokens in this forward (1 at -np1 non-spec decode)
@@ -5531,7 +5531,7 @@ private:
                                 // let apply_warmup enter draft after prompt is done.
                                 std::string model_dir = std::filesystem::path(params_base.model.path).parent_path().string();
                                 alpha_moe_optimizer_pin_domain_experts(moe_opt, model_dir.c_str());
-                                alpha_mole_set_argsort_persist(true);
+                                alpha_lora_mix_set_argsort_persist(true);
                                 slot.moe_lut_prefill = true;
 
                                 int n_expert_used = alpha_moe_optimizer_get_n_expert_used(moe_opt);
@@ -5545,7 +5545,7 @@ private:
                                     alpha_moe_optimizer_exit_draft_mode(moe_opt);
                                 }
                                 alpha_moe_optimizer_disable_cache(moe_opt);
-                                alpha_mole_set_argsort_persist(true);
+                                alpha_lora_mix_set_argsort_persist(true);
                                 alpha_moe_optimizer_prefetch_prompt_experts(moe_opt);
                             }
                         }
@@ -6626,8 +6626,8 @@ private:
                     // Enable argsort persistence from cycle 2+ so reload_from_argsort
                     // can read valid data after this cycle's draft decodes.
                     if (slot.moe_gen_tokens >= DRAFT_N) {
-                        if (!alpha_mole_get_argsort_persist()) {
-                            alpha_mole_set_argsort_persist(true);
+                        if (!alpha_lora_mix_get_argsort_persist()) {
+                            alpha_lora_mix_set_argsort_persist(true);
                         }
                     }
 
@@ -10478,9 +10478,9 @@ void server_routes::init_kv_chunk_routes() {
 #ifdef ALPHA_INTERNAL
     this->post_expert_routing = [this](const server_http_req & req) {
         // Ensure argsort data persists for future requests
-        alpha_mole_set_argsort_persist(true);
+        alpha_lora_mix_set_argsort_persist(true);
         auto res = std::make_unique<server_http_res>();
-        int n_layers = alpha_mole_get_argsort_count();
+        int n_layers = alpha_lora_mix_get_argsort_count();
         if (n_layers <= 0) {
             res->status = 200;
             res->data = safe_json_to_str(json{{"layers", json::array()}, {"error", "no routing data available"}});
@@ -10489,7 +10489,7 @@ void server_routes::init_kv_chunk_routes() {
 
         json layers = json::array();
         for (int il = 0; il < n_layers; il++) {
-            ggml_tensor * argsort_out = alpha_mole_get_argsort_output(il);
+            ggml_tensor * argsort_out = alpha_lora_mix_get_argsort_output(il);
             if (!argsort_out || !argsort_out->buffer) continue;
 
             int n_used = (int)argsort_out->ne[0];   // n_expert_used

@@ -14,7 +14,7 @@
 // ALPHA_MTP is on only for a non-zero value, matching the serve engine (serve-gpu-engine.cpp g_mtp), so ALPHA_MTP=0 does not load the head or build the MTP graph.
 static inline bool alpha_mtp_env_on() { const char * e = getenv("ALPHA_MTP"); return e && atoi(e) != 0; }
 
-// Top-k expert reduction (shared with deepseek4.cpp, alpha_mole_moe_optimizer.cpp)
+// Top-k expert reduction (shared with deepseek4.cpp, alpha_moe_optimizer.cpp)
 extern thread_local int g_alpha_topk_override;
 
 // Multi-pass pipeline layer range (for self-spec layer-skip)

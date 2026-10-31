@@ -11,7 +11,7 @@ files carries an "SPDX-License-Identifier: Apache-2.0" header.
 - tools/serve/                 the AlphaServe server (tools/serve/LICENSE)
 - ggml/src/ggml-cuda/dre.cu, dre.cuh, dre_pfcpu.inc, moe-merge.cu, moe-merge.cuh,
   moe-down9.cu, moe-down9.cuh  fused-infer expert offload kernels
-- src/alpha_mole_expert_cache.*, src/alpha_mole_moe_optimizer*, src/alpha_mole_expert_stacker.*,
+- src/alpha_expert_cache.*, src/alpha_moe_optimizer*, src/alpha_expert_stacker.*,
   src/alpha_hw_planner.*       fused-infer expert cache, offload planning and hardware detection
 
 Fused-infer code that lives inside files from llama.cpp / ggml (for example ggml-cuda.cu, mmvq.cu)

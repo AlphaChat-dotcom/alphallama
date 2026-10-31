@@ -27,7 +27,7 @@
 #  endif
 #endif
 ALPHA_CUDA_API_C void ggml_cuda_set_expert_user(int user_id);
-#include "alpha_mole_speculative.h"   // alpha_recurrent_snapshot/restore
+#include "alpha_speculative.h"   // alpha_recurrent_snapshot/restore
 #include "ggml-backend.h"
 
 // Multi-token-prediction self-speculative decode (ALPHA_MTP). Each single-token decode drafts the

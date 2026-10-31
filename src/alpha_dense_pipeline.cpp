@@ -1,5 +1,5 @@
 #include "alpha_dense_pipeline.h"
-#include "alpha_mole_moe_optimizer.h"  // for alpha_cuda_dma_*
+#include "alpha_moe_optimizer.h"  // for alpha_cuda_dma_*
 #include "llama-model.h"
 #include "ggml-backend.h"
 

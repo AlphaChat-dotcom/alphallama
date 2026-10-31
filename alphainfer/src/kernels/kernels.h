@@ -152,6 +152,8 @@ bool topk_native_ok(int64_t n_expert, int64_t k_used, int64_t T);
 // Compute-capability major of the current device (8 = Ampere/Ada, 12 = Blackwell consumer); 0 if unknown.
 // For per-architecture defaults.
 int device_cc_major();
+// Compute capability of the current device as major * 10 + minor (86 = RTX 30xx, 89 = RTX 40xx); 0 if unknown.
+int device_cc();
 
 // Offload v2 (offload.cu): device residency table + mapped-memory doorbell to the CPU miss pool.
 // table: i32 [n_expert] expert -> pool slot or -1; sel: i32 [k, T] routed experts; x: f32 [N, T]. Writes slots
