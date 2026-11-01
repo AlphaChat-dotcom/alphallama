@@ -269,7 +269,8 @@ static void set_default(const char * key, const std::string & value, const std::
 
 // Measured best Flash-Next configurations per VRAM class (decode A/V/R vs Strata 0.2.8 on the same GPU, 2 passes reversed). A class
 // profile is applied before the auto-tune: an explicit env wins over it, it wins over the measured-rate rules.
-// ALPHA_CLASS_PROFILE=0 skips it. A profile only holds what was measured on that class: AI_Q4X_PF_SHARE_GBS is the
+// ALPHA_CLASS_PROFILE=0 skips it. No profile lowers AI_Q4X_TAIL_RANK below the engine's 8: tail rank 6 measured KL 0.0057 vs
+// 0.0031 against the fp32 reference (top-1 98.47 vs 98.83%, worse on 24 of 25 prompts) for +1-2% decode. A profile only holds what was measured on that class: AI_Q4X_PF_SHARE_GBS is the
 // prefill cost model's price of one copied expert, not a link speed (48 on the 3090 with PF_COPY_OVERLAP, tuned for
 // TTFT; the measured link's 25 cost R TTFT 1.83 vs 1.46 s).
 struct class_profile {
@@ -289,7 +290,7 @@ static const std::vector<class_profile> & class_profiles() {
             { "AI_Q4X_STREAM_SPLIT", "1" }, { "AI_Q4X_PF_COPY_OVERLAP", "1" }, { "AI_Q4X_PF_SHARE_GBS", "48" },
             { "AI_Q4X_PF_STREAM_MIN", "1024" }, { "AI_Q4X_PF_NBUF", "2" }, { "AI_Q4X_RESERVE_EXTRA_MB", "400" },
             { "AI_Q4X_ADMIT", "256" }, { "AI_Q4X_ADMIT_STAGE", "640" }, { "AI_Q4X_ADMIT_THR", "1.0" },
-            { "AI_Q4X_ADMIT_RATIO", "1.1" }, { "AI_Q4X_TAIL_RANK", "6" }, { "AI_Q4X_LEND_ASYNC", "0" } } },
+            { "AI_Q4X_ADMIT_RATIO", "1.1" }, { "AI_Q4X_LEND_ASYNC", "0" } } },
         // the 5090's best measured run minus two knobs: LEND_ASYNC (the first request after a lent prefill is not repeatable) and
         // TAIL_RANK 6 (+1-2%, pending the KL / lm-eval check). Draft min-p 0 measured +2.6% V over 0.5 here.
         { "32 GB", 28.0, 1e9, "RTX 5090: 1.10-1.12x Strata 0.2.8 (2026-11-01)",
