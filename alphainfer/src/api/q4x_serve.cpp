@@ -114,6 +114,29 @@ struct Q4xServe::Impl {
     std::vector<int32_t> argmax_cols(const Tensor & lg, int64_t T, int64_t pos0) {
         static const bool host = env_int("AI_Q4X_HOST_ARGMAX", 0) != 0;
         std::vector<int32_t> g((size_t) T);
+        // [stray-token bug, 2026-11-01] the scratch of op::argmax / op::sample_into must not alias the logits. A
+        // replayed round's output lives in the workspace (RoundCache records every round from origin 0), but the
+        // workspace offset afterwards is wherever the caller left it -- often below the logits. argmax_partial_k then
+        // wrote its block maxima INTO the logits row while other blocks were still reading it, so those columns could
+        // win: served ids ~189-193K that sit 24-34 logits below the true argmax (RTX 5090: the logits match the fp32
+        // oracle within 0.6; AI_Q4X_HOST_ARGMAX=1 gave 0/36 strays and 9/9 identical reps; production 4080 :8106
+        // emitted CJK / Thai / Arabic tokens at temperature 0). Allocate past the end of the logits (or below their
+        // start when the workspace has no room after them); restored on return.
+        Device::Scope ws_scope(dev);
+        if (const char * wb = (const char *) dev.ws_base()) {
+            const char * p0 = (const char *) lg.data;
+            const size_t lb = (size_t) T * (size_t) V * sizeof(float);
+            if (p0 >= wb && p0 + lb <= wb + dev.ws_capacity()) {
+                const size_t s = (size_t) (p0 - wb), e = s + lb;
+                const size_t need = (size_t) 1 << 20;   // argmax partials / sampler scratch: well under 1 MiB at T <= 16
+                const size_t m = dev.ws_mark();
+                if (m < e) {
+                    if (e + need <= dev.ws_capacity()) dev.ws_reset(e);
+                    else if (s >= need) dev.ws_reset(0);
+                    else throw std::runtime_error("q4x argmax: no workspace room beside the logits");
+                }
+            }
+        }
         if (samp_on) {
             if (!lg.contiguous()) throw std::runtime_error("q4x sampling: the logits are not contiguous");
             const Tensor idx = op::argmax(dev, lg);
@@ -454,7 +477,13 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     static const int64_t long_ctx = env_int("AI_Q4X_MTP_LONG_CTX", 8192);
     static const int     k_long   = env_int("AI_Q4X_MTP_K_LONG", 2);
     const int            depth    = (int64_t) m.hist.size() > long_ctx ? std::min(m.mtp_k, k_long) : m.mtp_k;
-    if (!copied || m.agree) d = m.run->mtp_draft(pending, depth);
+    // [AI_Q4X_VERIFY_EARLY] no copy: the verify goes out right behind the draft chain, before the drafts reach the
+    // host (Qwen4ExpRun::draft_verify_early), so the GPU does not idle through the read-back and the graph launch
+    Tensor lg_early;
+    bool   early = false;
+    if (!copied && m.ctx - 1 - m.run->position() >= depth + 1)
+        early = m.run->draft_verify_early(pending, depth, d, lg_early);
+    if (!early && (!copied || m.agree)) d = m.run->mtp_draft(pending, depth);
     if (copied && m.agree) {   // keep the copy only where the MTP agrees on its first token
         if (d.empty() || d[0] != toks[1]) { toks.resize(1); copied = false; }
     }
@@ -472,7 +501,7 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     if (room < 1) throw std::runtime_error("q4x decode: context full");
     if ((int64_t) toks.size() > room) toks.resize((size_t) room);
     const int64_t T  = (int64_t) toks.size();
-    const Tensor  lg = m.run->verify(toks.data(), T);
+    const Tensor  lg = early ? lg_early : m.run->verify(toks.data(), T);
     // verify put the T rows in the history: column c picks the token at position (position() - T) + 1 + c
     const std::vector<int32_t> gq = m.argmax_cols(lg, T, m.run->position() - T + 1);
     int64_t a = 0;

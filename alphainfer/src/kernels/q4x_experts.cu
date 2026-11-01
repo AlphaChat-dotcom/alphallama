@@ -1113,6 +1113,7 @@ __global__ void __launch_bounds__(32 * W) dn_s_k(const uint8_t * __restrict__ do
     const int       r0 = (blockIdx.x * W + warp) * kTcDnRows;
     const bool      active = r0 < N;
     const int32_t * o  = recs + (size_t) blockIdx.y * rec_stride;
+    if (o[1] == 0) return;   // [AI_Q4X_PF_DEVPLAN] an unused record of a device-built plan (block-uniform)
     const int       ch = o[0], ncols = o[1], nu = F / QK8_1;
     const int       tb = (int) (kTcDnRows * row_bytes), rowb = nu * (int) sizeof(block_q8_1);
     uint8_t *       wsm = tc_sm + warp * tb;
@@ -1482,6 +1483,83 @@ bool tc_ok(const void * up, const void * gate, int64_t rbg, int64_t ebg, const v
            ebd % 16 == 0 && (uintptr_t) down % 16 == 0 && kTcWarps * kTcDnRows * rbd <= 48 * 1024;
 }
 
+// [AI_Q4X_PF_DEVPLAN] owner records of the columns [c0, c1) of a big batch, built from the DEVICE routing (sel i32,
+// expert ids, column = t * k + j), so the host never reads the routing back. Bank of expert e: 0 = resident
+// (res_slot[e] >= 0), 1 = spare (spare_slot && spare_slot[e] >= 0), 2 = scratch (scr_slot[e]). Per bank the records
+// are sorted by slot, each slot's columns ascending and split every kWideCols (the host builder's records in another
+// order: each column is still computed once, by the same arithmetic), then records [n, cap) get ncols 0 (the expert
+// kernels skip them). One block, kPlanThreads threads; thread t owns slots t, t + kPlanThreads, ... of every bank.
+constexpr int kPlanThreads = 512, kPlanChunk = 4096, kPlanMaxSlots = 1024;
+__global__ void __launch_bounds__(kPlanThreads) pf_plan_k(const int32_t * __restrict__ sel, int c0, int c1,
+                                                          const int32_t * __restrict__ res_slot,
+                                                          const int32_t * __restrict__ spare_slot,
+                                                          const int32_t * __restrict__ scr_slot, int nslots0, int nslots1,
+                                                          int nslots2, int32_t * rec0, int cap0, int32_t * rec1, int cap1,
+                                                          int32_t * rec2, int cap2, int * overflow) {
+    __shared__ int cnt[3][kPlanMaxSlots];
+    __shared__ int base[3][kPlanMaxSlots];
+    __shared__ int nrec[3];
+    __shared__ int key[kPlanChunk];
+    const int tid = threadIdx.x;
+    const int ns[3] = { nslots0, nslots1, nslots2 }, cap[3] = { cap0, cap1, cap2 };
+    int32_t * rec[3] = { rec0, rec1, rec2 };
+    for (int i = tid; i < 3 * kPlanMaxSlots; i += kPlanThreads) cnt[i / kPlanMaxSlots][i % kPlanMaxSlots] = 0;
+    __syncthreads();
+    auto classify = [&](int c) {   // packed (bank << 16) | slot, -1 = nobody (an expert with no slot: never routed here)
+        const int e = sel[c];
+        const int r = res_slot[e];
+        if (r >= 0) return r;
+        if (spare_slot && spare_slot[e] >= 0) return (1 << 16) | spare_slot[e];
+        const int s = scr_slot[e];
+        return s >= 0 ? (2 << 16) | s : -1;
+    };
+    for (int c = c0 + tid; c < c1; c += kPlanThreads) {
+        const int kk = classify(c);
+        if (kk >= 0) atomicAdd(&cnt[kk >> 16][kk & 0xFFFF], 1);
+    }
+    __syncthreads();
+    if (tid < 3) {   // exclusive scan of each bank's records per slot (<= 1024 slots: serial is ~1k adds)
+        int acc = 0;
+        for (int s = 0; s < ns[tid]; ++s) { base[tid][s] = acc; acc += (cnt[tid][s] + kWideCols - 1) / kWideCols; }
+        nrec[tid] = acc;
+        if (acc > cap[tid]) atomicExch(overflow, 1);
+    }
+    __syncthreads();
+    // this thread's slots: running column counts
+    int done[3][kPlanMaxSlots / kPlanThreads];
+    for (int b = 0; b < 3; ++b)
+        for (int q = 0; q < kPlanMaxSlots / kPlanThreads; ++q) done[b][q] = 0;
+    for (int ch0 = c0; ch0 < c1; ch0 += kPlanChunk) {
+        const int n = min(kPlanChunk, c1 - ch0);
+        __syncthreads();
+        for (int i = tid; i < n; i += kPlanThreads) key[i] = classify(ch0 + i);
+        __syncthreads();
+        for (int i = 0; i < n; ++i) {   // every thread walks the chunk in column order: its slots' lists stay sorted
+            const int kk = key[i];
+            if (kk < 0) continue;
+            const int b = kk >> 16, s = kk & 0xFFFF;
+            if (s % kPlanThreads != tid) continue;
+            const int q = s / kPlanThreads, d = done[b][q]++;
+            if (nrec[b] > cap[b]) continue;   // overflow: flagged above, nothing written past the plan
+            int32_t * r = rec[b] + (size_t) (base[b][s] + d / kWideCols) * kWideRec;
+            r[2 + d % kWideCols] = ch0 + i;
+        }
+    }
+    __syncthreads();
+    for (int b = 0; b < 3; ++b) {
+        if (nrec[b] > cap[b]) continue;
+        for (int s = tid; s < ns[b]; s += kPlanThreads) {
+            const int c = cnt[b][s];
+            for (int j = 0; j * kWideCols < c; ++j) {
+                int32_t * r = rec[b] + (size_t) (base[b][s] + j) * kWideRec;
+                r[0] = s;
+                r[1] = min(kWideCols, c - j * kWideCols);
+            }
+        }
+        for (int i = nrec[b] + tid; i < cap[b]; i += kPlanThreads) { rec[b][(size_t) i * kWideRec] = 0; rec[b][(size_t) i * kWideRec + 1] = 0; }
+    }
+}
+
 }  // namespace
 
 namespace ai::kern {
@@ -1583,6 +1661,18 @@ bool q4x_experts_range(void * stream, int ty_gu, const void * up, const void * g
 int q4x_experts_wide_rec() { return kWideRec; }
 void q4x_experts_set_tc(int mode) { g_tc_override = mode; }
 int q4x_experts_wide_cols() { return kWideCols; }
+
+bool q4x_pf_plan(void * stream, const int32_t * sel, int64_t c0, int64_t c1, const int32_t * res_slot,
+                 const int32_t * spare_slot, const int32_t * scr_slot, int nslots_res, int nslots_spare, int nslots_scr,
+                 int32_t * rec_res, int cap_res, int32_t * rec_spare, int cap_spare, int32_t * rec_scr, int cap_scr,
+                 int * overflow) {
+    if (nslots_res > kPlanMaxSlots || nslots_spare > kPlanMaxSlots || nslots_scr > kPlanMaxSlots || c1 > (1LL << 30)) return false;
+    pf_plan_k<<<1, kPlanThreads, 0, (cudaStream_t) stream>>>(sel, (int) c0, (int) c1, res_slot, spare_slot, scr_slot,
+                                                            nslots_res, spare_slot ? nslots_spare : 0, nslots_scr, rec_res,
+                                                            cap_res, rec_spare, spare_slot ? cap_spare : 0, rec_scr, cap_scr,
+                                                            overflow);
+    return true;
+}
 
 bool q4x_experts_wide(void * stream, int ty_gu, const void * up, const void * gate, int64_t row_bytes_gu,
                       int64_t expert_bytes_gu, int ty_down, const void * down, int64_t row_bytes_down,
@@ -1979,6 +2069,7 @@ __global__ void __launch_bounds__(4 * kMqRows) gu_mmq_k(const uint8_t * __restri
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3, tid = threadIdx.x;
     if ((int) blockIdx.y >= count) return;
     const int32_t * o = recs + (size_t) blockIdx.y * rec_stride;
+    if (o[1] == 0) return;   // [AI_Q4X_PF_DEVPLAN] an unused record of a device-built plan (block-uniform)
     const int ch = o[0], ncols = o[1], nsb = K / QK_K, rb = blockIdx.x * kMqRows;
     const uint8_t * gbase = gate + (size_t) ch * exp_bytes, * ubase = up + (size_t) ch * exp_bytes;
     const int  myr = rb + 8 * warp + g;   // this thread's output row (gate row myr pairs with up row myr)

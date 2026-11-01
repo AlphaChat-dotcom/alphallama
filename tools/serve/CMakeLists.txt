@@ -147,7 +147,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 # HTTP Server binary (multi-backend intelligence server)
-add_executable(alphallama-serve serve-main.cpp)
+add_executable(alphallama-serve serve-main.cpp serve-autotune.cpp serve-autotune.h)
 target_include_directories(alphallama-serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(alphallama-serve PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(alphallama-serve PRIVATE ${CMAKE_SOURCE_DIR}/src)

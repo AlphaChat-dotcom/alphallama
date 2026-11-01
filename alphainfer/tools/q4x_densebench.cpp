@@ -2,7 +2,10 @@
 // ai-q4x-densebench: the fp16 tensor-core dense GEMV (kernels/q4x_dense.cu) on synthetic rows.
 //   check: vs an fp64 reference built from ggml's own CPU dequantisation (type traits to_float) and the fp32 x;
 //   speed: us per call and the DRAM rate over the weight bytes, per T.
-//   ai-q4x-densebench [--type q6_K] [--N 8192] [--K 2560] [--T 1,2,3,4,8,16,32] [--reps 100] [--checkN 256]
+//   ai-q4x-densebench [--type q6_K] [--N 8192] [--K 2560] [--T 1,2,3,4,8,16,32] [--reps 100] [--checkN 256] [--copies R|auto]
+//   --copies: the timed calls rotate over R copies of the weights. One copy re-read 100x sits in L2 when it fits (the
+//   4080's 64 MB L2 read N 16384 q6_K at 127% of DRAM); a decode round reads each layer's weights once. auto = enough
+//   copies for 4x the L2.
 #include <cstddef>
 #include <cstdint>
 
@@ -35,7 +38,8 @@ static int type_of(const char * s) {
 }
 
 int main(int argc, char ** argv) {
-    int ty = GGML_TYPE_Q6_K, reps = 100, checkN = 256;
+    int ty = GGML_TYPE_Q6_K, reps = 100, checkN = 256, copies = 1;
+    bool copies_auto = false;
     int64_t N = 8192, K = 2560;
     std::vector<int> Ts = { 1, 2, 3, 4, 8, 16, 32 };
     for (int i = 1; i < argc; ++i) {
@@ -46,6 +50,7 @@ int main(int argc, char ** argv) {
         else if (a == "--K") K = atoll(nx());
         else if (a == "--reps") reps = atoi(nx());
         else if (a == "--checkN") checkN = atoi(nx());
+        else if (a == "--copies") { const std::string v = nx(); if (v == "auto") copies_auto = true; else copies = std::max(1, atoi(v.c_str())); }
         else if (a == "--T") { Ts.clear(); for (char * p = strtok(nx(), ","); p; p = strtok(nullptr, ",")) Ts.push_back(atoi(p)); }
         else { fprintf(stderr, "bad arg %s\n", a.c_str()); return 2; }
     }
@@ -69,13 +74,20 @@ int main(int argc, char ** argv) {
     std::vector<float> hx((size_t) (K * Tmax));
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto & v : hx) v = nd(rng) * 3.0f;
+    if (copies_auto) {
+        int l2 = 0;
+        CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0));
+        copies = (int) std::min<size_t>(64, std::max<size_t>(1, (4 * (size_t) l2 + hw.size() - 1) / hw.size()));
+    }
+    printf("timed over %d weight cop%s (%.1f MB)\n", copies, copies == 1 ? "y" : "ies", copies * hw.size() / 1e6);
     void * dw; float * dx, * dout; void * scr;
-    CK(cudaMalloc(&dw, hw.size()));
-    CK(cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dw, hw.size() * copies));
+    for (int c = 0; c < copies; ++c) CK(cudaMemcpy((uint8_t *) dw + hw.size() * c, hw.data(), hw.size(), cudaMemcpyHostToDevice));
+    auto wcopy = [&](int i) { return (const void *) ((const uint8_t *) dw + hw.size() * (size_t) (i % copies)); };
     CK(cudaMalloc(&dx, hx.size() * 4));
     CK(cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dout, sizeof(float) * N * Tmax));
-    CK(cudaMalloc(&scr, kern::q4x_dense_scratch_bytes(K, Tmax)));
+    CK(cudaMalloc(&scr, kern::q4x_dense_scratch_bytes(K, Tmax, N)));
     cudaStream_t st;
     CK(cudaStreamCreate(&st));
     // fp64 reference for the first checkN rows (ggml's CPU dequantisation)
@@ -96,7 +108,7 @@ int main(int argc, char ** argv) {
     for (int T : Ts) {
         if (!kern::q4x_dense_ok(ty, N, K, T)) { printf("T %d declined\n", T); continue; }
         CK(cudaMemset(dout, 0, sizeof(float) * N * T));
-        if (!kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, T, scr, dout, N)) { printf("declined\n"); return 1; }
+        if (!kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, T, scr, dout, N, N)) { printf("declined\n"); return 1; }
         CK(cudaStreamSynchronize(st));
         CK(cudaGetLastError());
         std::vector<float> o((size_t) N * T);
@@ -111,13 +123,13 @@ int main(int argc, char ** argv) {
             }
         // column invariance: column 0 of this T vs column 0 of T = 1 (bitwise)
         std::vector<float> o1((size_t) N);
-        if (!kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, 1, scr, dout, N)) return 1;
+        if (!kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, 1, scr, dout, N, N)) return 1;
         CK(cudaMemcpy(o1.data(), dout, o1.size() * 4, cudaMemcpyDeviceToHost));
         long long diff1 = 0;
         for (int64_t n = 0; n < N; ++n) diff1 += memcmp(&o1[(size_t) n], &o[(size_t) n], 4) != 0;
-        for (int i = 0; i < 5; ++i) kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, T, scr, dout, N);
+        for (int i = 0; i < 5; ++i) kern::q4x_dense(st, ty, wcopy(i), (int64_t) rb, N, K, dx, K, T, scr, dout, N, N);
         CK(cudaEventRecord(e0, st));
-        for (int i = 0; i < reps; ++i) kern::q4x_dense(st, ty, dw, (int64_t) rb, N, K, dx, K, T, scr, dout, N);
+        for (int i = 0; i < reps; ++i) kern::q4x_dense(st, ty, wcopy(i), (int64_t) rb, N, K, dx, K, T, scr, dout, N, N);
         CK(cudaEventRecord(e1, st));
         CK(cudaEventSynchronize(e1));
         float ms = 0;

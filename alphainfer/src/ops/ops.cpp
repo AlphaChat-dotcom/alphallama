@@ -380,12 +380,15 @@ Tensor rows(Device & d, const Tensor & x, const Tensor & ids) {
     return c.run(ggml_get_rows(c.ctx(), c.in(x), c.in(ids)));
 }
 
+static void ws_past(Device & d, const Tensor & x);   // below, with argmax
+
 Tensor max_softmax(Device & d, const Tensor & logits) {
     const int64_t ncols = logits.ne[0];
     const int64_t rows  = logits.numel() / ncols;
     if (logits.type != F32 || !logits.contiguous()) {
         throw std::runtime_error("max_softmax: f32 contiguous logits only");
     }
+    ws_past(d, logits);
     Tensor        dst = d.ws_alloc(F32, rows);
     const int64_t nsc = kern::max_softmax_scratch_floats(rows);
     Tensor        sc  = nsc > 0 ? d.ws_alloc(F32, nsc) : Tensor{};
@@ -397,7 +400,23 @@ Tensor max_softmax(Device & d, const Tensor & logits) {
     return dst;
 }
 
+// [stray-token bug, 2026-11-01] scratch allocated after a RoundCache replay can land INSIDE the replayed round's output
+// (rounds record from workspace origin 0; a replay leaves the caller's offset where it was), and argmax_partial_k then
+// overwrote logits other blocks were still reading. Before allocating scratch next to an f32 input that lives in the
+// workspace, move the offset past that input's end (forward only: what the caller allocated stays valid). Q4xServe's
+// argmax_cols does the same (c924e5b); this covers every caller, the CLI's greedy path included.
+static void ws_past(Device & d, const Tensor & x) {
+    const char * wb = (const char *) d.ws_base();
+    if (!wb || !x.valid() || x.type != F32) return;
+    const char * p0 = (const char *) x.data;
+    const size_t n  = (size_t) x.numel() * sizeof(float);
+    if (p0 < wb || p0 + n > wb + d.ws_capacity()) return;
+    const size_t e = (size_t) (p0 - wb) + n;
+    if (d.ws_mark() < e && e + ((size_t) 1 << 20) <= d.ws_capacity()) d.ws_reset(e);
+}
+
 Tensor argmax(Device & d, const Tensor & logits, const Tensor * map) {
+    ws_past(d, logits);
     // ggml's argmax is one block per row, so a 248k-column decode row reduces on a single block.
     // The native path splits the row and is bit-exact, ties included.
     static const bool k_native_argmax = []() {
@@ -434,6 +453,7 @@ void sample_into(Device & d, const Tensor & logits, const Tensor & token, int64_
     }
     const int64_t   ncols = logits.ne[0];
     const int64_t   rows  = logits.numel() / ncols;
+    ws_past(d, logits);
     Tensor          sc    = d.ws_alloc(F32, kern::sample_scratch_floats(rows));
     void *          st    = adapter::stream(d);
     const float *   px    = (const float *) logits.data;

@@ -44,7 +44,12 @@ static bool gemv16_ok(const Tensor & w, const Tensor & x) {
            w.ne[0] <= 4096 && ((uintptr_t) w.data & 15) == 0 && ((uintptr_t) x.data & 15) == 0;
 }
 
+// [AI_Q4X_STREAM_SPLIT] while set, linear() enqueues its native kernel on the backend's second stream (the caller
+// forks / joins around it); read at enqueue time
+static thread_local bool g_lin_side = false;
+
 Tensor linear(Device & d, const Tensor & w, const Tensor & x) {
+    const bool side = g_lin_side;
     if (gemv16_ok(w, x)) {
         const int64_t N = w.ne[1], K = w.ne[0], T = x.ne[1] * x.ne[2];
         Tensor        out = d.ws_alloc(F32, N, T);
@@ -54,7 +59,8 @@ Tensor linear(Device & d, const Tensor & w, const Tensor & x) {
         float *       op_ = (float *) out.data;
         Device *      dev = &d;
         adapter::native(d, [=]() {
-            if (!kern::q4x_gemv16(adapter::stream(*dev), wp, bf, xp, (int) K, (int) N, (int) T, op_)) abort();
+            void * st = side ? kern::backend_stream_no(dev->backend(), 1) : adapter::stream(*dev);
+            if (!kern::q4x_gemv16(st, wp, bf, xp, (int) K, (int) N, (int) T, op_)) abort();
         });
         return out;
     }
@@ -63,7 +69,8 @@ Tensor linear(Device & d, const Tensor & w, const Tensor & x) {
     if (!said) { said = true; fprintf(stderr, "[q4x-dense] dense projections on fp16 tensor cores (AI_Q4X_DENSE=1)\n"); }
     const int64_t N = w.ne[1], K = w.ne[0], T = x.ne[1] * x.ne[2];
     Tensor        out = d.ws_alloc(F32, N, T);
-    Tensor        scr = d.ws_alloc(F32, (int64_t) (kern::q4x_dense_scratch_bytes(K, T) / 4) + 64, 1);
+    // room for AI_Q4X_DENSE_SK's split-K partials (KS x T x N floats: 0.3 MB at N 8192, K 2560, T 4)
+    Tensor        scr = d.ws_alloc(F32, (int64_t) (kern::q4x_dense_scratch_bytes(K, T, N) / 4) + 64, 1);
     const int     ty = (int) w.type;
     const void *  wp = w.data;
     const int64_t rb = (int64_t) w.nb[1], xs = (int64_t) (x.nb[1] / 4);
@@ -72,7 +79,8 @@ Tensor linear(Device & d, const Tensor & w, const Tensor & x) {
     float *       op_ = (float *) out.data;
     Device *      dev = &d;
     adapter::native(d, [=]() {
-        if (!kern::q4x_dense(adapter::stream(*dev), ty, wp, rb, N, K, xp, xs, T, sp, op_, N)) {
+        void * st = side ? kern::backend_stream_no(dev->backend(), 1) : adapter::stream(*dev);
+        if (!kern::q4x_dense(st, ty, wp, rb, N, K, xp, xs, T, sp, op_, N, N)) {
             fprintf(stderr, "[q4x-dense] declined a shape the host check accepted\n");
             abort();
         }
@@ -274,9 +282,29 @@ static Tensor gdn_block_native(Device & d, const Tensor & x, const GdnWeights & 
             c.late(al);
         }
         if (dn && (w.ba.valid() ? gemv16_ok(w.ba, x) : gemv16_ok(w.beta, x) && gemv16_ok(w.alpha, x))) {
-            // the small BF16 gate projections natively too: this call launches nothing
+            // [item 3] the small BF16 gate projections natively too: this call launches nothing
+            // [AI_Q4X_STREAM_SPLIT & 1, default 0 until measured] ... on the backend's second stream, concurrent with the big
+            // qkvz projection on the main stream, joined right after it (Strata splits the GDN in-projection from alpha/beta:
+            // 0.30 ms/window of overlap on the 5090, nsys). Same kernels: identical bits.
+            static const int split = getenv("AI_Q4X_STREAM_SPLIT") ? atoi(getenv("AI_Q4X_STREAM_SPLIT")) : 0;
+            const bool       sp1   = (split & 1) != 0;
+            static void *    evs[2 * 128] = {};
+            static unsigned  ev_i = 0;
+            void *           ef = nullptr, * ej = nullptr;
+            Device *         dvs = &d;
+            if (sp1) {
+                const unsigned i = (ev_i++) % 128;
+                if (!evs[2 * i]) { evs[2 * i] = kern::event_create(); evs[2 * i + 1] = kern::event_create(); }
+                ef = evs[2 * i]; ej = evs[2 * i + 1];
+                adapter::native(d, [=]() {
+                    kern::event_record(ef, adapter::stream(*dvs));
+                    kern::stream_wait_event(kern::backend_stream_no(dvs->backend(), 1), ef);
+                });
+                g_lin_side = true;
+            }
             if (w.ba.valid()) ba_t = linear(d, w.ba, x);
             else { beta_t = linear(d, w.beta, x); alpha_t = linear(d, w.alpha, x); }
+            g_lin_side = false;
             ba = be = al = nullptr;
             if (w.qkvz.valid()) {
                 fo_t   = linear(d, w.qkvz, x);
@@ -286,6 +314,12 @@ static Tensor gdn_block_native(Device & d, const Tensor & x, const GdnWeights & 
             } else {
                 z_t   = linear(d, w.z, x);
                 qkv_t = linear(d, w.qkv, x);
+            }
+            if (sp1) {
+                adapter::native(d, [=]() {
+                    kern::event_record(ej, kern::backend_stream_no(dvs->backend(), 1));
+                    kern::stream_wait_event(adapter::stream(*dvs), ej);
+                });
             }
         } else if (dn) {
             if (ba) ba_t = c.run(ba);
@@ -818,6 +852,41 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
         adapter::native(d, [=]() { kern::q4x_qsa_dirty(st, pp, T, r, pc_M, rows, pcc, pcr, pcp); });
     }
 
+    // [AI_Q4X_ATTN_NATIVE_PROJ, default 0 until NLL-gated] decode widths: Q / K / V on the native fp16 dense path
+    // (linear(), as the GDN projections) instead of the graph's MMVQ; bit 2 also puts K / V on the backend's second
+    // stream, concurrent with Q, joined before the graph (Strata splits its attention projections across two streams:
+    // ~0.5 ms/window on the 5090, nsys). A numerics change (fp16 activations vs MMVQ's q8_1): paired NLL first.
+    static const int anp  = getenv("AI_Q4X_ATTN_NATIVE_PROJ") ? atoi(getenv("AI_Q4X_ATTN_NATIVE_PROJ")) : 0;
+    const bool       natp = anp != 0 && T <= 16 && dense_ok(w.q, x) && dense_ok(w.k, x) && dense_ok(w.v, x);
+    Tensor           qf_n, k_n, v_n;
+    if (natp) {
+        const bool       spl = (anp & 2) != 0;
+        static void *    evs[2 * 64] = {};
+        static unsigned  ev_i = 0;
+        void *           ef = nullptr, * ej = nullptr;
+        Device *         dvs = &d;
+        if (spl) {
+            const unsigned i = (ev_i++) % 64;
+            if (!evs[2 * i]) { evs[2 * i] = kern::event_create(); evs[2 * i + 1] = kern::event_create(); }
+            ef = evs[2 * i]; ej = evs[2 * i + 1];
+            adapter::native(d, [=]() {
+                kern::event_record(ef, adapter::stream(*dvs));
+                kern::stream_wait_event(kern::backend_stream_no(dvs->backend(), 1), ef);
+            });
+            g_lin_side = true;
+        }
+        k_n = linear(d, w.k, x);
+        v_n = linear(d, w.v, x);
+        g_lin_side = false;
+        qf_n = linear(d, w.q, x);
+        if (spl) {
+            adapter::native(d, [=]() {
+                kern::event_record(ej, kern::backend_stream_no(dvs->backend(), 1));
+                kern::stream_wait_event(adapter::stream(*dvs), ej);
+            });
+        }
+    }
+
     Call c(d);
     ggml_context * g = c.ctx();
     ggml_tensor *  gx = c.in(x, "attn_in");
@@ -898,13 +967,13 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
         }
     }
 
-    // attention
-    ggml_tensor * qf   = ggml_mul_mat(g, c.in(w.q, "wq"), gx);
+    // ---- attention ----
+    ggml_tensor * qf   = natp ? c.in(qf_n, "wq_native") : ggml_mul_mat(g, c.in(w.q, "wq"), gx);
     const size_t  es   = ggml_element_size(qf);
     ggml_tensor * q    = ggml_view_3d(g, qf, D, Hq, T, es * D * 2, es * D * 2 * Hq, 0);
     ggml_tensor * gate = ggml_cont_2d(g, ggml_view_3d(g, qf, D, Hq, T, es * D * 2, es * D * 2 * Hq, es * D), D * Hq, T);
-    ggml_tensor * k    = ggml_reshape_3d(g, ggml_mul_mat(g, c.in(w.k, "wk"), gx), D, Hkv, T);
-    ggml_tensor * v    = ggml_reshape_3d(g, ggml_mul_mat(g, c.in(w.v, "wv"), gx), D, Hkv, T);
+    ggml_tensor * k    = ggml_reshape_3d(g, natp ? c.in(k_n, "wk_native") : ggml_mul_mat(g, c.in(w.k, "wk"), gx), D, Hkv, T);
+    ggml_tensor * v    = ggml_reshape_3d(g, natp ? c.in(v_n, "wv_native") : ggml_mul_mat(g, c.in(w.v, "wv"), gx), D, Hkv, T);
     q = rope(ggml_mul(g, ggml_rms_norm(g, q, p.eps), c.in(w.q_norm, "attn_q_norm")), pos);
     k = rope(ggml_mul(g, ggml_rms_norm(g, k, p.eps), c.in(w.k_norm, "attn_k_norm")), pos);
 

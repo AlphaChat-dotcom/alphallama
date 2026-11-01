@@ -178,7 +178,14 @@ void offload_wait_fill(void * stream, const unsigned * done_bell, const unsigned
 // logits f32 [E, T] scratch; sel i32 [k, T]; weights f32 [k, T]. false = shape not supported (caller falls back).
 bool q4x_route(void * stream, const void * w, bool w_is_bf16, const float * x, int K, int E, int T, int k,
                float * logits, int32_t * sel, float * weights);
-// select_cols: out[:, c] = use_a[c] ? a[:, c] : b[:, c] over f32 [N, cols] (offload.cu)
+// [AI_Q4X_ROUTE_RING] q4x_route + offload_resolve_ring fused (no GPU miss share): the top-k kernel's T blocks also write
+// slots / miss ids / weights / their x column to the bells, and the last block rings (n_tok, seq). x is [K, T].
+bool q4x_route_ring(void * stream, const void * w, bool w_is_bf16, const float * x, int K, int E, int T, int k,
+                    float * logits, int32_t * sel, float * weights, const int32_t * table, int32_t filler0,
+                    int32_t * slots, int32_t * miss_bell, float * x_bell, int32_t * n_tok_bell, unsigned * seq_bell,
+                    const unsigned * base, int layer, float * w_bell);
+// [P4] fused MoE weighted sum: out f32 [N, T] = sum_j w[j, t] * exps[:, j, t] + shared[:, t], ggml's exact op order
+// [P6 prefill] out[:, c] = use_a[c] ? a[:, c] : b[:, c] over f32 [N, cols] (offload.cu)
 void select_cols(void * stream, const float * a, const float * b, const int32_t * use_a, float * out, int64_t N,
                  int64_t cols);
 // moe_wsum: fused MoE weighted sum, out f32 [N, T] = sum_j w[j, t] * exps[:, j, t] + shared[:, t], ggml's op order.
@@ -206,7 +213,12 @@ bool   q4x_experts(void * stream, int ty_gu, const void * up, const void * gate,
 // n_own records of q4x_experts_wide_rec() ints, [slot, ncols, cols...] (column = t * k + j). Writes only owned columns.
 // q4x_gemv16: small BF16/F16 projection of T <= 16 rows with the router's GEMV (q4x_route.cu): out[t * N + n] = W[n] . x[t];
 // K % 512 == 0, K <= 4096, 16-byte aligned w and x. Returns false (nothing launched) otherwise.
-// Draft capture: tok = map ? map[*idx] : *idx -> *ids_next (if non-null), *out_tok; *out_p = *p (q4x_route.cu)
+// [draft capture] tok = map ? map[*idx] : *idx -> *ids_next (if non-null), *out_tok; *out_p = *p (q4x_route.cu)
+// [AI_Q4X_DRAFT_ARGMAX_NATIVE] top-1 + softmax probability of f32 logits [V] and draft_next's stores in two launches;
+// part: 3 * q4x_draft_argmax_blocks(V) floats of scratch
+int    q4x_draft_argmax_blocks(int64_t V);
+void   q4x_draft_argmax_next(void * stream, const float * logits, int64_t V, float * part, const int32_t * map,
+                             int32_t * ids_next, int32_t * out_tok, float * out_p);
 void   q4x_draft_next(void * stream, const int32_t * idx, const float * p, const int32_t * map, int32_t * ids_next,
                       int32_t * out_tok, float * out_p);
 // Prefill: one sub-chunk's causal mask f16 [n_kv, T]: m[i * n_kv + j] = j <= p0 + i ? 0 : -inf (q4x_route.cu)
@@ -214,14 +226,17 @@ void   q4x_causal_mask(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int
 void   q4x_mtp_mask_col0(void * stream, uint16_t * m, int64_t n_kv, int64_t T, int64_t p0);   // MTP: column 0 masked past p 0
 // copy n i32 from (mapped pinned host) src to device dst with a kernel on `stream` (not the copy engine)
 void   q4x_copy_i32(void * stream, const int32_t * src, int32_t * dst, int64_t n);
+// [AI_Q4X_PLE_GATE] wait until the mapped host flag >= *want (device word), then copy n f32 from mapped host src to dst
+void   q4x_ple_gate(void * stream, const unsigned * flag, const unsigned * want, const float * src, float * dst, int64_t n);
 bool   q4x_gemv16(void * stream, const void * w, bool w_is_bf16, const float * x, int K, int N, int T, float * out);
 // Dense small-M GEMV on fp16 tensor cores, fp16 activations (src/kernels/q4x_dense.cu): out[t * ldo + n] =
 // sum_k W[n][k] x[t * x_stride + k] for q6_K / q5_K / q4_K / iq4_xs / iq3_s rows, T <= 32; flat in T per 8 columns.
 bool   q4x_dense_ok(int type, int64_t N, int64_t K, int64_t T);
-size_t q4x_dense_scratch_bytes(int64_t K, int64_t T);
+// N > 0: also room for the split-K partials of N rows (AI_Q4X_DENSE_SK); pass the same N as scratch_n to q4x_dense
+size_t q4x_dense_scratch_bytes(int64_t K, int64_t T, int64_t N = 0);
 bool   q4x_dense(void * stream, int type, const void * w, int64_t row_bytes, int64_t N, int64_t K, const float * x,
-                 int64_t x_stride, int64_t T, void * scratch, float * out, int64_t ldo);
-// 1 = the tensor-core grouped experts, 0 = the dp4a ones; overrides AI_Q4X_TC (for tools)
+                 int64_t x_stride, int64_t T, void * scratch, float * out, int64_t ldo, int64_t scratch_n = 0);
+// [item 1] 1 = the tensor-core grouped experts, 0 = the dp4a ones; overrides AI_Q4X_TC (tools, A/B)
 void   q4x_experts_set_tc(int mode);
 int    q4x_experts_wide_rec();
 // Prefill with big MoE batches: the tensor-core wide path in three steps (q4x_experts.cu): gate/up over T rows (both banks
@@ -239,6 +254,13 @@ bool   q4x_experts_wide_dn(void * stream, int ty_gu, const void * up, const void
                            int ty_down, const void * down, int64_t rbd, int64_t ebd, const int32_t * plan, int n_own,
                            int64_t K, int64_t F, int64_t N, int k, int64_t T, void * scratch, float * out, int64_t col_lo);
 int    q4x_experts_wide_cols();
+// [AI_Q4X_PF_DEVPLAN] the owner records of columns [c0, c1) built on the device from the routing sel (no host read-back):
+// resident (res_slot[e] >= 0), spare (spare_slot, may be null) and scratch (scr_slot) banks, each padded to its cap
+// with ncols-0 records the expert kernels skip. *overflow (device int) is set to 1 if a bank needed more than its cap.
+bool   q4x_pf_plan(void * stream, const int32_t * sel, int64_t c0, int64_t c1, const int32_t * res_slot,
+                   const int32_t * spare_slot, const int32_t * scr_slot, int nslots_res, int nslots_spare, int nslots_scr,
+                   int32_t * rec_res, int cap_res, int32_t * rec_spare, int cap_spare, int32_t * rec_scr, int cap_scr,
+                   int * overflow);
 bool   q4x_experts_wide(void * stream, int ty_gu, const void * up, const void * gate, int64_t row_bytes_gu,
                         int64_t expert_bytes_gu, int ty_down, const void * down, int64_t row_bytes_down,
                         int64_t expert_bytes_down, const float * x, int64_t x_stride, const int32_t * plan, int n_own,

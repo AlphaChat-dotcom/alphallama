@@ -237,10 +237,46 @@ Tensor Qwen4ExpRun::mtp_build(const Tensor & H, const Tensor & ids_t, const Tens
     Tensor R1 = op::q4x::hc_scatter(dev_, R0, att, r.inject);
     op::q4x::HcRead f = op::q4x::hc_read(dev_, R1, L.hc_ffn, s.rms_eps);
     op::MoeParams mp{ s.n_expert, s.n_expert_used };
-    op::MoeRoute  route  = op::moe_route(dev_, f.mixed, L.moe.router, mp);
+    // [AI_Q4X_MTP_NATIVE_MOE, default 1] the head's routing and weighted sum through the trunk's native kernels
+    // (moe_doorbell): router GEMV + softmax + top-k + renorm in 2 launches instead of ggml's chain with its ONE-block
+    // argsort over 512 experts, and the fused weighted sum (ggml's exact op order) instead of a mul + k-1 adds. 5090
+    // 2026-11-01: argsort 10 us + ~13 element-wise launches per draft step against Strata's draft step.
+    static const bool nat = !getenv("AI_Q4X_MTP_NATIVE_MOE") || atoi(getenv("AI_Q4X_MTP_NATIVE_MOE")) != 0;
+    const Tensor & mx = f.mixed;
+    const Tensor & rw = L.moe.router;
+    const int      mk = s.n_expert_used;
+    const int64_t  mN = mx.ne[0], mT = mx.ne[1];
+    op::MoeRoute   route;
+    Device *       mdv = &dev_;
+    if (nat && mT <= 16 && (rw.type == BF16 || rw.type == F16) && rw.contiguous() && mx.contiguous() && rw.ne[0] == mN &&
+        rw.ne[1] == s.n_expert && s.n_expert <= 1024) {
+        Tensor        lgt = dev_.ws_alloc(F32, s.n_expert, mT);
+        route.sel         = dev_.ws_alloc(I32, mk, mT);
+        route.weights     = dev_.ws_alloc(F32, 1, mk, mT);
+        const void *  wp0 = rw.data;
+        const bool    bf  = rw.type == BF16;
+        const float * xp0 = (const float *) mx.data;
+        float *       lp  = (float *) lgt.data;
+        int32_t *     sp0 = (int32_t *) route.sel.data;
+        float *       wo  = (float *) route.weights.data;
+        const int     E   = s.n_expert;
+        adapter::native(dev_, [=]() { kern::q4x_route(adapter::stream(*mdv), wp0, bf, xp0, (int) mN, E, (int) mT, mk, lp, sp0, wo); });
+    } else {
+        route = op::moe_route(dev_, mx, rw, mp);
+    }
     Tensor        shared = op::moe_shared(dev_, f.mixed, L.moe);
     Tensor        exps   = op::q4x::moe_experts_raw(dev_, f.mixed, L.moe.up_exps, L.moe.gate_exps, L.moe.down_exps, route.sel);
-    Tensor        y      = op::q4x::moe_weighted_sum(dev_, exps, route.weights, shared, s.n_expert_used);
+    Tensor        y;
+    if (nat && exps.contiguous() && route.weights.contiguous() && shared.contiguous()) {
+        y                 = dev_.ws_alloc(F32, mN, mT);
+        const float * ep  = (const float *) exps.data;
+        const float * we  = (const float *) route.weights.data;
+        const float * sh  = (const float *) shared.data;
+        float *       yo  = (float *) y.data;
+        adapter::native(dev_, [=]() { kern::moe_wsum(adapter::stream(*mdv), ep, we, sh, yo, mN, mk, mT); });
+    } else {
+        y = op::q4x::moe_weighted_sum(dev_, exps, route.weights, shared, s.n_expert_used);
+    }
     Tensor        R2     = op::q4x::hc_scatter(dev_, R1, y, f.inject);
     op::copy_into(dev_, R2.reshape(HW, T, 1, 1), mtp_R2_, "q4x mtp R2");
     Tensor h  = op::q4x::hc_head(dev_, R2, M.head, s.rms_eps);
@@ -258,7 +294,7 @@ Tensor Qwen4ExpRun::mtp_build(const Tensor & H, const Tensor & ids_t, const Tens
 // mask over a power-of-two envelope F) in fixed buffers, each step's argmax mapped to its token on the device and fed
 // to the next step's embedding (draft_next), so the host waits once per chain instead of twice per step. Keyed by
 // (F, fill rows m, n). Returns the n drafts and their probabilities (the caller applies tau).
-void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * probs) {
+void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch) {
     const Qwen4ExpSpec & s = prog_.spec();
     const int64_t HW = s.hc_dim(), pos = (int64_t) hist_.size();
     const int64_t m = mtp_fill_m_, p0 = mtp_fill_p0_;
@@ -326,15 +362,27 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
         for (int i = 0; i < n; ++i) {
             const Tensor lg = mtp_build(H, mc_sids_[i], mc_spos4_[i], mc_scell_[i],
                                         mc_smask_[i].view(F, 1, 1, 1, (size_t) F * 2, (size_t) F * 2, (size_t) F * 2, 0), 1, F, true);
-            const op::q4x::ArgmaxP am = op::q4x::argmax_p(dev_, lg);
-            const int32_t * ip  = (const int32_t *) am.idx.data;
-            const float *   pp  = (const float *) am.p.data;
             const int32_t * mp  = mapped ? (const int32_t *) draft_map_dev_.data : nullptr;
             int32_t *       nx  = i + 1 < n ? (int32_t *) mc_sids_[i + 1].data : nullptr;
             int32_t *       ot  = (int32_t *) mc_tok_.data + i;
             float *         op_ = (float *) mc_p_.data + i;
             Device *        dv  = &dev_;
-            adapter::native(dev_, [=]() { kern::q4x_draft_next(adapter::stream(*dv), ip, pp, mp, nx, ot, op_); });
+            // [AI_Q4X_DRAFT_ARGMAX_NATIVE, default 1] top-1 + probability + draft_next in two native launches (ggml's
+            // argmax runs ONE block over the draft rows: argmax + soft_max + get_rows + draft_next were 81 us a chain
+            // of 3 on the 5090, 2026-10-31)
+            static const bool am_native = !getenv("AI_Q4X_DRAFT_ARGMAX_NATIVE") || atoi(getenv("AI_Q4X_DRAFT_ARGMAX_NATIVE")) != 0;
+            if (am_native && lg.type == F32 && lg.contiguous() && lg.numel() == lg.ne[0]) {
+                const int64_t V    = lg.ne[0];
+                Tensor        part = dev_.ws_alloc(F32, 3 * (int64_t) kern::q4x_draft_argmax_blocks(V));
+                const float * lp   = (const float *) lg.data;
+                float *       pp2  = (float *) part.data;
+                adapter::native(dev_, [=]() { kern::q4x_draft_argmax_next(adapter::stream(*dv), lp, V, pp2, mp, nx, ot, op_); });
+            } else {
+                const op::q4x::ArgmaxP am = op::q4x::argmax_p(dev_, lg);
+                const int32_t * ip = (const int32_t *) am.idx.data;
+                const float *   pp = (const float *) am.p.data;
+                adapter::native(dev_, [=]() { kern::q4x_draft_next(adapter::stream(*dv), ip, pp, mp, nx, ot, op_); });
+            }
             H = mtp_R2_;
         }
         return mc_tok_;
@@ -343,6 +391,7 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
                 (long long) ((k2 >> 6) & 63), (long long) ((k2 >> 1) & 31), e.round->n_nodes());
     });
     mtp_fill_m_ = 0;
+    if (!fetch) return;   // [AI_Q4X_VERIFY_EARLY] read from mc_tok_ after an event, not a stream sync
     dev_.download(mc_tok_, toks, 0, (size_t) n * 4);
     dev_.download(mc_p_, probs, 0, (size_t) n * 4);
 }

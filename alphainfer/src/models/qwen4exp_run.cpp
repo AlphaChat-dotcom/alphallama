@@ -219,6 +219,7 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
 
 void Qwen4ExpRun::reset() {
     fold_join(true);
+    ple_gate_idle();
     hist_.clear();
     ck_len_ = -1;
     if (mtp_on_) {   // no pending fill, no carried H (the head's K/V is masked by position)
@@ -266,6 +267,7 @@ void Qwen4ExpRun::checkpoint() {
 bool Qwen4ExpRun::restore_checkpoint() {
     if (ck_len_ < 0 || ck_len_ > (int64_t) hist_.size()) return false;
     fold_join(true);
+    ple_gate_idle();
     dev_.synchronize();
     const std::vector<Tensor *> ts = recurrent_tensors();
     if (ts.size() != ck_buf_.size()) return false;
@@ -281,14 +283,14 @@ bool Qwen4ExpRun::restore_checkpoint() {
 // [AI_Q4X_PLE_IO] the PLE rows' host reads. Rows are hashed n-grams spread over the 29 GB table and the page cache holds
 // only what was read since the tier fill dropped it. One blocking pread per row, serially on the decode thread, cost
 // 8.7-10.3 ms of host time per round on the 3090 starts whose disk was slow (tier read 36-40 s; 63-78 vs 91-105 tok/s,
-// dg1 2026-10-30) and 7.2 ms under an O_DIRECT read ballast (pl1). Per call:
-//   1. the row ids are de-duplicated (55.7% of a call's rows repeat another's: pl1);
+// 2026-10-30) and 7.2 ms under an O_DIRECT read ballast. Per call:
+//   1. the row ids are de-duplicated (55.7% of a call's rows repeat another's);
 //   2. every unique row is tried with preadv2 RWF_NOWAIT -- a page-cache hit costs what the serial pread did;
 //   3. the rows that would wait for the disk are all queued with WILLNEED readahead at once, then read: inline below
 //      AI_Q4X_PLE_IO_MIN rows (a decode round), else by blocking reader threads too (AI_Q4X_PLE_IO, default 16; on the
 //      host cpus, never the launch core or the spinning pool).
 // A row cache across calls was tried and dropped: 0.3% hits (the next round's rows are never this round's), and waking
-// the readers for page-cache hits cost +0.4 ms/round quiet (pl1). Same bytes, same to_float: the output does not change.
+// the readers for page-cache hits cost +0.4 ms/round quiet. Same bytes, same to_float: the output does not change.
 struct Qwen4ExpRun::PleIo {
     const WeightSet & ws;
     size_t            rb;
@@ -298,7 +300,7 @@ struct Qwen4ExpRun::PleIo {
     std::atomic<size_t>      left{0};
     std::mutex               mu, call_mu;
     std::condition_variable  cv, done_cv;
-    uint64_t                 gen = 0;
+    uint64_t                 gen = 0, open_gen = 0;   // open_gen: the threaded call readers may still join (0 = none)
     int                      draining = 0;
     bool                     stop = false;
     // [AI_Q4X_PLE_IO_MIN, default 64] fewer disk rows than this are read inline (a decode round's ~20: waking the
@@ -330,6 +332,8 @@ struct Qwen4ExpRun::PleIo {
                     cv.wait(lk, [&]() { return stop || gen != seen; });
                     if (stop) return;
                     seen = gen;
+                    // [stray-token race, 2026-11-01] a reader that wakes after its call finished must not drain
+                    if (open_gen != gen) continue;
                     ++draining;
                 }
                 drain();
@@ -369,6 +373,10 @@ struct Qwen4ExpRun::PleIo {
         if (slow_left > 0) --slow_left;
         if (thr.empty() || jobs.size() < (size_t) (slow ? 2 : min_par)) {
             const auto t0 = std::chrono::steady_clock::now();
+            if (!thr.empty()) {   // no reader may still be inside an earlier call's drain()
+                std::unique_lock<std::mutex> lk(mu);
+                done_cv.wait(lk, [&]() { return draining == 0; });
+            }
             next = 0; left = jobs.size();
             drain();
             if (!thr.empty() && slow_ms > 0 &&
@@ -380,14 +388,17 @@ struct Qwen4ExpRun::PleIo {
         }
         ++n_woke;
         {
-            std::lock_guard<std::mutex> lk(mu);
+            std::unique_lock<std::mutex> lk(mu);
+            done_cv.wait(lk, [&]() { return draining == 0; });
             next = 0; left = jobs.size();
             ++gen;
+            open_gen = gen;
         }
         cv.notify_all();
         drain();
         std::unique_lock<std::mutex> lk(mu);
         done_cv.wait(lk, [&]() { return left.load() == 0 && draining == 0; });
+        open_gen = 0;   // closed under the lock: a reader not yet counted in skips this call
     }
 };
 
@@ -448,13 +459,18 @@ void Qwen4ExpRun::ple_rows(int64_t pos0, int64_t T, float * out) const {
         io.slot.resize(cap);
         if (io.buf.size() < rows.size() * rb) io.buf.resize(rows.size() * rb);
         io.jobs.clear();
-        // [AI_Q4X_PLE_DIRECT, default 512 rows; 0 = off] a call this small (a decode / verify round) reads every unique
+        // [AI_Q4X_PLE_DIRECT, default 0 = off; N = calls of <= N rows] DEFAULT OFF since 2026-10-31: on healthy 3090 starts
+        // the buffered reads hit the page cache for 31-35% of rows and cost 0.80-0.85 ms/round vs 1.19-1.22 direct (fd2,
+        // 5 + 5 fresh starts, set A), and direct did NOT prevent the stall: fd1's 2 stalled starts of 6 were direct, at
+        // 17-18 ms/round (A 69-90 tok/s). The stall follows the load's disk / reclaim backlog (fd2 sampler: 3-20 ms per IO
+        // in the first seconds, 1.4-2.1M pages scanned at the tier pin), not the read mode. Opt-in: 512.
+        // Original rationale: a call this small (a decode / verify round) reads every unique
         // row through O_DIRECT on the readers, past the page cache. On 2 in 10 fresh 3090 starts the buffered reads ran
         // ~10x slower for the whole run (PLE 8.6-10.5 ms/round vs 0.8; 74-78 vs ~100 tok/s), and 16 parallel readers did
         // not help (sd2: the same 10 ms) -- the page-cache path under reclaim (kswapd stole 1.4-1.8M pages a run on a
         // 62 GB box with a 40 GB pinned tier), not disk latency. Strata reads these rows with --ple-io direct. Larger
         // calls (prefill chunks) keep the page cache: neighbouring rows share pages there.
-        static const int direct_max = getenv("AI_Q4X_PLE_DIRECT") ? std::max(0, atoi(getenv("AI_Q4X_PLE_DIRECT"))) : 512;
+        static const int direct_max = getenv("AI_Q4X_PLE_DIRECT") ? std::max(0, atoi(getenv("AI_Q4X_PLE_DIRECT"))) : 0;
         io.direct = direct_max > 0 && rows.size() <= (size_t) direct_max;
         std::vector<uint32_t> at(rows.size());
         uint32_t n_u = 0;
@@ -654,6 +670,17 @@ void Qwen4ExpRun::init_doorbell(int slots) {
         size_t per_max = 0;
         for (const auto & l : layers) per_max = std::max(per_max, (size_t) (l.moe.gate_exps.nb[2] + l.moe.up_exps.nb[2] + l.moe.down_exps.nb[2]));
         lend_need = (pf_state_bytes(S, sub) + 255) / 256 * 256 + (size_t) E * per_max + 3 * 256;
+        // [AI_Q4X_LEND2, default 1] room for a SECOND expert scratch too, so the prefill's layer stream is double-
+        // buffered (layer l+1's experts copy under layer l's MoE as well as its mixer). Without it the 5090 at 311
+        // slots had no VRAM for the second scratch: one buffer, the link idle 310 ms of a 2.6K-token prefill while the
+        // GPU computed, and the GPU idle ~2.3 ms per layer waiting for the copies. Lends ~2 more layers' banks (no
+        // extra VRAM; those layers' experts stream during a prefill and are copied back after it).
+        static const bool lend2 = !getenv("AI_Q4X_LEND2") || atoi(getenv("AI_Q4X_LEND2")) != 0;
+        if (lend2) lend_need += ((size_t) E * per_max + 3 * 256 + 255) / 256 * 256;
+        // [AI_Q4X_PF_NBUF, default 2 (5090 p13: 3 = V TTFT 1.21-1.25x vs 1.08x, R 1.14x vs 1.04x); 3 = a third scratch as well: the copy stream runs two layers ahead (5090 2.6K prompt:
+        // with two, the link still sat idle 163 ms while the GPU computed). ~2 more lent layers, no extra VRAM.
+        static const int nbuf = getenv("AI_Q4X_PF_NBUF") ? atoi(getenv("AI_Q4X_PF_NBUF")) : 2;
+        if (lend2 && nbuf >= 3) lend_need += ((size_t) E * per_max + 3 * 256 + 255) / 256 * 256;
         size_t acc = 0;
         while (nl < L - 1 && acc < lend_need) acc += bank_bytes(L - 1 - nl++);
         if (acc < lend_need) nl = 0;
@@ -924,10 +951,36 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
     // (src/kernels/q4x_route.cu) instead of the ggml chain's BF16 GEMM and converts; greedy tokens match the chain.
     // 0 = the ggml chain.
     static const bool route_native = !getenv("AI_Q4X_ROUTE_NATIVE") || atoi(getenv("AI_Q4X_ROUTE_NATIVE")) != 0;
+    // [AI_Q4X_ROUTE_RING=1, default 0 until measured] the top-k kernel also does resolve_ring's work (kern::q4x_route_ring):
+    // its T blocks write their rows' slots / miss ids / weights and x columns to the bells in parallel, the last block
+    // rings. 3090 decode nsys (set A): softmax_topk 7.6 + resolve_ring 10.2 us per layer and round, vs Strata's one
+    // ~4.4 us route_multi. Same top-k arithmetic: identical bits. Not with the GPU miss share or the wait-stats timing.
+    static const bool ring_env = getenv("AI_Q4X_ROUTE_RING") && atoi(getenv("AI_Q4X_ROUTE_RING")) != 0 &&
+                                 !getenv("AI_Q4X_WAIT_STATS") && !getenv("AI_Q4X_HANDOFF_STATS") && !getenv("AI_Q4X_HDR_TOUCH");
+    static const int  ring_gm   = getenv("AI_Q4X_GPU_MISS") ? atoi(getenv("AI_Q4X_GPU_MISS")) : 0;
+    static const bool ring_part = !getenv("AI_Q4X_PARTIAL") || atoi(getenv("AI_Q4X_PARTIAL")) != 0;
+    Tensor        slots     = dev_.ws_alloc(I32, k, T);
+    bool          ring_done = false;
     op::MoeRoute  route;
     const Tensor & rw = L.moe.router;
-    if (route_native && T <= kDoorbellT && (rw.type == BF16 || rw.type == F16) && rw.contiguous() && x.contiguous() &&
-        rw.ne[0] == N && rw.ne[1] == s.n_expert && s.n_expert <= 1024) {
+    const bool rnat = route_native && T <= kDoorbellT && (rw.type == BF16 || rw.type == F16) && rw.contiguous() &&
+                      x.contiguous() && rw.ne[0] == N && rw.ne[1] == s.n_expert && s.n_expert <= 1024;
+    // [AI_Q4X_EXP_FORK=2] fork BEFORE the routing: router GEMV, top-k, ring and the routed experts (all native) on the
+    // backend's second stream, the shared expert (ggml) on the main stream, joined before the wait. EXP_FORK=1 forked
+    // only the experts, after the ring (3090 CLI +2.7%); Strata overlaps its shared expert with the whole routed chain.
+    static const int exp_fork_mode = getenv("AI_Q4X_EXP_FORK") ? atoi(getenv("AI_Q4X_EXP_FORK")) : 0;
+    const bool fork2 = exp_fork_mode == 2 && ring_gm == 0 && rnat;
+    if (fork2) {
+        static std::vector<void *> evf2;
+        while (evf2.size() < prog_.layers().size()) evf2.push_back(kern::event_create());
+        void *   ef = evf2[(size_t) il];
+        Device * dv = &dev_;
+        adapter::native(dev_, [=]() {
+            kern::event_record(ef, adapter::stream(*dv));
+            kern::stream_wait_event(kern::backend_stream_no(dv->backend(), 1), ef);
+        });
+    }
+    if (rnat) {
         Tensor        lgt = dev_.ws_alloc(F32, s.n_expert, T);
         route.sel         = dev_.ws_alloc(I32, k, T);
         route.weights     = dev_.ws_alloc(F32, 1, k, T);
@@ -939,11 +992,29 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
         float *       wo  = (float *) route.weights.data;
         const int     E   = s.n_expert;
         Device *      dv  = &dev_;
-        adapter::native(dev_, [=]() { kern::q4x_route(adapter::stream(*dv), wp0, bf, xp0, (int) N, E, (int) T, k, lp, sp0, wo); });
+        if (ring_env && ring_gm == 0) {
+            const int32_t *  tb0 = (const int32_t *) B.table.data;
+            int32_t *        sl0 = (int32_t *) slots.data;
+            const unsigned * wb0 = (const unsigned *) win_base_.data;
+            const int32_t    f0  = B.n_slots;
+            float *          wbl = ring_part ? bl.d_w : nullptr;
+            const int        lay = il;
+            const bool f2 = fork2;
+            adapter::native(dev_, [=]() {
+                if (!kern::q4x_route_ring(f2 ? kern::backend_stream_no(dv->backend(), 1) : adapter::stream(*dv), wp0, bf, xp0, (int) N, E, (int) T, k, lp, sp0, wo, tb0, f0, sl0,
+                                          bl.d_miss, bl.d_x, bl.d_n_tok, bl.d_seq, wb0, lay, wbl)) {
+                    fprintf(stderr, "[q4x] route+ring declined a shape the host check accepted\n");
+                    abort();
+                }
+            });
+            ring_done = true;
+        } else {
+            const bool f2 = fork2;
+            adapter::native(dev_, [=]() { kern::q4x_route(f2 ? kern::backend_stream_no(dv->backend(), 1) : adapter::stream(*dv), wp0, bf, xp0, (int) N, E, (int) T, k, lp, sp0, wo); });
+        }
     } else {
         route = op::moe_route(dev_, x, L.moe.router, mp);
     }
-    Tensor          slots = dev_.ws_alloc(I32, k, T);
     const int32_t * sel   = (const int32_t *) route.sel.data;
     const float *   xp    = (const float *) x.data;
     const int32_t * tab   = (const int32_t *) B.table.data;
@@ -969,8 +1040,8 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
     const int32_t gpu0 = gm > 0 ? filler0 + k : INT32_MAX;
     const int     trk  = tail_rank_env;
     Device * dev = &dev_;
-    adapter::native(dev_, [=]() {
-        kern::offload_resolve_ring(adapter::stream(*dev), tab, sel, xp, N, k, T, filler0, sp, bl.d_miss, bl.d_x,
+    if (!ring_done) adapter::native(dev_, [=]() {
+        kern::offload_resolve_ring(fork2 ? kern::backend_stream_no(dev->backend(), 1) : adapter::stream(*dev), tab, sel, xp, N, k, T, filler0, sp, bl.d_miss, bl.d_x,
                                    bl.d_n_tok, bl.d_seq, wb, il, wp, partial ? bl.d_w : nullptr, gm, gpu0, trk);
     });
     // GPU miss share: the host-tier pass forks onto the backend's second stream right after the ring, so its PCIe pull
@@ -1014,8 +1085,21 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
             kern::event_record(ej, st_side);
         });
     }
-    Tensor shared = op::moe_shared(dev_, x, L.moe);   // runs while the CPU computes the misses
-    // AI_Q4X_GROUPED: routed experts grouped by slot (src/kernels/q4x_experts.cu) -- each resident slot's weights
+    // [AI_Q4X_EXP_FORK=1, default 0 until measured] the resident routed experts (the grouped kernel) on the backend's
+    // second stream, forked right after the ring, while the shared expert runs on the main stream; joined before the
+    // wait. Strata's decode runs its routed experts on their own stream concurrent with the trunk (5090 nsys:
+    // ~2.2 ms/window of overlap where we have 0.1); our round is GPU-bound on the 3090 (spin 1.6 of ~24 ms) with
+    // latency-bound expert / shared kernels. Same kernels on the same data: identical bits. Own scratch, as the gm fork.
+    // MEASURED ~NULL (4080 2026-10-31, card 4K, MTP 2, 3 reps): md5 identical 6/6; 96.1 vs 94.4 tok/s; GPU-only bound
+    // (NO_WAIT + SKIP_MISS) verify 14.83 -> 14.68 ms. The shared expert is too small to hide much; Strata's overlap
+    // must reach the trunk, not just the shared expert. Opt-in.
+    static const bool exp_fork_env = getenv("AI_Q4X_EXP_FORK") && atoi(getenv("AI_Q4X_EXP_FORK")) != 0;
+    const bool exp_fork = exp_fork_env && gm == 0;
+    if (fork2 && gm > 0) throw std::runtime_error("q4x doorbell: AI_Q4X_EXP_FORK=2 with the GPU miss share");
+    void *     ex_join  = nullptr;
+    Tensor     shared;
+    if (!exp_fork) shared = op::moe_shared(dev_, x, L.moe);   // runs while the CPU computes the misses
+    // [P4] AI_Q4X_GROUPED: routed experts grouped by slot (src/kernels/q4x_experts.cu) -- each resident slot's weights
     // unpacked once for every window row routed to it, gate+up+SwiGLU in one launch, missed columns skipped.
     // 1 = native (default); 0 = the ggml chain; 2 = compare: run both, generate from the chain, count bitwise diffs.
     // For T >= 2 it is bit-identical to the chain and skips the chain's wasted filler columns.
@@ -1039,12 +1123,28 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
         const int32_t * spc = sp;
         void *        ps  = scr.data;
         float *       pm  = (float *) mine.data;
+        void *        ev_f = nullptr;
+        if (exp_fork && grouped != 2) {
+            static std::vector<void *> evx;
+            while (evx.size() < 2 * prog_.layers().size()) evx.push_back(kern::event_create());
+            ev_f    = evx[(size_t) (2 * il)];
+            ex_join = evx[(size_t) (2 * il + 1)];
+        }
+        void * ej_x = ex_join;
         adapter::native(dev_, [=]() {
-            if (!kern::q4x_experts(adapter::stream(*dev), tg, pu, pg, rbg, ebg, td, pd, rbd, ebd, xp, xs, spc, k, filler0,
+            void * st = adapter::stream(*dev);
+            if (ej_x) {
+                void * st_side = kern::backend_stream_no(dev->backend(), 1);
+                kern::event_record(ev_f, st);
+                kern::stream_wait_event(st_side, ev_f);
+                st = st_side;
+            }
+            if (!kern::q4x_experts(st, tg, pu, pg, rbg, ebg, td, pd, rbd, ebd, xp, xs, spc, k, filler0,
                                    N, F, N, k, T, ps, pm)) {
                 fprintf(stderr, "[q4x-experts] declined a shape the host check accepted\n");
                 abort();
             }
+            if (ej_x) kern::event_record(ej_x, st);
         });
 
         if (grouped == 2) {   // the chain computes missed columns on the filler rows: compare needs AI_Q4X_FILLERS=1
@@ -1058,7 +1158,23 @@ Tensor Qwen4ExpRun::moe_doorbell(int il, const Tensor & x) {
     } else {
         // the chain computes missed columns on the filler rows: without them it would read past the bank
         if (!fillers_) throw std::runtime_error("q4x doorbell: AI_Q4X_FILLERS=0 needs the grouped experts kernel");
+        if (fork2) {   // [AI_Q4X_EXP_FORK=2] the slots came from the side stream: join before the (main-stream) chain
+            static std::vector<void *> evc;
+            while (evc.size() < prog_.layers().size()) evc.push_back(kern::event_create());
+            void * ec = evc[(size_t) il];
+            adapter::native(dev_, [=]() {
+                kern::event_record(ec, kern::backend_stream_no(dev->backend(), 1));
+                kern::stream_wait_event(adapter::stream(*dev), ec);
+            });
+        }
         exps = op::q4x::moe_experts_raw(dev_, x, B.up, B.gate, B.down, slots);
+    }
+    if (exp_fork) {
+        if (!shared.valid()) shared = op::moe_shared(dev_, x, L.moe);   // overlaps the routed experts on the side stream
+        if (ex_join) {
+            void * ej = ex_join;
+            adapter::native(dev_, [=]() { kern::stream_wait_event(adapter::stream(*dev), ej); });
+        }
     }
     float * ep  = (float *) exps.data;
     float * shp = (float *) shared.data;
@@ -1178,8 +1294,71 @@ Tensor Qwen4ExpRun::verify(const int32_t * tokens, int64_t T) {
     return lg;
 }
 
+// [AI_Q4X_VERIFY_EARLY, default 0: neutral on the 5090 (sets A + V), the real gap is ~0.25 ms] draft + verify without the GPU idling between them: the chain (fill + n steps) is
+// launched, then the verify of pending + n drafts right behind it on the stream -- its ids are copied from the chain's
+// output on the device, and the PLE gate worker reads the drafts back after the chain's event (into hist_, before
+// hashing its rows), so the host neither syncs on the chain nor holds the launch for it. 5090 nsys: the host's read-back
+// + the 2846-node graph launch left the GPU idle ~0.4 ms a round (1.36 ms under nsys) between draft_next_k and the
+// verify. Width is always n + 1: only with draft min-p off (no host cut). Only for a CAPTURED verify profile: an eager
+// (recording or first) launch could run host steps that wait on the GPU, which sits at the PLE gate until the drafts
+// arrive.
+bool Qwen4ExpRun::draft_verify_early(int32_t pending, int n, std::vector<int32_t> & drafts, Tensor & lg) {
+    static const bool on        = getenv("AI_Q4X_VERIFY_EARLY") && atoi(getenv("AI_Q4X_VERIFY_EARLY")) != 0;
+    static const bool capture   = !getenv("AI_Q4X_MTP_CAPTURE") || atoi(getenv("AI_Q4X_MTP_CAPTURE")) != 0;
+    static const bool trunk_cap = getenv("AI_Q4X_CAPTURE") && atoi(getenv("AI_Q4X_CAPTURE")) != 0;
+    static const bool gate_env  = getenv("AI_Q4X_PLE_GATE") && atoi(getenv("AI_Q4X_PLE_GATE")) != 0;
+    const Qwen4ExpSpec & s = prog_.spec();
+    static long long n_ok = 0, n_why[6] = { 0, 0, 0, 0, 0, 0 };
+    auto no = [&](int why) {   // AI_Q4X_ROUND_TIMING: why the early path was declined (logged every 512 declines)
+        if (g_rt.on && (++n_why[why] & 511) == 1)
+            fprintf(stderr, "[q4x] verify early: declined (%d) x%lld; taken %lld\n", why, n_why[why], n_ok);
+        return false;
+    };
+    if (!on || !mtp_on_ || !capture || !trunk_cap || !doorbell_ || !gate_env || s.ple_layers.empty()) return no(0);
+    if (n < 1 || n > kMtpChain || n + 1 > kDoorbellT || mtp_minp() > 0 || rec_T_ > 0) return no(1);
+    const int64_t pos0 = (int64_t) hist_.size(), T = n + 1;
+    if (pos0 + T > max_ctx_ - 1) return no(2);
+    int64_t F = 256;
+    while (F < pos0 + T) F *= 2;
+    F = std::min(F, max_ctx_);
+    const auto * e = rounds_.find((F << 6) | (T << 1) | 1);
+    if (!e || e->launches < 2) return no(3);
+    if (g_rt.on && (++n_ok & 1023) == 1) fprintf(stderr, "[q4x] verify early: taken x%lld\n", n_ok);
+    if (!ple_thr_.joinable()) ple_gate_init();
+    if (!ple_ev_chain_) {
+        cudaEventCreateWithFlags((cudaEvent_t *) &ple_ev_chain_, cudaEventDisableTiming);
+        cudaStreamCreateWithFlags((cudaStream_t *) &ple_side_, cudaStreamNonBlocking);
+        cudaHostAlloc((void **) &draft_pin_, (size_t) kMtpChain * 4, cudaHostAllocDefault);
+    }
+    int32_t ct[kMtpChain];
+    float   cp[kMtpChain];
+    mtp_chain(pending, n, ct, cp, false);
+    cudaEventRecord((cudaEvent_t) ple_ev_chain_, (cudaStream_t) adapter::stream(dev_));
+    admit_after_round();   // as verify(): the previous round has completed (its caller read the logits)
+    rec_pos0_ = pos0;
+    rec_T_    = T;
+    rec_      = true;
+    std::vector<int32_t> toks((size_t) T, 0);
+    toks[0] = pending;
+    try {
+        lg = round(toks.data(), T, true);
+    } catch (...) {
+        rec_ = false;
+        throw;
+    }
+    rec_ = false;
+    {
+        std::unique_lock<std::mutex> lk(ple_mu_);
+        ple_cv_.wait(lk, [&]() { return ple_early_done_; });
+        ple_early_done_ = false;
+    }
+    drafts.assign(hist_.begin() + pos0 + 1, hist_.begin() + pos0 + T);
+    return true;
+}
+
 void Qwen4ExpRun::commit(int64_t m1) {
     if (rec_T_ <= 0 || m1 < 1 || m1 > rec_T_) throw std::runtime_error("Qwen4ExpRun::commit: no verify, or m1 out of range");
+    ple_gate_idle();   // the worker read hist_ for this round's rows: done before the rejected rows are dropped
     auto tc = std::chrono::steady_clock::now();
     if (g_rt.on) g_rt.cmark(0, adapter::stream(dev_));
     struct CommitDone {   // the closing mark + host time on every exit of the folds below
@@ -1338,6 +1517,7 @@ void Qwen4ExpRun::pin_launch_thread() {
 Tensor Qwen4ExpRun::chunk(const int32_t * tokens, int64_t T) {
     pin_launch_thread();
     fold_join();
+    ple_gate_idle();
     const Qwen4ExpSpec & s = prog_.spec();
     mtp_flush();
     const int64_t pos0 = (int64_t) hist_.size();
@@ -1426,6 +1606,14 @@ Tensor Qwen4ExpRun::forward(const Tensor & ids_t, const Tensor & pos4_t, const T
         // Debug: AI_Q4X_DEL bitmask for timing only (output is wrong): 1 = no attention/GDN block, 2 = no MoE at all,
         // 4 = no routed experts (shared expert only), 8 = no PLE
         static const int del = getenv("AI_Q4X_DEL") ? atoi(getenv("AI_Q4X_DEL")) : 0;
+        if (L.ple && !(del & 8) && ple_gate_now_) {   // [AI_Q4X_PLE_GATE] the rows arrive while the layers before run
+            const unsigned * fl = ple_flag_d_, * wt = (const unsigned *) in_want_.data;
+            const float *    src = ple_map_d_;
+            float *          dst = (float *) ple_t.data;
+            const int64_t    n   = s.n_embd * T;
+            Device *         dv  = &dev_;
+            adapter::native(dev_, [=]() { kern::q4x_ple_gate(adapter::stream(*dv), fl, wt, src, dst, n); });
+        }
         if (L.ple && !(del & 8)) R = op::q4x::ple_block(dev_, R, ple_t, L.plew, pp_, ple_[(size_t) il], rp, rp ? &ple_pad : nullptr);
         op::q4x::HcRead r = op::q4x::hc_read(dev_, R, L.hc_attn, s.rms_eps);
         Tensor out = (del & 1) ? r.mixed : L.attn
@@ -1479,6 +1667,17 @@ Tensor Qwen4ExpRun::forward(const Tensor & ids_t, const Tensor & pos4_t, const T
 // Stops the admission worker, then releases the RAM tier.
 Qwen4ExpRun::~Qwen4ExpRun() {
     fold_join(true);
+    if (lend_ev_) cudaEventSynchronize((cudaEvent_t) lend_ev_);
+    if (ple_thr_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(ple_mu_);
+            ple_stop_ = true;
+        }
+        ple_cv_.notify_all();
+        ple_thr_.join();
+    }
+    if (ple_map_) cudaFreeHost(ple_map_);
+    if (ple_flag_) cudaFreeHost(ple_flag_);
     if (admit_thr_.joinable()) {
         {
             std::lock_guard<std::mutex> lk(admit_mu_);
@@ -1572,6 +1771,7 @@ void Qwen4ExpRun::admit_after_round() {
     const int k = s.n_expert_used, E = s.n_expert;
     std::vector<char> dirty(banks_.size(), 0);
     admit_kick();   // jobs never handed over (no launch since the last boundary) would block the publish below
+    lend_publish(false);   // [AI_Q4X_LEND_ASYNC] the lent layers mapped again once their give-back landed
     // 1) publish copies that landed. AI_Q4X_ADMIT_SYNC=1 (default): every job enqueued at the previous round boundary
     //    is published now, waiting for its copy if needed (the copies are short next to a round, so the wait is
     //    rarely real). Residency is then a function of the token history alone, so fast mode is run-to-run
@@ -1678,6 +1878,7 @@ void Qwen4ExpRun::admit_after_round() {
 
 int Qwen4ExpRun::reset_residency() {
     if (!doorbell_ || banks_.empty() || init_owner_.size() != banks_.size()) return 0;
+    lend_publish(true);   // [AI_Q4X_LEND_ASYNC] owners final for the lent layers too
     admit_drain();   // every in-flight admission landed and published: owners are final
     bells_live_ = false;
     const auto & layers = prog_.layers();
@@ -1754,13 +1955,68 @@ Tensor Qwen4ExpRun::decode(int32_t token) {
     return round(&token, 1);
 }
 
-// T <= kDoorbellT rows (decode: T = 1; verify: the pending token + drafts, record mode) as a captured round. Inputs go
-// to fixed ingress buffers sized for kDoorbellT rows; the key is (envelope F, T, record mode), so each verify width and the plain
+void Qwen4ExpRun::ple_gate_init() {
+    const Qwen4ExpSpec & s = prog_.spec();
+    if (cudaHostAlloc((void **) &ple_map_, (size_t) (s.n_embd * kDoorbellT) * 4, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void **) &ple_flag_, 256, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void **) &ple_map_d_, ple_map_, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void **) &ple_flag_d_, ple_flag_, 0) != cudaSuccess) {
+        throw std::runtime_error("q4x: AI_Q4X_PLE_GATE mapped allocation failed");
+    }
+    memset(ple_flag_, 0, 256);
+    const int b = dev_.alloc_buffer(256, "q4x.ple_want");
+    in_want_.buf = b; in_want_.type = I32; in_want_.ne[0] = 1; set_contiguous_strides(in_want_);
+    in_want_.data = dev_.buffer_base(b);
+    ple_thr_ = std::thread([this]() {
+        if (!host_cpus_.empty()) offload::pin_this_thread(host_cpus_);
+        for (;;) {
+            int64_t p0, T;
+            unsigned seq;
+            bool early;
+            {
+                std::unique_lock<std::mutex> lk(ple_mu_);
+                ple_cv_.wait(lk, [&]() { return ple_stop_ || ple_job_; });
+                if (ple_stop_) return;
+                p0 = ple_p0_; T = ple_T_; seq = ple_job_seq_; early = ple_early_job_;
+            }
+            if (early) {   // [AI_Q4X_VERIFY_EARLY] the chain's drafts into hist_ (the rows hash them), then wake the caller
+                cudaEventSynchronize((cudaEvent_t) ple_ev_chain_);
+                cudaMemcpyAsync(draft_pin_, mc_tok_.data, (size_t) (T - 1) * 4, cudaMemcpyDeviceToHost, (cudaStream_t) ple_side_);
+                cudaStreamSynchronize((cudaStream_t) ple_side_);
+                for (int64_t i = 0; i + 1 < T; ++i) hist_[(size_t) (p0 + 1 + i)] = draft_pin_[i];
+                {
+                    std::lock_guard<std::mutex> lk(ple_mu_);
+                    ple_early_done_ = true;
+                }
+                ple_cv_.notify_all();
+            }
+            ple_rows(p0, T, ple_map_);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile unsigned *) ple_flag_ = seq;   // the gate kernel may copy the rows now
+            {
+                std::lock_guard<std::mutex> lk(ple_mu_);
+                ple_job_ = false;
+            }
+            ple_cv_.notify_all();
+        }
+    });
+    fprintf(stderr, "[q4x] PLE gate: decode rows read by a worker while the round launches; the round waits before its PLE layer (AI_Q4X_PLE_GATE)\n");
+}
+
+void Qwen4ExpRun::ple_gate_idle() {
+    if (!ple_thr_.joinable()) return;
+    std::unique_lock<std::mutex> lk(ple_mu_);
+    ple_cv_.wait(lk, [&]() { return !ple_job_; });
+}
+
+// [P3/P5] T <= 8 rows (decode: T = 1; verify: the pending token + drafts, record mode) as a CAPTURED round. Inputs go
+// to fixed ingress buffers sized for 8 rows; the key is (envelope F, T, record mode), so each verify width and the plain
 // decode get their own recorded round.
-Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
-    if (!doorbell_) throw std::runtime_error("Qwen4ExpRun::round: needs AI_Q4X_DOORBELL=1 (the expert pool path reads routing on the host)");
+Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T, bool early) {
+    if (!doorbell_) throw std::runtime_error("Qwen4ExpRun::round: needs AI_Q4X_DOORBELL=1 (the v1 pool reads routing on the host)");
     if (T < 1 || T > kDoorbellT) throw std::runtime_error("Qwen4ExpRun::round: 1 <= T <= kDoorbellT");
     bells_live_ = true;   // this round rings the bells the next admit_after_round counts
+    ple_gate_idle();
     auto tr = std::chrono::steady_clock::now();
     mtp_flush();
     if (g_rt.on) g_rt.flush += rt_ms_since(tr);
@@ -1786,7 +2042,9 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
         in_mask_  = mk(F16, max_ctx_ * Tm, o_mask);
     }
     if (g_rt.on) rt_ms_since(tr);
-    dev_.synchronize();   // the ingress uploads below are unordered against the stream (see chunk())
+    // the ingress uploads below are unordered against the stream (see chunk()). Early: only the draft chain is in
+    // flight (the previous verify was read back), and it reads none of the ingress buffers
+    if (!early) dev_.synchronize();
     if (g_rt.on) { g_rt.sync += rt_ms_since(tr); g_rt.gpu_eval(); rt_ms_since(tr); }
     std::vector<int32_t>  pos4((size_t) (4 * T));
     std::vector<int64_t>  cells((size_t) T);
@@ -1797,16 +2055,31 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
         cells[(size_t) i] = pos0 + i;
         for (int64_t jj = 0; jj < F; ++jj) mask[(size_t) (i * F + jj)] = jj <= pos0 + i ? 0x0000 : 0xFC00;
     }
-    dev_.upload(in_ids_, tokens, 0, (size_t) T * 4);
+    if (early) {   // [AI_Q4X_VERIFY_EARLY] the pending token from the host, the drafts from the chain (stream-ordered)
+        dev_.upload(in_ids_, tokens, 0, 4);
+        kern::q4x_copy_i32(adapter::stream(dev_), (const int32_t *) mc_tok_.data, (int32_t *) in_ids_.data + 1, T - 1);
+    } else {
+        dev_.upload(in_ids_, tokens, 0, (size_t) T * 4);
+    }
     dev_.upload(in_pos4_, pos4.data(), 0, pos4.size() * 4);
     dev_.upload(in_cells_, cells.data(), 0, cells.size() * 8);
     dev_.upload(in_mask_, mask.data(), 0, mask.size() * 2);
     if (g_rt.on) g_rt.upload += rt_ms_since(tr);
+    // [AI_Q4X_PLE_GATE=1, default 0 until measured] the rows are read by the worker, posted just before the launch
+    static const bool gate_env = getenv("AI_Q4X_PLE_GATE") && atoi(getenv("AI_Q4X_PLE_GATE")) != 0;
+    bool gated = false;
     if (!s.ple_layers.empty()) {
-        std::vector<float> rows((size_t) (s.n_embd * T));
-        ple_rows(pos0, T, rows.data());
-        if (g_rt.on) g_rt.ple += rt_ms_since(tr);
-        dev_.upload(in_ple_, rows.data(), 0, rows.size() * 4);
+        if (gate_env) {
+            if (!ple_thr_.joinable()) ple_gate_init();
+            ++ple_seq_;
+            dev_.upload(in_want_, &ple_seq_, 0, 4);
+            gated = true;
+        } else {
+            std::vector<float> rows((size_t) (s.n_embd * T));
+            ple_rows(pos0, T, rows.data());
+            if (g_rt.on) g_rt.ple += rt_ms_since(tr);
+            dev_.upload(in_ple_, rows.data(), 0, rows.size() * 4);
+        }
     }
     auto v1 = [](const Tensor & t, int64_t n0, size_t es) { return t.view(n0, 1, 1, 1, n0 * es, n0 * es, n0 * es, 0); };
     const Tensor ids_v   = v1(in_ids_, T, 4);
@@ -1820,7 +2093,15 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
     dump_dir_.clear();   // no host reads inside a captured round
     const int64_t key = (F << 6) | (T << 1) | (rec_ ? 1 : 0);
     pin_launch_thread();
-    fold_join();   // AI_Q4X_FOLD_SIDE: outside any capture: the round reads the folded state
+    fold_join();   // [AI_Q4X_FOLD_SIDE] outside any capture: the round reads the folded state
+    if (gated) {
+        {
+            std::lock_guard<std::mutex> lk(ple_mu_);
+            ple_p0_ = pos0; ple_T_ = T; ple_job_seq_ = ple_seq_; ple_job_ = true; ple_early_job_ = early;
+        }
+        ple_cv_.notify_all();
+    }
+    ple_gate_now_ = gated;
     if (g_rt.on) g_rt.mark(2, adapter::stream(dev_));
     const Tensor & lg = rounds_.launch(dev_, key, [&]() {
         return forward(ids_v, pos4_v, cells_v, mask_v, s.ple_layers.empty() ? Tensor{} : ple_v, T, F);
@@ -1828,6 +2109,7 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T) {
         fprintf(stderr, "[q4x] round recorded: F=%lld T=%lld%s, %d nodes\n", (long long) (k2 >> 6), (long long) ((k2 >> 1) & 31),
                 (k2 & 1) ? " (verify)" : "", e.round->n_nodes());
     });
+    ple_gate_now_ = false;
     dump_dir_ = dd;
     if (g_rt.on) { g_rt.mark(3, adapter::stream(dev_)); g_rt.launch += rt_ms_since(tr); }
     if (mtp_on_ && !rec_) { mtp_fill_p0_ = pos0; mtp_fill_m_ = T; }

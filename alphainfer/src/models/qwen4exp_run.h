@@ -49,7 +49,10 @@ public:
     // indexer cells are written at their positions and simply rewritten by later rounds. Must be followed by
     // commit(m1), 1 <= m1 <= T: the first m1 rows are accepted (ReplaySSM fold), the rest dropped.
     Tensor verify(const int32_t * tokens, int64_t T);
-    // MTP drafting (needs prog.load_mtp): call before the prefill. The head's K/V column c holds
+    // [AI_Q4X_VERIFY_EARLY] the draft chain, then the verify of pending + its n drafts launched right behind it (ids
+    // from the chain's device output); false = not eligible, nothing done (use mtp_draft + verify)
+    bool   draft_verify_early(int32_t pending, int n, std::vector<int32_t> & drafts, Tensor & lg);
+    // [P5] MTP drafting (needs prog.load_mtp): call before the prefill. The head's K/V column c holds
     // f(trunk streams H_{c-1}, token c); columns are filled as rows commit (lazily, at the next call). mtp_draft
     // chains n drafts after `pending` (the token at position position()).
     void                 mtp_enable();
@@ -93,7 +96,7 @@ private:
     // WILLNEED readahead at once, then read inline (decode) or by blocking reader threads too (prefill)
     struct PleIo;
     mutable std::unique_ptr<PleIo> ple_io_;
-    Tensor round(const int32_t * tokens, int64_t T);                // captured T <= kDoorbellT row round (decode / verify)
+    Tensor round(const int32_t * tokens, int64_t T, bool early = false);                // captured T <= 8 row round (decode / verify)
     Tensor forward(const Tensor & ids, const Tensor & pos4, const Tensor & cells, const Tensor & mask, const Tensor & ple,
                    int64_t T, int64_t n_kv);
     Tensor moe_streamed(int il, const Tensor & x);                 // routed (pool) + gated shared expert
@@ -104,7 +107,7 @@ private:
     bool   prefill_alloc(int64_t S, int64_t sub);
     size_t pf_state_bytes(int64_t S, int64_t sub) const;   // prefill_alloc's state buffer (residuals, PLE, ids, masks)
     int    pf_cap(int il) const;   // the layer's prefill scratch capacity: its non-resident experts (all of them when lent)
-    void   lend_begin();           // [AI_Q4X_LEND] the lent layers' banks become the prefill's buffers (their experts non-resident)
+    void   lend_begin(size_t used = (size_t) -1);   // [AI_Q4X_LEND] the lent layers' banks become the prefill's buffers (their experts non-resident)
     void   lend_end();             // ... and are copied back (the same experts) once the prefill's work has finished
     void   init_doorbell(int slots);
     void   dump(const char * name, int il, const Tensor & t);
@@ -116,7 +119,7 @@ private:
     bool    mtp_mapped() const;
     Tensor  mtp_build(const Tensor & H, const Tensor & ids_t, const Tensor & pos4_t, const Tensor & cells_t,
                       const Tensor & mask_t, int64_t T, int64_t n_kv, bool full);
-    void    mtp_chain(int32_t pending, int n, int32_t * toks, float * probs);   // AI_Q4X_MTP_CAPTURE
+    void    mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch = true);   // [AI_Q4X_MTP_CAPTURE]
     static constexpr int kMtpChain = 8;
     RoundCache<int64_t, Tensor> mtp_rounds_;   // captured fill + draft chains, keyed by (F, fill rows, n, mapped)
     Tensor  mc_ids_, mc_pos4_, mc_cells_, mc_mask_, mc_tok_, mc_p_;
@@ -245,8 +248,20 @@ private:
     // [AI_Q4X_LEND] layers lend_from_.. keep their slot banks in one buffer (lend_buf_) that a prefill borrows for its
     // state (offset pf_buf_off_) and expert scratch (pf_scr_off_): the prefill's ~2 GB need not stay free in decode.
     int                  lend_buf_ = -1, lend_from_ = 1 << 30;
+    int                  lend_n_ = 0;   // [AI_Q4X_LEND_PART] layers lend_from_ .. lend_from_ + lend_n_ - 1 are lent now
+    bool                 lent_layer(int il) const { return lent_ && il >= lend_from_ && il < lend_from_ + lend_n_; }
     size_t               lend_bytes_ = 0, pf_buf_off_ = 0, pf_scr_off_ = 0;
+    size_t               pf_scr2_off_ = 0;   // [AI_Q4X_LEND2] the second expert scratch inside the lent buffer
+    size_t               pf_scr3_off_ = 0;   // [AI_Q4X_PF_NBUF=3] the third, also inside the lent buffer
+    int                  pf_nb_ = 1;         // scratch buffers in the layer-stream ring (1, 2 or 3)
+    int                  pf_b(int il) const { return pf_nb_ > 1 ? il % pf_nb_ : 0; }
     bool                 lent_ = false;
+    // [AI_Q4X_LEND_ASYNC] the give-back copies run on their own stream after the prefill returns (its first token is not
+    // held for ~2 GB of copies); the lent layers stay non-resident (owners -1: no admission picks them) until
+    // lend_publish sees the event and maps them again
+    bool                 lend_back_ = false;
+    void *               lend_stream_ = nullptr, * lend_ev_ = nullptr;
+    void                 lend_publish(bool wait);
     std::vector<std::vector<int32_t>> lend_owner_;   // per lent layer: its slots' experts while lent
     size_t               pf_off_R_ = 0, pf_off_ple_ = 0, pf_off_ids_ = 0, pf_off_pos4_ = 0, pf_off_cell_ = 0, pf_off_mask_ = 0;
     std::vector<int32_t> pf_slot_of_;
@@ -262,15 +277,22 @@ private:
     // while layer l computes (double-buffered; buffer il % 2 holds layer il)
     int                  pf_scr2_ = -1;
     bool                 pf_stream_on_ = false, pf_stream_now_ = false;   // available / used for this super-chunk
-    void                 pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd, int n = 0) const;
-    // AI_Q4X_PF_SPARE: two spare buffers of pf_spare_P_ experts (when a second full scratch does not fit)
+    void                 pf_bank(int il, int buf, Tensor & sg, Tensor & su, Tensor & sd, int n = 0, int which = 0) const;
+    void                 pf_bank_b(int il, int b, Tensor & sg, Tensor & su, Tensor & sd) const;   // ring buffer b
+    // [AI_Q4X_PF_SPARE] two spare buffers of pf_spare_P_ experts (when a second full scratch does not fit)
     int                  pf_spare_[2] = { -1, -1 }, pf_spare_P_ = 0, pf_spare_layer_[2] = { -1, -1 };
     void *               pf_ev_spfree_[3] = { nullptr, nullptr, nullptr };
     std::vector<int32_t> pf_spare_of_;
     void                 pf_stream_part(int il, int part);
     void *               pf_cstream_ = nullptr;
-    void *               pf_ev_ready_[2] = { nullptr, nullptr }, * pf_ev_free_[2] = { nullptr, nullptr };
-    int                  pf_buf_layer_[2] = { -1, -1 };   // the layer each scratch buffer holds (or is being filled with)
+    void *               pf_ostream_ = nullptr, * pf_ev_ocopy_ = nullptr, * pf_ev_omain_ = nullptr;   // [AI_Q4X_PF_COPY_OVERLAP]
+    // [AI_Q4X_PF_DEVPLAN] per-layer scratch / spare slot maps in mapped pinned memory, read by the device plan kernel;
+    // the device overflow flag (a bank needed more records than its cap)
+    int32_t *            pf_dmap_pin_ = nullptr, * pf_dmap_dev_ = nullptr;
+    int                  pf_dmap_n_ = 0;
+    int *                pf_dplan_ovf_ = nullptr;
+    void *               pf_ev_ready_[3] = { nullptr, nullptr, nullptr }, * pf_ev_free_[3] = { nullptr, nullptr, nullptr };
+    int                  pf_buf_layer_[3] = { -1, -1, -1 };   // the layer each scratch buffer holds (or is being filled with)
     void                 pf_stream_layer(int il);         // queue layer il's non-resident experts into its buffer
     void                 pf_layer_begin(int il);          // the copies to queue at the start of layer il
     Tensor               moe_prefill_big(int il, const Tensor & fm, int64_t slice);   // AI_Q4X_PF_MOE_BIG
@@ -285,6 +307,27 @@ private:
     bool                                    doorbell_ = false;
     RoundCache<int64_t, Tensor>             rounds_;     // captured decode rounds, keyed by the envelope F
     Tensor in_ids_, in_pos4_, in_cells_, in_mask_, in_ple_;   // fixed decode ingress (outside the workspace)
+    // [AI_Q4X_PLE_GATE] the round's PLE rows read by a worker thread WHILE the round launches and its first layers run:
+    // the worker writes them into mapped pinned memory and bumps a mapped flag; a gate kernel before the PLE layer waits
+    // for this round's sequence (in_want_) and copies them into in_ple_. Off the host critical path between draft and
+    // verify (3090: ple rows 0.8-1.2 ms + launch 0.45 ms, serial, before the GPU started).
+    bool                    ple_gate_ = false, ple_gate_now_ = false;   // enabled / this forward is a gated round
+    float *                 ple_map_ = nullptr, * ple_map_d_ = nullptr;
+    unsigned *              ple_flag_ = nullptr, * ple_flag_d_ = nullptr;
+    unsigned                ple_seq_ = 0;
+    Tensor                  in_want_;
+    std::thread             ple_thr_;
+    std::mutex              ple_mu_;
+    std::condition_variable ple_cv_;
+    bool                    ple_job_ = false, ple_stop_ = false;
+    int64_t                 ple_p0_ = 0, ple_T_ = 0;
+    unsigned                ple_job_seq_ = 0;
+    // [AI_Q4X_VERIFY_EARLY] the worker reads the chain's drafts into hist_ before the job's rows
+    bool                    ple_early_job_ = false, ple_early_done_ = false;
+    void *                  ple_ev_chain_ = nullptr, * ple_side_ = nullptr;
+    int32_t *               draft_pin_ = nullptr;
+    void                    ple_gate_init();
+    void                    ple_gate_idle();   // the worker has finished its job (before hist_ changes or the next post)
     std::string          dump_dir_;
     bool                 dump_append_ = false;   // this chunk continues the sequence: dumps append rows
 };

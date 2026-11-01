@@ -25,6 +25,7 @@
 #include "serve-response.h"
 #include "serve-backend.h"
 #include "serve-intelligence.h"
+#include "serve-autotune.h"
 
 #ifdef ALPHA_HAS_FLASHINFER
 #include "serve-forward.h"
@@ -1390,12 +1391,16 @@ int main(int argc, char ** argv) {
         // so it stays off there.
         size_t vram_free = 0, vram_total = 0;
         alpha_vram_info(&vram_free, &vram_total);
-        const bool card16 = vram_total > 0 && vram_total < (20ull << 30);
-        const bool card32 = vram_total >= (28ull << 30);
-        if (card16 || card32) setenv("AI_Q4X_LEND", "1", /*overwrite=*/ 0);
         const std::string sidecar = alpha_q4x_find(model_path, /*profile=*/ false);
         if (!getenv("ALPHA_AI_MTP_K")) setenv("ALPHA_AI_MTP_K", sidecar.empty() && !getenv("AI_Q4X_MTP") ? "0" : "3", 1);
-        if (atoi(getenv("ALPHA_AI_MTP_K")) > 0) setenv("AI_Q4X_MTP_MINP", "0.5", /*overwrite=*/ 0);
+        // auto-tune (serve-autotune.cpp): the run settings from measured PCIe / DRAM / CPU topology, each logged;
+        // ALPHA_AUTOTUNE=0 keeps the fixed rules below
+        if (!alphaserve::autotune_apply_qwen4exp(model_path, vram_total)) {
+            const bool card16 = vram_total > 0 && vram_total < (20ull << 30);
+            const bool card32 = vram_total >= (28ull << 30);
+            if (card16 || card32) setenv("AI_Q4X_LEND", "1", /*overwrite=*/ 0);
+            if (atoi(getenv("ALPHA_AI_MTP_K")) > 0) setenv("AI_Q4X_MTP_MINP", "0.5", /*overwrite=*/ 0);
+        }
         if (!getenv("ALPHA_DRE_PROFILE") && !getenv("AI_Q4X_PROFILE")) {
             const std::string prof = alpha_q4x_find(model_path, /*profile=*/ true);
             if (!prof.empty()) setenv("ALPHA_DRE_PROFILE", prof.c_str(), 1);

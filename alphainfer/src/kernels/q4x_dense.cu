@@ -297,7 +297,98 @@ __global__ void __launch_bounds__(32 * W) dense_k(const uint8_t * __restrict__ W
 }
 
 
-// AI_Q4X_DENSE_PIPE=1: the same split-K tile with a two-stage pipeline per warp: one superblock per stage
+// [AI_Q4X_DENSE_SK] split-K for few rows: dense_k gives a block 16 rows and lets its W warps walk ALL of K, so N = 2560
+// is 160 blocks (~8 warps per SM) and each warp a serial load -> wait -> mma chain over a few superblock pairs: 33-57%
+// of DRAM at T = 3 even on the 4080 (densebench --copies auto 2026-10-31; N 16384 = 1024 blocks: 73-80%), and on the
+// 3090 that chain runs at the core clock (the 3090/4080 census: dense 1.02x where bandwidth-bound would be 0.77x).
+// Here block (x, y) takes pairs [y * W, y * W + W), ONE per warp, so KS = ceil(pairs / W) times the blocks are in flight.
+// A block adds its warps in warp order (as dense_k) and writes the unscaled partial; dense_skred adds the KS partials in
+// split order and applies the column max. Deterministic and column-invariant (a column's instructions do not depend on
+// T), but a different sum tree from dense_k's: a cross-build numeric change (paired NLL gate).
+template <int TY, int W, int NT>
+__global__ void __launch_bounds__(32 * W) dense_sk(const uint8_t * __restrict__ Wq, long long row_bytes, int N, int K,
+                                                   const __half * __restrict__ xp, int T, float * __restrict__ part) {
+    using Q = DQ<TY>;
+    constexpr int PB = 2 * Q::SB, PW = PB / 4;
+    __shared__ __align__(16) uint8_t stg[W][16 * PB];
+    __shared__ float red[W][NT][4][32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3;
+    const int r0 = blockIdx.x * 16, s = blockIdx.y;
+    const uint8_t * rows = Wq + (size_t) r0 * row_bytes;
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    const __half * xc[NT];
+    bool           cv[NT];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) { const int col = 8 * n + g; cv[n] = col < T; xc[n] = xp + (size_t) (cv[n] ? col : 0) * K; }
+    const int np = K >> 9, pr = s * W + warp;
+    uint8_t * sm = stg[warp];
+    if (pr < np) {
+        for (int i = lane; i < 16 * PW; i += 32) {
+            const int r = i / PW, w = i - r * PW;
+            dn_cp4(sm + r * PB + 4 * w, rows + (size_t) r * row_bytes + (size_t) pr * PB + 4 * w);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncwarp();
+#pragma unroll 1
+        for (int h = 0; h < 2; ++h) {
+            const int sb = 2 * pr + h;
+            unsigned  Aa[16][2], Ab[16][2];
+            Q::decode(sm + g * PB + h * Q::SB, tg, Aa);
+            Q::decode(sm + (g + 8) * PB + h * Q::SB, tg, Ab);
+#pragma unroll
+            for (int c = 0; c < 16; ++c) {
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const __half * xb = xc[n] + (sb << 8) + 16 * c;
+                    const unsigned b0 = cv[n] ? *reinterpret_cast<const unsigned *>(xb + 2 * tg) : 0u;
+                    const unsigned b1 = cv[n] ? *reinterpret_cast<const unsigned *>(xb + 2 * tg + 8) : 0u;
+                    hmma(acc[n], Aa[c][0], Ab[c][0], Aa[c][1], Ab[c][1], b0, b1);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) red[warp][n][q][lane] = acc[n][q];
+    __syncthreads();
+    if (warp != 0) return;
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float v = red[0][n][q][lane];
+#pragma unroll
+            for (int w = 1; w < W; ++w) v += red[w][n][q][lane];
+            acc[n][q] = v;
+        }
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int col = 8 * n + 2 * tg + q;
+            if (col < T) {
+                float * pc = part + ((size_t) s * T + col) * N;
+                pc[r0 + g]     = acc[n][q];
+                pc[r0 + g + 8] = acc[n][2 + q];
+            }
+        }
+    }
+}
+
+// out[t][n] = (sum over splits s = 0 .. KS-1 of part[s][t][n], in that order) * cm[t]
+__global__ void dense_skred(const float * __restrict__ part, const float * __restrict__ cm, int N, int T, int KS,
+                            float * __restrict__ out, long long ldo) {
+    const int t = blockIdx.y;
+    for (int n = blockIdx.x * blockDim.x + threadIdx.x; n < N; n += gridDim.x * blockDim.x) {
+        float v = part[(size_t) t * N + n];
+        for (int s = 1; s < KS; ++s) v += part[((size_t) s * T + t) * N + n];
+        out[(long long) t * ldo + n] = v * cm[t];
+    }
+}
+
+// [item 2, AI_Q4X_DENSE_PIPE=1] the same split-K tile with a two-stage pipeline per warp: one superblock per stage
 // (its 4-byte-aligned superset: block types of 2 mod 4 bytes start 2 bytes in), the next superblock's cp.async in
 // flight while this one decodes. Same per-column arithmetic and reduction order as dense_k: identical bits.
 template <int TY, int W, int NT>
@@ -381,12 +472,22 @@ __global__ void __launch_bounds__(32 * W) dense_p_k(const uint8_t * __restrict__
 
 template <int TY>
 void dense_launch(cudaStream_t st, const void * w, long long rb, int N, int K, const float * x, long long xs, int T,
-                  __half * xp, float * cm, float * out, long long ldo) {
+                  __half * xp, float * cm, float * out, long long ldo, float * part) {
     constexpr int W = 4;
     dense_perm_k<TY><<<T, 256, 0, st>>>(x, xs, K, xp, cm);
     const dim3 grid((unsigned) (N / 16));
-    // AI_Q4X_DENSE_PIPE=1: the two-stage pipeline. Off by default: no gain on mid-size matrices and slightly slower
-    // on the output head.
+    // [AI_Q4X_DENSE_SK, default 0 until gated] split-K when the caller gave the partial area, the rows are few (N <=
+    // AI_Q4X_DENSE_SK_N, default 8192 = 512 blocks) and K has more pairs than one block's warps
+    static const int sk   = getenv("AI_Q4X_DENSE_SK") ? atoi(getenv("AI_Q4X_DENSE_SK")) : 0;
+    static const int sk_n = getenv("AI_Q4X_DENSE_SK_N") ? atoi(getenv("AI_Q4X_DENSE_SK_N")) : 8192;
+    const int KS = ((K >> 9) + W - 1) / W;
+    if (sk != 0 && part != nullptr && N <= sk_n && KS >= 2 && T <= 8) {
+        dense_sk<TY, W, 1><<<dim3((unsigned) (N / 16), (unsigned) KS), 32 * W, 0, st>>>((const uint8_t *) w, rb, N, K, xp, T, part);
+        dense_skred<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(part, cm, N, T, KS, out, ldo);
+        return;
+    }
+    // AI_Q4X_DENSE_PIPE=1: the two-stage pipeline. Off by default: no gain on mid-size matrices (q6_K 16384x2560 465 vs
+    // 461 GB/s at T=1), slightly worse on the head (q5_K 248320x2560: 803 vs 838 GB/s) -- 3090 2026-10-24
     static const bool pipe = getenv("AI_Q4X_DENSE_PIPE") && atoi(getenv("AI_Q4X_DENSE_PIPE")) != 0;
     if (pipe) {
         if (T <= 8)       dense_p_k<TY, W, 1><<<grid, 32 * W, 0, st>>>((const uint8_t *) w, rb, N, K, xp, cm, T, out, ldo);
@@ -409,21 +510,36 @@ bool q4x_dense_ok(int type, int64_t N, int64_t K, int64_t T) {
     return ty && N % 16 == 0 && K % 512 == 0 && T >= 1 && T <= 32;   // superblock pairs; 4-byte-aligned rows
 }
 
-size_t q4x_dense_scratch_bytes(int64_t K, int64_t T) { return ((size_t) K * T * 2 + 255) / 256 * 256 + 256 + (size_t) T * 4; }
+// scratch: [xp: K * T halves | cm: T floats | (N > 0) split-K partials: KS * T * N floats], each part 256-aligned
+static size_t dense_part_off(int64_t K, int64_t T) {
+    return ((size_t) K * T * 2 + 255) / 256 * 256 + ((size_t) T * 4 + 256 + 255) / 256 * 256;
+}
+// the partial area only where split-K can run (T <= 8, N <= 65536): the 248k-row head at T 32 would need 63 MB
+// and only with AI_Q4X_DENSE_SK on, so the default build's workspace is unchanged
+static bool dense_has_part(int64_t N, int64_t T) {
+    static const bool on = getenv("AI_Q4X_DENSE_SK") && atoi(getenv("AI_Q4X_DENSE_SK")) != 0;
+    return on && N > 0 && N <= 65536 && T <= 8;
+}
+size_t q4x_dense_scratch_bytes(int64_t K, int64_t T, int64_t N) {
+    if (!dense_has_part(N, T)) return ((size_t) K * T * 2 + 255) / 256 * 256 + 256 + (size_t) T * 4;
+    const int64_t KS = ((K >> 9) + 3) / 4;
+    return dense_part_off(K, T) + (size_t) KS * T * N * 4;
+}
 
 bool q4x_dense(void * stream, int type, const void * w, int64_t row_bytes, int64_t N, int64_t K, const float * x,
-               int64_t x_stride, int64_t T, void * scratch, float * out, int64_t ldo) {
+               int64_t x_stride, int64_t T, void * scratch, float * out, int64_t ldo, int64_t scratch_n) {
     if (!q4x_dense_ok(type, N, K, T) || row_bytes % 4 || (uintptr_t) w % 4) return false;
     cudaStream_t st = (cudaStream_t) stream;
     __half *     xp = (__half *) scratch;
     float *      cm = (float *) ((char *) scratch + ((size_t) K * T * 2 + 255) / 256 * 256);
+    float *      pt = scratch_n >= N && dense_has_part(N, T) ? (float *) ((char *) scratch + dense_part_off(K, T)) : nullptr;
     const int    Ni = (int) N, Ki = (int) K, Ti = (int) T;
     switch (type) {
-        case GGML_TYPE_Q6_K:   dense_launch<GGML_TYPE_Q6_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo); break;
-        case GGML_TYPE_Q5_K:   dense_launch<GGML_TYPE_Q5_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo); break;
-        case GGML_TYPE_Q4_K:   dense_launch<GGML_TYPE_Q4_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo); break;
-        case GGML_TYPE_IQ4_XS: dense_launch<GGML_TYPE_IQ4_XS>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo); break;
-        default:               dense_launch<GGML_TYPE_IQ3_S>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo); break;
+        case GGML_TYPE_Q6_K:   dense_launch<GGML_TYPE_Q6_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo, pt); break;
+        case GGML_TYPE_Q5_K:   dense_launch<GGML_TYPE_Q5_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo, pt); break;
+        case GGML_TYPE_Q4_K:   dense_launch<GGML_TYPE_Q4_K>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo, pt); break;
+        case GGML_TYPE_IQ4_XS: dense_launch<GGML_TYPE_IQ4_XS>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo, pt); break;
+        default:               dense_launch<GGML_TYPE_IQ3_S>(st, w, row_bytes, Ni, Ki, x, x_stride, Ti, xp, cm, out, ldo, pt); break;
     }
     return true;
 }

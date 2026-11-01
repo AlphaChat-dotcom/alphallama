@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@ using namespace ai;
 
 int main(int argc, char ** argv) {
     std::string model, tokens_in, score_out, dump_dir, gen_out;
+    bool        score_nll = false;   // --score-nll: int64 n, int64 V, then n - 1 float NLLs (log-sum-exp in double)
     int64_t n_gen = 0;
     int64_t chunk = 512, ctx = 4096;
     int     slots = 64;
@@ -47,6 +49,7 @@ int main(int argc, char ** argv) {
         if (a == "-m") model = v;
         else if (a == "--tokens-in") tokens_in = v;
         else if (a == "--score") score_out = v;
+        else if (a == "--score-nll") { score_out = v; score_nll = true; }   // per-position NLL only (see the loop)
         else if (a == "--chunk") chunk = atoll(v.c_str());
         else if (a == "--ctx") ctx = atoll(v.c_str());
         else if (a == "--slots") slots = atoi(v.c_str());
@@ -168,7 +171,22 @@ int main(int argc, char ** argv) {
             if (f) {
                 std::vector<float> all((size_t) (V * T));
                 dev.download(logits, all.data(), 0, all.size() * 4);
-                fwrite(all.data(), 4, all.size(), f);
+                if (!score_nll) {
+                    fwrite(all.data(), 4, all.size(), f);
+                } else {
+                    // [--score-nll] row t predicts token off + t + 1: NLL = logsumexp(row) - row[next], reduced in DOUBLE
+                    // (float accumulation over 248320 terms drifts, and differently per arm: the very difference a
+                    // paired gate measures). The last position has no target.
+                    for (int64_t t = 0; t < T && off + t + 1 < n; ++t) {
+                        const float * rw = all.data() + (size_t) t * (size_t) V;
+                        double        mx = rw[0];
+                        for (int64_t j = 1; j < V; ++j) mx = std::max(mx, (double) rw[j]);
+                        double se = 0;
+                        for (int64_t j = 0; j < V; ++j) se += std::exp((double) rw[j] - mx);
+                        const float nll = (float) (mx + std::log(se) - (double) rw[ids[(size_t) (off + t + 1)]]);
+                        fwrite(&nll, 4, 1, f);
+                    }
+                }
             }
         }
         if (f) fclose(f);
@@ -279,7 +297,7 @@ int main(int argc, char ** argv) {
                 lg = run.verify(toks.data(), T);
                 // the greedy ids reduced on the device (op::argmax, bit-exact with ties), as the server does: the full
                 // logits download (3 MB at T = 3) + host scan cost 0.75 ms/round of GPU idle that serving does not have
-                // (3090 pl6 2026-10-30, nsys graph trace). AI_Q4X_HOST_ARGMAX=1: the old host path.
+                // (3090 2026-10-30, nsys graph trace). AI_Q4X_HOST_ARGMAX=1: the old host path.
                 static const bool host_argmax = getenv("AI_Q4X_HOST_ARGMAX") && atoi(getenv("AI_Q4X_HOST_ARGMAX")) != 0;
                 std::vector<int32_t> gq((size_t) T);
                 if (host_argmax || !lg.contiguous()) {
