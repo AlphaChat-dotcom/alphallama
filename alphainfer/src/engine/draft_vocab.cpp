@@ -132,16 +132,26 @@ std::vector<uint8_t> classify_gguf_tokens(const std::vector<std::string> & token
     return cls;
 }
 
+std::vector<std::string> gguf_token_texts(const std::vector<std::string> & tokens) {
+    std::vector<std::string> out(tokens.size());
+    for (size_t id = 0; id < tokens.size(); ++id) out[id] = gpt2_token_bytes(tokens[id]);
+    return out;
+}
+
 double prompt_english_share(const Tokenizer & tok, const std::vector<int32_t> & prompt) {
-    // share of the prompt's words that are common English function words (English prose typically scores 12-37%,
-    // other European languages ~1-2%, mostly-code ~10%). DFlash2's drafter only beats the MTP head on English.
+    std::string text;
+    for (int32_t id : prompt) text += tok.piece(id);
+    return text_english_share(text);
+}
+
+double text_english_share(const std::string & text) {
+    // share of the prompt's words that are common English function words (27B 3090 prompts, 2026-10-20: English chat /
+    // docs 12-37%, German 1.0%, Spanish 1.8%, mostly-code 10%). DFlash2's drafter only beats the MTP head on English.
     static const char * const kWords[] = { "the", "of", "and", "to", "a", "in", "is", "that", "for", "it", "as", "with",
         "was", "on", "be", "by", "this", "are", "or", "at", "from", "an", "not", "have", "which", "you", "your", "we",
         "they", "he", "she", "his", "her", "its", "can", "will", "would", "there", "their", "what", "when", "how", "all",
         "if", "do", "does", "has", "but", "more", "one", "so", "been", "than", "about", "into", "only", "also", "these",
         "those", "our", "may", "should" };
-    std::string text;
-    for (int32_t id : prompt) text += tok.piece(id);
     long long words = 0, hits = 0;
     std::string w;
     auto flush = [&]() {

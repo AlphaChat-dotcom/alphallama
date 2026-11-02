@@ -71,7 +71,17 @@ __global__ static void q4x_qsa_dirty_k(const int32_t * pos, long long T, long lo
     }
 }
 
+__global__ static void q4x_qsa_iota_k(long long n, long long T, int32_t * out) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * T) out[i] = (int32_t) (i % n);
+}
+
 namespace ai::kern {
+
+void q4x_qsa_iota(void * stream, int64_t n, int64_t T, int32_t * out) {
+    if (n <= 0 || T <= 0) return;
+    q4x_qsa_iota_k<<<q4x_blocks_for(n * T, 256), 256, 0, (cudaStream_t) stream>>>((long long) n, (long long) T, out);
+}
 
 void q4x_qsa_dirty(void * stream, const int32_t * pos, int64_t T, int64_t r, int64_t M, int64_t rows, int32_t * dcells,
                    int64_t * drows, int32_t * dpos) {

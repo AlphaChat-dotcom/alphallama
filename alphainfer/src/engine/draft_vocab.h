@@ -49,8 +49,11 @@ std::vector<uint8_t> classify_gguf_tokens(const std::vector<std::string> & token
 bool prompt_is_latin(const std::vector<uint8_t> & cls, const std::vector<int32_t> & prompt);
 // For AI_DF2_ROUTE: share of the prompt's words that are common English function words (0..1)
 double prompt_english_share(const Tokenizer & tok, const std::vector<int32_t> & prompt);
-// For AI_DF2_ROUTE_EDIT: the last user turn carries a fenced code block (>= 600 chars) and asks for it edited
-// (rename/fix/...)
+// the same share from text (the qwen4exp runner has no Tokenizer: it decodes the GGUF pieces, gguf_token_texts)
+double text_english_share(const std::string & text);
+// tokenizer.ggml.tokens (GPT-2 byte-encoded) -> the raw bytes of every piece
+std::vector<std::string> gguf_token_texts(const std::vector<std::string> & tokens);
+// [AI_DF2_ROUTE_EDIT] the last user turn carries a fenced code block (>= 600 chars) and asks for it edited (rename/fix/...)
 bool prompt_is_code_edit(const Tokenizer & tok, const std::vector<int32_t> & prompt);
 // The draft rows for a prompt, ascending ids, exactly `rows` of them; empty when the default rows should stay
 // (a Latin-dominant prompt). `why` receives a one-line description.

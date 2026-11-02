@@ -91,6 +91,7 @@ struct Q4xServe::Impl {
     int                          mtp_k = 0, copy_min = 0, copy_k = 15;
     bool                         agree = true;
     std::vector<uint8_t>         vocab_cls;   // per-token script classes for the draft rows (empty = first rows)
+    std::vector<std::string>     vocab_txt;   // [AI_Q4X_DRAFT_ROWS_EN] every piece's bytes (English-share test)
     std::vector<int32_t>         hist;        // prompt + every emitted token (the suffix copy's history)
     std::vector<float>           logits;
     std::vector<int32_t>         stop_ids;    // end-of-turn tokens: a decode round commits nothing past one
@@ -336,7 +337,11 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
     m.run = std::make_unique<Qwen4ExpRun>(m.prog, m.dev, m.ctx, slots);
     if (m.mtp) {
         m.run->mtp_enable();
-        if (env_int("AI_DRAFT_VOCAB", 1) != 0) m.vocab_cls = classify_gguf_tokens(m.prog.weights().get_str_array("tokenizer.ggml.tokens"));
+        if (env_int("AI_DRAFT_VOCAB", 1) != 0) {
+            const std::vector<std::string> toks = m.prog.weights().get_str_array("tokenizer.ggml.tokens");
+            m.vocab_cls = classify_gguf_tokens(toks);
+            if (env_int("AI_Q4X_DRAFT_ROWS_EN", 106496) > 0) m.vocab_txt = gguf_token_texts(toks);
+        }
     }
     m.dev.init_workspace(ws << 20);
     // [sampling] one kern::SampleParams on the device for this stream (AI_SAMPLING=0: none, greedy only); all-greedy
@@ -372,9 +377,24 @@ int64_t Q4xServe::free_vram_mib() const {
     return (int64_t) (fr >> 20);
 }
 
+// [AI_Q4X_ACC_LOG=<file>, debug] one line per decode round: request id, the window's source (M = MTP
+// drafts, C = copied n-gram continuation, P = no drafts), window T (pending + drafts), drafts accepted, the copy's
+// match length, and the MTP drafter's own top-1 probability per depth; "R id n" opens a request (prompt length n)
+static FILE * acc_log() {
+    static FILE * f = getenv("AI_Q4X_ACC_LOG") ? fopen(getenv("AI_Q4X_ACC_LOG"), "a") : nullptr;
+    return f;
+}
+static long long g_acc_req = 0;
+
 int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
     Impl & m = *p_;
     if (n < 1) throw std::runtime_error("q4x prefill: empty prompt");
+    if (FILE * f = acc_log()) {   // the prompt ids too: the n-gram copy is replayed offline over prompt + output
+        fprintf(f, "R %lld %d", ++g_acc_req, n);
+        for (int i = 0; i < n; ++i) fprintf(f, " %d", tokens[i]);
+        fputc('\n', f);
+        fflush(f);
+    }
     if ((int64_t) n + 1 >= m.ctx) throw std::runtime_error("q4x prefill: the prompt does not fit the context");
     feed_.clear();
     // AI_Q4X_RESIDENCY_RESET (default 1 without MTP, i.e. exact; 0 with): admissions move experts into VRAM from every
@@ -419,8 +439,29 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
     if (start == 0) m.run->reset();
     reused_ = start;
     if (m.mtp && env_int("AI_DRAFT_VOCAB", 1) != 0) {   // the draft head's rows from this prompt's scripts
-        const int64_t              rows = env_int("AI_Q4X_DRAFT_ROWS", 131072);
+        int64_t                    rows = env_int("AI_Q4X_DRAFT_ROWS", 131072);
         const std::vector<int32_t> ids(tokens, tokens + n);
+        // [AI_Q4X_DRAFT_ROWS_EN, default 106496; 0 = off] an ENGLISH prompt (Latin-dominant and >= AI_Q4X_DRAFT_EN_SHARE,
+        // default 0.05, of its words English function words: English chat / docs 12-37%, code ~10%, German 1%, Spanish 2%;
+        // 5090: 0.08 missed d1 0.077 and v_explain_taps 0.079, the 11 English prompts span 0.077-0.230, de/es 0.000)
+        // gets this many draft rows (Strata's draft vocab is ~106K). Latin-priority rows are common + Latin ascending, so
+        // the cut drops the HIGHEST-id Latin rows: German / Spanish lost acceptance with a global cut (3090: de
+        // -7.4%, es -2.9% at 106496), hence English only. 5090: draft 1.26 -> 1.18 ms/round, tokens/round unchanged on
+        // the English / code prompts. Rows change acceptance only, never the verified text.
+        const int64_t rows_en = env_int("AI_Q4X_DRAFT_ROWS_EN", 106496);
+        if (rows_en > 0 && rows_en < rows && !m.vocab_txt.empty() && prompt_is_latin(m.vocab_cls, ids)) {
+            static const double en_thr = getenv("AI_Q4X_DRAFT_EN_SHARE") ? atof(getenv("AI_Q4X_DRAFT_EN_SHARE")) : 0.05;
+            std::string text;
+            for (int32_t id : ids) if (id >= 0 && (size_t) id < m.vocab_txt.size()) text += m.vocab_txt[(size_t) id];
+            const double share = text_english_share(text);
+            if (share >= en_thr) rows = rows_en;
+            static int64_t last_rows = -1;   // logged when the choice changes (quiet in steady state)
+            if (rows != last_rows) {
+                last_rows = rows;
+                fprintf(stderr, "[draft-vocab] English share %.3f (threshold %.3f): %lld draft rows%c", share, en_thr,
+                        (long long) rows, 10);
+            }
+        }
         std::string                why;
         const std::vector<int32_t> sel = m.vocab_cls.empty() ? std::vector<int32_t>{} : draft_rows_for(m.vocab_cls, ids, rows, &why);
         m.run->set_draft_rows(sel, rows);
@@ -483,7 +524,8 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     bool   early = false;
     if (!copied && m.ctx - 1 - m.run->position() >= depth + 1)
         early = m.run->draft_verify_early(pending, depth, d, lg_early);
-    if (!early && (!copied || m.agree)) d = m.run->mtp_draft(pending, depth);
+    std::vector<float> dprob;   // [AI_Q4X_ACC_LOG] the drafter's top-1 probability per depth
+    if (!early && (!copied || m.agree)) d = m.run->mtp_draft(pending, depth, 0.0f, acc_log() ? &dprob : nullptr);
     if (copied && m.agree) {   // keep the copy only where the MTP agrees on its first token
         if (d.empty() || d[0] != toks[1]) { toks.resize(1); copied = false; }
     }
@@ -517,6 +559,13 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     }
     m.run->commit((int64_t) out.size());
     m.hist.insert(m.hist.end(), out.begin(), out.end());
+    if (FILE * f = acc_log()) {   // [AI_Q4X_ACC_LOG] src T accepted match | per-depth drafter p (MTP windows)
+        fprintf(f, "%c %lld %d %d", T == 1 ? 'P' : copied ? 'C' : 'M', (long long) T, (int) out.size() - 1, copied ? match : 0);
+        if (!copied) for (float p : dprob) fprintf(f, " %.4f", p);
+        fprintf(f, " |");   // the committed tokens
+        for (int32_t t : out) fprintf(f, " %d", t);
+        fputc('\n', f);
+    }
     if (use_policy)
         m.policy.observe(copied, (int) T, (int) out.size() - 1, match,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

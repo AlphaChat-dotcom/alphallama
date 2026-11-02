@@ -17,7 +17,12 @@
 
 #include <cuda_runtime.h>
 
+#include "ggml.h"
+
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -294,10 +299,12 @@ Tensor Qwen4ExpRun::mtp_build(const Tensor & H, const Tensor & ids_t, const Tens
 // mask over a power-of-two envelope F) in fixed buffers, each step's argmax mapped to its token on the device and fed
 // to the next step's embedding (draft_next), so the host waits once per chain instead of twice per step. Keyed by
 // (F, fill rows m, n). Returns the n drafts and their probabilities (the caller applies tau).
-void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch) {
+// [AI_Q4X_MTP_SPLIT] off > 0 continues a chain whose first off steps already ran: no fill, step 0 reads the carried
+// H from mtp_R2_ (where the last step left it) and drafts at positions pos + off + i; `pending` is the last draft.
+void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch, int off) {
     const Qwen4ExpSpec & s = prog_.spec();
-    const int64_t HW = s.hc_dim(), pos = (int64_t) hist_.size();
-    const int64_t m = mtp_fill_m_, p0 = mtp_fill_p0_;
+    const int64_t HW = s.hc_dim(), pos = (int64_t) hist_.size() + off;
+    const int64_t m = off > 0 ? 0 : mtp_fill_m_, p0 = mtp_fill_p0_;
     int64_t F = 256;
     while (F < pos + n) F *= 2;
     F = std::min(F, max_ctx_);
@@ -326,6 +333,43 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
         mc_tok_ = mk(I32, kMtpChain, base + fill_b + kMtpChain * step_b);
         mc_p_   = mk(F32, kMtpChain, base + fill_b + kMtpChain * step_b + 256);
     }
+    // [AI_Q4X_MTP_ASYNC_UP, default 0 until measured] the ingress through a pinned mirror of the device buffer, as
+    // stream-ordered async copies: no host sync before the chain (Device::upload is unordered, so the sync path drains
+    // the stream first and then issues ~3 + 3n blocking pageable copies while the GPU idles). Same bytes, same order.
+    // The mirror is free to rewrite here: every earlier chain's copies completed before its read-back.
+    static const bool async_up = getenv("AI_Q4X_MTP_ASYNC_UP") && atoi(getenv("AI_Q4X_MTP_ASYNC_UP")) != 0;
+    if (async_up && !mc_pin_) {
+        const size_t ctx = (size_t) max_ctx_;
+        const size_t tot = 256 + 256 + 256 + (Tm * ctx * 2 + 255) / 256 * 256 + kMtpChain * (256 + (ctx * 2 + 255) / 256 * 256) + 512;
+        if (cudaHostAlloc((void **) &mc_pin_, tot, cudaHostAllocDefault) != cudaSuccess) { (void) cudaGetLastError(); mc_pin_ = nullptr; }
+    }
+    if (async_up && mc_pin_) {
+        char *       db = (char *) mc_ids_.data;
+        cudaStream_t st = (cudaStream_t) adapter::stream(dev_);
+        auto put = [&](const Tensor & t, const void * src, size_t nb) {
+            const size_t o = (size_t) ((char *) t.data - db);
+            memcpy(mc_pin_ + o, src, nb);
+            cudaMemcpyAsync(t.data, mc_pin_ + o, nb, cudaMemcpyHostToDevice, st);
+        };
+        if (m > 0) {
+            const size_t o4 = (size_t) ((char *) mc_pos4_.data - db), oc = (size_t) ((char *) mc_cells_.data - db);
+            const size_t om = (size_t) ((char *) mc_mask_.data - db);
+            mtp_ingress(p0, m, F, (int32_t *) (mc_pin_ + o4), (int64_t *) (mc_pin_ + oc), (uint16_t *) (mc_pin_ + om));
+            put(mc_ids_, hist_.data() + p0, (size_t) m * 4);
+            cudaMemcpyAsync(mc_pos4_.data, mc_pin_ + o4, (size_t) (4 * m) * 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(mc_cells_.data, mc_pin_ + oc, (size_t) m * 8, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(mc_mask_.data, mc_pin_ + om, (size_t) (F * m) * 2, cudaMemcpyHostToDevice, st);
+        }
+        put(mc_sids_[0], &pending, 4);
+        for (int i = 0; i < n; ++i) {
+            const size_t o4 = (size_t) ((char *) mc_spos4_[i].data - db), oc = (size_t) ((char *) mc_scell_[i].data - db);
+            const size_t om = (size_t) ((char *) mc_smask_[i].data - db);
+            mtp_ingress(pos + i, 1, F, (int32_t *) (mc_pin_ + o4), (int64_t *) (mc_pin_ + oc), (uint16_t *) (mc_pin_ + om));
+            // pos4 + cell are 64 bytes apart in one 256-byte header: one copy for both
+            cudaMemcpyAsync(mc_spos4_[i].data, mc_pin_ + o4, (size_t) (oc - o4) + 8, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(mc_smask_[i].data, mc_pin_ + om, (size_t) F * 2, cudaMemcpyHostToDevice, st);
+        }
+    } else {
     dev_.synchronize();   // the uploads below are unordered against the stream
     if (m > 0) {
         std::vector<int32_t>  p4((size_t) (4 * m));
@@ -345,8 +389,13 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
         dev_.upload(mc_scell_[i], &ce, 0, 8);
         dev_.upload(mc_smask_[i], mk.data(), 0, mk.size() * 2);
     }
+    }
     const bool    mapped = mtp_mapped();
-    const int64_t key    = (F << 12) | (m << 6) | ((int64_t) n << 1) | (mapped ? 1 : 0);
+    // [AI_Q4X_DRAFT_ROWS_EN] the compact head's row COUNT can change per request (English prompts get fewer rows): the
+    // captured chain bakes it into the head GEMV and argmax, so it is part of the key (rows / 4096, bits 52-58)
+    const int64_t drows  = mapped ? draft_head_.ne[1] / 4096 : 0;
+    const int64_t key    = (F << 12) | (m << 6) | ((int64_t) n << 1) | (mapped ? 1 : 0) | (off > 0 ? (int64_t) 1 << 50 : 0) |
+                           (drows << 52);
     bool warm = false;
     mtp_rounds_.launch(dev_, key, [&]() {
         auto v1 = [](const Tensor & t, int64_t n0, size_t es) { return t.view(n0, 1, 1, 1, n0 * es, n0 * es, n0 * es, 0); };
@@ -358,7 +407,7 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
             const Tensor slot0 = mtp_H_.view(HW, 1, 1, 1, (size_t) HW * 4, (size_t) HW * 4, (size_t) HW * 4, 0);
             op::copy_into(dev_, last, slot0, "q4x mtp Hprev");
         }
-        Tensor H = mtp_H_.view(HW, 1, 1, 1, (size_t) HW * 4, (size_t) HW * 4, (size_t) HW * 4, 0);
+        Tensor H = off > 0 ? mtp_R2_ : mtp_H_.view(HW, 1, 1, 1, (size_t) HW * 4, (size_t) HW * 4, (size_t) HW * 4, 0);
         for (int i = 0; i < n; ++i) {
             const Tensor lg = mtp_build(H, mc_sids_[i], mc_spos4_[i], mc_scell_[i],
                                         mc_smask_[i].view(F, 1, 1, 1, (size_t) F * 2, (size_t) F * 2, (size_t) F * 2, 0), 1, F, true);
@@ -387,10 +436,11 @@ void Qwen4ExpRun::mtp_chain(int32_t pending, int n, int32_t * toks, float * prob
         }
         return mc_tok_;
     }, &warm, true, [&](const int64_t & k2, const auto & e) {
-        fprintf(stderr, "[q4x] MTP chain recorded: F=%lld fill=%lld n=%lld, %d nodes\n", (long long) (k2 >> 12),
-                (long long) ((k2 >> 6) & 63), (long long) ((k2 >> 1) & 31), e.round->n_nodes());
+        fprintf(stderr, "[q4x] MTP chain recorded: F=%lld fill=%lld n=%lld%s, %d nodes\n", (long long) ((k2 >> 12) & ((1LL << 38) - 1)),
+                (long long) ((k2 >> 6) & 63), (long long) ((k2 >> 1) & 31), (k2 >> 50) & 1 ? " (continuation)" : "",
+                e.round->n_nodes());
     });
-    mtp_fill_m_ = 0;
+    if (off == 0) mtp_fill_m_ = 0;
     if (!fetch) return;   // [AI_Q4X_VERIFY_EARLY] read from mc_tok_ after an event, not a stream sync
     dev_.download(mc_tok_, toks, 0, (size_t) n * 4);
     dev_.download(mc_p_, probs, 0, (size_t) n * 4);
@@ -405,19 +455,74 @@ bool Qwen4ExpRun::set_draft_rows(const std::vector<int32_t> & ids, int64_t prefi
         return true;
     }
     const int64_t rows = (int64_t) ids.size();
-    const size_t  rb   = outw.nb[1];
     for (int32_t id : ids) {
         if (id < 0 || id >= outw.ne[1]) { fprintf(stderr, "[draft-vocab] id %d out of range: refused\n", id); return false; }
+    }
+    // the same rows already in the buffer (serve calls this per prompt): nothing to copy
+    if (draft_head_.valid() && ids == draft_map_) return true;
+    // [AI_Q4X_DRAFT_HEAD_TYPE=q4_k|iq4_xs|iq3_s, default: the output head's own type] the DRAFT head's rows in a
+    // smaller type (the verify head stays full): fewer bytes per draft step (Q5_K 131072 x 2560 = 231 MB; Q4_K 189,
+    // IQ4_XS 178, IQ3_S 144). Output text cannot change (the verify decides every token); acceptance can, so a type
+    // ships only through the multilingual acceptance gate. The head is requantised once on the host (Q5_K ->
+    // f32 -> type, ggml's CPU quantiser, all threads) and the chosen rows uploaded from there.
+    static const int dh_type = []() {
+        const char * v = getenv("AI_Q4X_DRAFT_HEAD_TYPE");
+        if (!v || !*v) return -1;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+            if (ggml_get_type_traits((ggml_type) t)->type_name && strcmp(ggml_type_name((ggml_type) t), v) == 0) return t;
+        fprintf(stderr, "[draft-vocab] AI_Q4X_DRAFT_HEAD_TYPE=%s unknown: head type kept\n", v);
+        return -1;
+    }();
+    const bool    rq   = dh_type >= 0 && dh_type != outw.type && outw.contiguous() &&
+                         kern::q4x_dense_ok(dh_type, rows, outw.ne[0], 1) && outw.ne[0] % 256 == 0;
+    const size_t  rb_src = outw.nb[1];
+    const size_t  rb   = rq ? ggml_row_size((ggml_type) dh_type, outw.ne[0]) : rb_src;
+    if (rq && draft_host_type_ != dh_type) {
+        const auto    t0  = std::chrono::steady_clock::now();
+        const int64_t V = outw.ne[1], K = outw.ne[0];
+        std::vector<uint8_t> src((size_t) V * rb_src);
+        dev_.synchronize();
+        if (cudaMemcpy(src.data(), outw.data, src.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            fprintf(stderr, "[draft-vocab] head download failed: head type kept\n");
+            return false;
+        }
+        draft_host_.assign((size_t) V * rb, 0);
+        const auto *  tt = ggml_get_type_traits((ggml_type) outw.type);
+        const int64_t nt = std::max<int64_t>(1, std::min<int64_t>(32, (int64_t) std::thread::hardware_concurrency()));
+        const int64_t per = (V + nt - 1) / nt;
+        std::vector<std::thread> th;
+        for (int64_t w = 0; w < nt; ++w) {
+            const int64_t r0 = w * per, r1 = std::min(V, r0 + per);
+            if (r0 >= r1) break;
+            th.emplace_back([&, r0, r1]() {   // 256 rows at a time: 2.6 MB of f32 per thread, not the thread's whole range
+                constexpr int64_t kChunk = 256;
+                std::vector<float> f((size_t) (kChunk * K));
+                for (int64_t c0 = r0; c0 < r1; c0 += kChunk) {
+                    const int64_t c1 = std::min(r1, c0 + kChunk);
+                    for (int64_t r = c0; r < c1; ++r) tt->to_float(src.data() + (size_t) r * rb_src, f.data() + (r - c0) * K, K);
+                    ggml_quantize_chunk((ggml_type) dh_type, f.data(), draft_host_.data() + (size_t) c0 * rb, 0, c1 - c0, K, nullptr);
+                }
+            });
+        }
+        for (auto & t : th) t.join();
+        draft_host_type_ = dh_type;
+        fprintf(stderr, "[draft-vocab] draft head requantised %s -> %s (%.0f -> %.0f MB for the whole vocab) in %.2f s\n",
+                ggml_type_name((ggml_type) outw.type), ggml_type_name((ggml_type) dh_type), V * rb_src / 1e6, V * rb / 1e6,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     // one buffer for the life of the run, sized at the first call (later calls must not ask for more rows)
     if (draft_buf_ < 0) {
         try {
-            draft_buf_ = dev_.alloc_buffer((size_t) rows * rb + 256 + (size_t) rows * 4, "q4x.draft_head");   // rows + the device map
+            // sized for the largest request: AI_Q4X_DRAFT_ROWS (an English prompt first must not cap the rest)
+            const char *  ev  = getenv("AI_Q4X_DRAFT_ROWS");
+            const int64_t cap = std::max<int64_t>(rows, std::min<int64_t>(outw.ne[1], ev ? atoll(ev) : 131072));
+            draft_buf_ = dev_.alloc_buffer((size_t) cap * rb + 256 + (size_t) cap * 4, "q4x.draft_head");   // rows + the device map
+            draft_head_cap_ = cap;
         } catch (const std::exception & e) {
             fprintf(stderr, "[draft-vocab] %s: full draft head kept\n", e.what());
             return false;
         }
-        draft_head_cap_ = rows;
     }
     if (rows > draft_head_cap_) {
         fprintf(stderr, "[draft-vocab] %lld rows > %lld allocated: refused\n", (long long) rows, (long long) draft_head_cap_);
@@ -425,13 +530,20 @@ bool Qwen4ExpRun::set_draft_rows(const std::vector<int32_t> & ids, int64_t prefi
     }
     char * base = (char *) dev_.buffer_base(draft_buf_);
     dev_.synchronize();
-    // copy runs of consecutive ids (the output rows are contiguous, nb[1] apart)
-    for (int64_t i = 0; i < rows;) {
-        int64_t j = i + 1;
-        while (j < rows && ids[(size_t) j] == ids[(size_t) (j - 1)] + 1) ++j;
-        cudaMemcpy(base + (size_t) i * rb, (const char *) outw.data + (size_t) ids[(size_t) i] * rb, (size_t) (j - i) * rb,
-                   cudaMemcpyDefault);
-        i = j;
+    if (rq) {   // gather the rows on the host, one upload
+        std::vector<uint8_t> g((size_t) rows * rb);
+        for (int64_t i = 0; i < rows; ++i)
+            memcpy(g.data() + (size_t) i * rb, draft_host_.data() + (size_t) ids[(size_t) i] * rb, rb);
+        cudaMemcpy(base, g.data(), g.size(), cudaMemcpyHostToDevice);
+    } else {
+        // copy runs of consecutive ids (the output rows are contiguous, nb[1] apart)
+        for (int64_t i = 0; i < rows;) {
+            int64_t j = i + 1;
+            while (j < rows && ids[(size_t) j] == ids[(size_t) (j - 1)] + 1) ++j;
+            cudaMemcpy(base + (size_t) i * rb, (const char *) outw.data + (size_t) ids[(size_t) i] * rb, (size_t) (j - i) * rb,
+                       cudaMemcpyDefault);
+            i = j;
+        }
     }
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) { fprintf(stderr, "[draft-vocab] copy failed: %s\n", cudaGetErrorString(e)); return false; }
@@ -439,6 +551,7 @@ bool Qwen4ExpRun::set_draft_rows(const std::vector<int32_t> & ids, int64_t prefi
     t.buf    = draft_buf_;
     t.data   = base;
     t.ne[1]  = rows;
+    if (rq) t.type = dh_type;
     set_contiguous_strides(t);
     draft_head_ = t;
     draft_map_  = ids;
@@ -505,8 +618,25 @@ std::vector<int32_t> Qwen4ExpRun::mtp_draft(int32_t pending, int n, float tau, s
     if (chain) {
         int32_t ct[kMtpChain];
         float   cp[kMtpChain];
+        // [AI_Q4X_MTP_SPLIT=s, default 0 = one chain] with draft min-p on, the first s steps as one chain, then the
+        // rest only if none of those s drafts failed the cut: a cut at step s no longer pays for steps s+1..n (Strata
+        // drafts until the first failing step). Costs one read-back + launch when the window survives. Same drafts.
+        static const int split = getenv("AI_Q4X_MTP_SPLIT") ? atoi(getenv("AI_Q4X_MTP_SPLIT")) : 0;
         q4x_rt_mark(0, adapter::stream(dev_));
-        mtp_chain(pending, n_eff, ct, cp);
+        if (split > 0 && split < n_eff && (mtp_minp() > 0 || tau > 0)) {
+            mtp_chain(pending, split, ct, cp);
+            double c0   = 1.0;
+            bool   live = true;
+            for (int i = 0; i < split && live; ++i) {
+                if (tau > 0 && i >= mtp_keep_ && c0 * cp[i] < tau) live = false;
+                if (mtp_minp() > 0 && i >= mtp_keep_ && cp[i] < mtp_minp()) live = false;
+                c0 *= cp[i];
+            }
+            if (live) mtp_chain(ct[split - 1], n_eff - split, ct + split, cp + split, true, split);
+            else for (int i = split; i < n_eff; ++i) cp[i] = 0.0f;   // never read: the loop below stops first
+        } else {
+            mtp_chain(pending, n_eff, ct, cp);
+        }
         q4x_rt_mark(1, adapter::stream(dev_));
         double cum = 1.0;
         for (int i = 0; i < n_eff; ++i) {
@@ -515,6 +645,28 @@ std::vector<int32_t> Qwen4ExpRun::mtp_draft(int32_t pending, int n, float tau, s
             cum *= cp[i];
             out.push_back(ct[i]);
             if (probs) probs->push_back(cp[i]);
+        }
+        // [AI_Q4X_ROUND_TIMING] where the cut lands: kept drafts per chain of n_eff computed steps; a chain that kept k < n
+        // computed n - k - 1 steps nobody reads (the step after the failing one)
+        static const bool cut_stats = getenv("AI_Q4X_ROUND_TIMING") != nullptr;
+        if (cut_stats) {
+            struct CutHist {
+                long long h[kMtpChain + 1][kMtpChain + 1] = {};
+                ~CutHist() {
+                    long long chains = 0, wasted = 0;
+                    for (int a = 1; a <= kMtpChain; ++a)
+                        for (int b = 0; b <= a; ++b) { chains += h[a][b]; if (b < a) wasted += h[a][b] * (a - b - 1); }
+                    if (!chains) return;
+                    fprintf(stderr, "[mtp-cut] %lld chains, %.3f computed steps unread per chain; kept/computed:", chains,
+                            (double) wasted / (double) chains);
+                    for (int a = 1; a <= kMtpChain; ++a)
+                        for (int b = 0; b <= a; ++b)
+                            if (h[a][b]) fprintf(stderr, " %d/%d %.1f%%", b, a, 100.0 * (double) h[a][b] / (double) chains);
+                    fprintf(stderr, "\n");
+                }
+            };
+            static CutHist ch;
+            ++ch.h[n_eff][out.size()];
         }
         return out;
     }

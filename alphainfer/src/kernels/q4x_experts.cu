@@ -17,6 +17,7 @@
 // the GLU is op_silu(gate) * up; q8_1 copies come from ggml-cuda's quantize_row_q8_1_cuda. Built -use_fast_math as
 // ggml-cuda is. AI_Q4X_GROUPED=2 runs both and counts differing values over the computed columns.
 #include "kernels/kernels.h"
+#include "kernels/q4x_plan.cuh"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/quantize.cuh"
@@ -262,35 +263,19 @@ __device__ __forceinline__ float silu(float x) {
 
 // The window's ownership plan, computed once per call (one block): the lowest column routed to each resident slot
 // owns it; plan->own[i] = { slot, ncols, the columns in ascending order } for i < plan->count. Missed columns (slot >=
-// filler0) own nothing. The owner order is whatever the atomic gives -- each column's result does not depend on it.
-constexpr int kPlanCols = 16;  // columns one owner can serve (= the most window rows sharing a slot; T <= 16)
-struct Own { int ch, ne, cs[kPlanCols]; };
-struct Plan { int count, pad[3]; Own own[kMaxCols]; };
+// filler0) own nothing. The owner ORDER is whatever the atomic gives -- each column's result does not depend on it.
+// (the struct and the builder live in kernels/q4x_plan.cuh, shared with the fused route + ring kernel)
+using q4xplan::kPlanCols;
+using q4xplan::Own;
+using q4xplan::Plan;
+static_assert(q4xplan::kMaxCols == kMaxCols, "q4x_plan.cuh and q4x_experts.cu disagree on the column cap");
 static_assert(sizeof(Own) == (2 + kPlanCols) * sizeof(int) && offsetof(Plan, own) == 4 * sizeof(int), "TC path reads Plan as records");
 
 // owners are ids in [lo, hi), slot = id - lo (decode: lo = 0, hi = filler0; the GPU miss share: lo = gpu0, the host bank)
 __global__ void plan_k(const int32_t * __restrict__ ids, int ids_stride, int k, int n, int lo, int hi, Plan * __restrict__ plan) {
     __shared__ int sid[kMaxCols];
     __shared__ int cnt;
-    const int c = threadIdx.x;
-    if (c == 0) cnt = 0;
-    if (c < n) sid[c] = ids[(c % k) + (c / k) * ids_stride];
-    __syncthreads();
-    if (c < n) {
-        const int ch = sid[c];
-        bool owner = ch >= lo && ch < hi;
-        for (int d = 0; d < c && owner; ++d) owner = sid[d] != ch;
-        if (owner) {
-            const int i = atomicAdd(&cnt, 1);
-            Own &     o = plan->own[i];
-            int       ne = 0;
-            for (int d = c; d < n && ne < kPlanCols; ++d) if (sid[d] == ch) o.cs[ne++] = d;
-            o.ch = ch - lo;
-            o.ne = ne;
-        }
-    }
-    __syncthreads();
-    if (c == 0) plan->count = cnt;
+    q4xplan::plan_build(ids, ids_stride, k, n, lo, hi, plan, sid, cnt);
 }
 
 // grid (ceil(F / (W*R)), k * T), block (32, W): block y = owner y of the plan (exits past plan->count); warp w does rows
@@ -1570,6 +1555,66 @@ bool q4x_experts_ok(int ty_gu, int ty_down, int64_t K, int64_t F, int64_t N, int
            N % 4 == 0 && F % 4 == 0;
 }
 
+// [AI_Q4X_RING_CHECK=1, debug] when the ring kernel built the plan / x's q8_1 copy, build them again the reference way
+// (plan_k's routine, the fork's quantize) into device-global shadows and compare: the plan as an owner SET (the owner
+// order is the atomic's), xq bytewise. Device printf: the first mismatches, then a running count every 2048 checks.
+constexpr int kChkXqBytes = 128 * 36 * 16;   // K <= 4096, T <= 16
+__device__ Plan          g_chk_plan;
+__device__ unsigned char g_chk_xq[kChkXqBytes];
+__device__ unsigned      g_chk_n = 0, g_chk_bad = 0;
+__global__ void ring_check_k(const Plan * __restrict__ a, const unsigned char * __restrict__ xa, int xbytes, int ready) {
+    __shared__ int bad;
+    const Plan & b = g_chk_plan;
+    if (threadIdx.x == 0) bad = 0;
+    __syncthreads();
+    int mine = 0;
+    if (ready & 1) {
+        if (threadIdx.x == 0 && a->count != b.count) mine = 1;
+        for (int i = threadIdx.x; i < a->count && i < kMaxCols; i += blockDim.x) {
+            const Own & o = a->own[i];
+            int         j = 0;
+            while (j < b.count && b.own[j].ch != o.ch) ++j;
+            if (j == b.count || b.own[j].ne != o.ne) { mine = 1; continue; }
+            for (int c = 0; c < o.ne; ++c) mine |= o.cs[c] != b.own[j].cs[c];
+        }
+    }
+    if (ready & 2) for (int i = threadIdx.x; i < xbytes; i += blockDim.x) mine |= xa[i] != g_chk_xq[i];
+    if (mine) atomicOr(&bad, 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned n  = atomicAdd(&g_chk_n, 1u) + 1;
+        unsigned       nb = g_chk_bad;
+        if (bad) {
+            nb = atomicAdd(&g_chk_bad, 1u) + 1;
+            if (nb <= 8) printf("[ring-check] MISMATCH #%u at check %u (ready %d, plan count %d vs %d)\n", nb, n, ready, a->count, b.count);
+        }
+        if (n % 2048 == 0) printf("[ring-check] %u checks, %u mismatched (ready %d)\n", n, nb, ready);
+    }
+}
+__global__ void plan_chk_k(const int32_t * ids, int ids_stride, int k, int n, int lo, int hi) {
+    __shared__ int sid[kMaxCols];
+    __shared__ int cnt;
+    q4xplan::plan_build(ids, ids_stride, k, n, lo, hi, &g_chk_plan, sid, cnt);
+}
+static void ring_check(cudaStream_t st, int ready, const float * x, int64_t x_stride, const void * xq, const int32_t * ids,
+                       int ids_stride, int k, int n, int lo, int hi, const Plan * plan, int64_t K, int64_t T) {
+    static const bool on = getenv("AI_Q4X_RING_CHECK") && atoi(getenv("AI_Q4X_RING_CHECK")) != 0;
+    if (!on) return;
+    static void * sx = nullptr;
+    if (!sx && cudaGetSymbolAddress(&sx, g_chk_xq) != cudaSuccess) { (void) cudaGetLastError(); sx = nullptr; }
+    const int xbytes = (int) ((K / QK8_1) * (int64_t) sizeof(block_q8_1) * T);
+    if (!sx || xbytes > kChkXqBytes) {
+        static bool said = false;
+        if (!said) { said = true; fprintf(stderr, "[ring-check] SKIPPED (shadow %p, %d bytes)\n", sx, xbytes); }
+        return;
+    }
+    static bool said_on = false;
+    if (!said_on) { said_on = true; fprintf(stderr, "[ring-check] ON (ready %d)\n", ready); }
+    if (ready & 1) plan_chk_k<<<1, (kMaxCols + 31) / 32 * 32, 0, st>>>(ids, ids_stride, k, n, lo, hi);
+    if (ready & 2) quantize_row_q8_1_cuda(x, nullptr, (char *) sx, GGML_TYPE_Q8_0, K, x_stride, x_stride * T, x_stride * T, K, T, 1, 1, st);
+    ring_check_k<<<1, 256, 0, st>>>(plan, (const unsigned char *) xq, xbytes, ready);
+}
+
 size_t q4x_experts_scratch_bytes(int64_t K, int64_t F, int k, int64_t T) {
     const size_t xq = (size_t) (K / QK8_1) * sizeof(block_q8_1) * T, act = (size_t) F * k * T * sizeof(float);
     const size_t aq = (size_t) (F / QK8_1) * sizeof(block_q8_1) * k * T;
@@ -1580,7 +1625,7 @@ static bool experts_impl(void * stream, int ty_gu, const void * up, const void *
                          int64_t expert_bytes_gu, int ty_down, const void * down, int64_t row_bytes_down,
                          int64_t expert_bytes_down, const float * x, int64_t x_stride, const int32_t * ids,
                          int64_t ids_stride, int32_t id_lo, int32_t id_hi, bool force_smem, int64_t K, int64_t F,
-                         int64_t N, int k, int64_t T, void * scratch, float * out) {
+                         int64_t N, int k, int64_t T, void * scratch, float * out, int ready = 0) {
     const int filler0 = id_hi;
     if (!q4x_experts_ok(ty_gu, ty_down, K, F, N, k, T)) return false;
     const size_t bg = bsize(ty_gu), bd = bsize(ty_down);
@@ -1600,8 +1645,10 @@ static bool experts_impl(void * stream, int ty_gu, const void * up, const void *
     const size_t aq_b = (size_t) (F / QK8_1) * sizeof(block_q8_1) * k * T;
     auto *       plan = (Plan *) ((char *) aq + (aq_b + 255) / 256 * 256);
     const int    n    = (int) (k * T);
-    plan_k<<<1, (kMaxCols + 31) / 32 * 32, 0, st>>>(ids, (int) ids_stride, k, n, id_lo, id_hi, plan);
-    quantize_row_q8_1_cuda(x, nullptr, xq, GGML_TYPE_Q8_0, K, x_stride, x_stride * T, x_stride * T, K, T, 1, 1, st);
+    // [AI_Q4X_ROUTE_RING] ready: the fused route + ring kernel already built the plan (bit 1) / x's q8_1 copy (bit 2)
+    if (!(ready & 1)) plan_k<<<1, (kMaxCols + 31) / 32 * 32, 0, st>>>(ids, (int) ids_stride, k, n, id_lo, id_hi, plan);
+    if (!(ready & 2)) quantize_row_q8_1_cuda(x, nullptr, xq, GGML_TYPE_Q8_0, K, x_stride, x_stride * T, x_stride * T, K, T, 1, 1, st);
+    if (ready) ring_check(st, ready, x, x_stride, xq, ids, (int) ids_stride, k, n, id_lo, id_hi, plan, K, T);
     const int srg = (int) (row_bytes_gu / bg), scg = (int) (expert_bytes_gu / bg);
     const int srd = (int) (row_bytes_down / bd), scd = (int) (expert_bytes_down / bd), ist = (int) ids_stride;
     const int t = (int) T, Ki = (int) K, Fi = (int) F, Ni = (int) N;
@@ -1643,9 +1690,18 @@ static bool experts_impl(void * stream, int ty_gu, const void * up, const void *
 bool q4x_experts(void * stream, int ty_gu, const void * up, const void * gate, int64_t row_bytes_gu,
                  int64_t expert_bytes_gu, int ty_down, const void * down, int64_t row_bytes_down,
                  int64_t expert_bytes_down, const float * x, int64_t x_stride, const int32_t * ids, int64_t ids_stride,
-                 int filler0, int64_t K, int64_t F, int64_t N, int k, int64_t T, void * scratch, float * out) {
+                 int filler0, int64_t K, int64_t F, int64_t N, int k, int64_t T, void * scratch, float * out,
+                 int ready) {
     return experts_impl(stream, ty_gu, up, gate, row_bytes_gu, expert_bytes_gu, ty_down, down, row_bytes_down,
-                        expert_bytes_down, x, x_stride, ids, ids_stride, 0, filler0, false, K, F, N, k, T, scratch, out);
+                        expert_bytes_down, x, x_stride, ids, ids_stride, 0, filler0, false, K, F, N, k, T, scratch, out,
+                        ready);
+}
+
+// where experts_impl keeps its Plan inside the scratch (the same arithmetic as its layout)
+size_t q4x_experts_plan_offset(int64_t K, int64_t F, int k, int64_t T) {
+    const size_t xq_b = (size_t) (K / QK8_1) * sizeof(block_q8_1) * T, act_b = (size_t) F * k * T * sizeof(float);
+    const size_t aq_b = (size_t) (F / QK8_1) * sizeof(block_q8_1) * k * T;
+    return (xq_b + 255) / 256 * 256 + (act_b + 255) / 256 * 256 + (aq_b + 255) / 256 * 256;
 }
 
 bool q4x_experts_range(void * stream, int ty_gu, const void * up, const void * gate, int64_t row_bytes_gu,

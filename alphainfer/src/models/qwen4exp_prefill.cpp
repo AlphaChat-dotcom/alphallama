@@ -912,12 +912,12 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
     // AI_Q4X_PF_NOCOPY=1 (profiling only, wrong output): assign scratch slots but skip the expert copies, which
     // exposes the prefill's compute + host-sync floor without the PCIe stream
     static const bool pf_nocopy = getenv("AI_Q4X_PF_NOCOPY") && atoi(getenv("AI_Q4X_PF_NOCOPY")) != 0;
-    // [AI_Q4X_PF_COPY_OVERLAP=1, default 0 until measured] the staged walk's expert copies on a stream of their own: the
+    // [AI_Q4X_PF_COPY_OVERLAP, default 1 since 2026-11-02 (same windows as ROUTE_RING); =0 off] the staged walk's expert copies on a stream of their own: the
     // resident pass and the shared expert run while they land, and only the scratch pass waits for them. Serial on the
     // compute stream they were 0.36 s of a 1.85 s 2K-token prefill with the GPU idle (3090 nsys, R w_engine, 10-31).
     // The copy stream first waits for the compute stream (the new layer's scratch zeroing above; the route sync left
     // everything before it complete, so no earlier kernel still reads the scratch).
-    static const bool ovl = getenv("AI_Q4X_PF_COPY_OVERLAP") && atoi(getenv("AI_Q4X_PF_COPY_OVERLAP")) != 0;
+    static const bool ovl = !getenv("AI_Q4X_PF_COPY_OVERLAP") || atoi(getenv("AI_Q4X_PF_COPY_OVERLAP")) != 0;   // default on since 2026-11-02
     void * cst = st;
     if (ovl && !pf_stream_now_) {
         if (!pf_ostream_) {

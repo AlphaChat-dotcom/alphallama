@@ -17,6 +17,11 @@ void * backend_stream(ggml_backend * backend);
 void   backend_set_stream_no(ggml_backend * backend, int n);
 void * backend_stream_no(ggml_backend * backend, int n);
 
+// up to 8 contiguous f32 spans copied in ONE launch (src[i] -> dst[i], n[i] floats): the verify records' D2D copies
+// (keep_record: 4 per GDN layer, each its own ggml copy node on the main stream) as one kernel. Plain copies: bit-identical.
+struct CopySpans { const float * src[8]; float * dst[8]; long long n[8]; int count; };
+void copy_spans(void * stream, const CopySpans & s);
+
 // Stream capture of a whole round: begin -> launches -> end (instantiates) -> launch many times.
 struct Capture {
     void * graph = nullptr;
@@ -183,7 +188,9 @@ bool q4x_route(void * stream, const void * w, bool w_is_bf16, const float * x, i
 bool q4x_route_ring(void * stream, const void * w, bool w_is_bf16, const float * x, int K, int E, int T, int k,
                     float * logits, int32_t * sel, float * weights, const int32_t * table, int32_t filler0,
                     int32_t * slots, int32_t * miss_bell, float * x_bell, int32_t * n_tok_bell, unsigned * seq_bell,
-                    const unsigned * base, int layer, float * w_bell);
+                    const unsigned * base, int layer, float * w_bell, void * plan = nullptr, void * xq = nullptr);
+                    // plan: q4x_experts' Plan (scratch + q4x_experts_plan_offset), built by the last block -> ready bit 1;
+                    // xq: its q8_1 copy of x (scratch + 0), written by every block -> ready bit 2 (q4x_experts' `ready`)
 // [P4] fused MoE weighted sum: out f32 [N, T] = sum_j w[j, t] * exps[:, j, t] + shared[:, t], ggml's exact op order
 // [P6 prefill] out[:, c] = use_a[c] ? a[:, c] : b[:, c] over f32 [N, cols] (offload.cu)
 void select_cols(void * stream, const float * a, const float * b, const int32_t * use_a, float * out, int64_t N,
@@ -207,9 +214,13 @@ size_t q4x_experts_scratch_bytes(int64_t K, int64_t F, int k, int64_t T);
 bool   q4x_experts(void * stream, int ty_gu, const void * up, const void * gate, int64_t row_bytes_gu,
                    int64_t expert_bytes_gu, int ty_down, const void * down, int64_t row_bytes_down,
                    int64_t expert_bytes_down, const float * x, int64_t x_stride, const int32_t * ids, int64_t ids_stride,
-                   int filler0, int64_t K, int64_t F, int64_t N, int k, int64_t T, void * scratch, float * out);
-// q4x_experts_compare (AI_Q4X_GROUPED=2): count bitwise differences between two [N, k, T] expert outputs over the non-missed columns
-// q4x_experts_wide: the grouped experts over wide prefill windows (T <= q4x_experts_wide_cols()) with a host-built owner plan:
+                   int filler0, int64_t K, int64_t F, int64_t N, int k, int64_t T, void * scratch, float * out,
+                   int ready = 0);   // bit 1: the Plan is in scratch already; bit 2: so is x's q8_1 copy
+// [AI_Q4X_ROUTE_RING] the byte offset of q4x_experts' Plan in its scratch (the fused ring kernel's last block builds it
+// there for the resident slots [0, filler0); q4x_experts then skips plan_k with plan_ready = true)
+size_t q4x_experts_plan_offset(int64_t K, int64_t F, int k, int64_t T);
+// AI_Q4X_GROUPED=2: count bitwise differences between two [N, k, T] expert outputs over the non-missed columns
+// [P6 prefill] the grouped experts over WIDE windows (T <= q4x_experts_wide_cols()) with a HOST-built owner plan:
 // n_own records of q4x_experts_wide_rec() ints, [slot, ncols, cols...] (column = t * k + j). Writes only owned columns.
 // q4x_gemv16: small BF16/F16 projection of T <= 16 rows with the router's GEMV (q4x_route.cu): out[t * N + n] = W[n] . x[t];
 // K % 512 == 0, K <= 4096, 16-byte aligned w and x. Returns false (nothing launched) otherwise.
@@ -511,5 +522,7 @@ void    q4x_qsa_inputs(void * stream, const int32_t * pos, int64_t T, int64_t n_
 // the QSA pooled cache's dirty blocks of a round (kernels/q4x_qsa.cu): dcells i32 [r * M], drows i64 [M], dpos i32 [4 * M]
 void    q4x_qsa_dirty(void * stream, const int32_t * pos, int64_t T, int64_t r, int64_t M, int64_t rows, int32_t * dcells,
                       int64_t * drows, int32_t * dpos);
+// [AI_Q4X_QSA_ALLCELLS] out i32 [n, T]: out[t * n + j] = j (every cell, in index order, for each of the T rows)
+void    q4x_qsa_iota(void * stream, int64_t n, int64_t T, int32_t * out);
 
 }  // namespace ai::kern

@@ -92,8 +92,9 @@ public:
 
 private:
     void   ple_rows(int64_t pos0, int64_t T, float * out) const;   // host: [N, T] f32
-    // AI_Q4X_PLE_IO: the round's PLE row reads, de-duplicated; page-cache hits are read inline, the rest queued with
-    // WILLNEED readahead at once, then read inline (decode) or by blocking reader threads too (prefill)
+    void   ple_warm();   // AI_Q4X_PLE_WARM: read the PLE table into the page cache after the load's cache drop
+    // [AI_Q4X_PLE_IO] the round's PLE row reads: de-duplicated, page-cache hits read inline, the rest queued with
+    // WILLNEED readahead at once, then read inline (decode) or by blocking reader threads too (prefill) -- PleIo
     struct PleIo;
     mutable std::unique_ptr<PleIo> ple_io_;
     Tensor round(const int32_t * tokens, int64_t T, bool early = false);                // captured T <= 8 row round (decode / verify)
@@ -119,7 +120,8 @@ private:
     bool    mtp_mapped() const;
     Tensor  mtp_build(const Tensor & H, const Tensor & ids_t, const Tensor & pos4_t, const Tensor & cells_t,
                       const Tensor & mask_t, int64_t T, int64_t n_kv, bool full);
-    void    mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch = true);   // [AI_Q4X_MTP_CAPTURE]
+    void    mtp_chain(int32_t pending, int n, int32_t * toks, float * probs, bool fetch = true,
+                      int off = 0);   // [AI_Q4X_MTP_CAPTURE]; off > 0: continue a chain after its first off steps
     static constexpr int kMtpChain = 8;
     RoundCache<int64_t, Tensor> mtp_rounds_;   // captured fill + draft chains, keyed by (F, fill rows, n, mapped)
     Tensor  mc_ids_, mc_pos4_, mc_cells_, mc_mask_, mc_tok_, mc_p_;
@@ -135,6 +137,9 @@ private:
     Tensor               draft_map_dev_;    // draft_map_ on the device (the captured chain maps on the device)
     std::vector<int32_t> draft_map_;        // compact row -> token id
     int64_t              draft_prefix_ = 0, draft_head_cap_ = 0;
+    std::vector<uint8_t> draft_host_;       // [AI_Q4X_DRAFT_HEAD_TYPE] the whole output head requantised, on the host
+    int                  draft_host_type_ = -1;
+    char *               mc_pin_ = nullptr;   // [AI_Q4X_MTP_ASYNC_UP] pinned mirror of the chain's ingress buffer
 
     bool                       rec_ = false;     // forward() in record mode (verify)
     int64_t                    rec_pos0_ = -1, rec_T_ = 0;
