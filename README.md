@@ -1,10 +1,34 @@
 # AlphaLlama
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/AlphaChat-dotcom/alphallama)](https://github.com/AlphaChat-dotcom/alphallama/releases/latest)
+[![InferArena](https://img.shields.io/badge/benchmarks-InferArena-orange)](https://alphachat.com/inferarena)
 
-AlphaLlama is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running large language models on
-consumer GPUs, with a focus on Mixture-of-Experts (MoE) models that do not fit in VRAM.
+**Run large Mixture-of-Experts models on the GPU you already have.** AlphaLlama serves models several times larger
+than your VRAM at interactive speed: the hot experts stay on the GPU, the rest stream from system RAM and disk or
+run on the CPU in parallel.
 
+- **Faster than Strata 0.2.8 on Qwen3.8-Flash-Next** on an RTX 4080 16 GB, RTX 3090 24 GB and RTX 5090 32 GB:
+  same model file, same prompts, same session ([measured on InferArena](https://alphachat.com/inferarena)).
+- **One command:** `alphallama-serve -m model.gguf` measures your machine and picks the configuration measured
+  best for your GPU class, behind an OpenAI-compatible API.
+- **Exact when you need it:** on validated models the multi-token-prediction output is identical to plain decoding.
+
+## Get it
+
+Download a package from the [latest release](https://github.com/AlphaChat-dotcom/alphallama/releases/latest):
+Linux (NVIDIA, includes the fastest AlphaInfer engine), Windows (CUDA 12 / 13, Vulkan, CPU, ARM64) or
+macOS (Apple Silicon, Intel). Then:
+
+```sh
+alphallama-serve -m model.gguf --port 8080
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+## What's inside
+
+AlphaLlama is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp).
 It keeps the llama.cpp model format (GGUF), tools and C API, and adds:
 
 - **Expert offload for MoE models.** VRAM, pinned system RAM and the model file on disk act as one expert store.
