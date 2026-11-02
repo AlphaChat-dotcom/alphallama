@@ -913,7 +913,8 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
         }
     }
 
-    // [AI_Q4X_QSA_ALLCELLS, default 1 since 2026-11-02 (NLL-gated); =0 off] the indexer keeps the top width = min(n_kv, top_k + r - 1) cells,
+    // [AI_Q4X_QSA_ALLCELLS, default 0; =1 on: not bit-identical, it can flip a near-tie token (a verbatim quote lost its
+    // "**" and its copy drafts, 8.5% slower on that prompt) though NLL is neutral] the indexer keeps the top width = min(n_kv, top_k + r - 1) cells,
     // so while n_kv <= top_k + r - 1 (every round below ~2K cells) it keeps EVERY cell whatever the scores: skip its q
     // projection, scoring and top-k (~29 us per attention layer on the 5090, nsys) and give the sparse FA the
     // cells in index order. The indexer's key write and pooled-cache upkeep stay (later rounds need them). Same cell set;
@@ -921,7 +922,7 @@ Tensor attn_qsa_block(Device & d, const Tensor & x, const AttnWeights & w, const
     // MEASURED (5090): paired NLL prompt rows 2.4770 -> 2.4732, generated 0.1474 -> 0.1476, KL vs base <= 0.04;
     // serve verify -0.20..-0.31 ms/round: full run with ZSIDE / REC_SPANS / ATTN_SIDE: Short chat 1.032, Write new
     // code 1.013 vs Strata 0.2.8. The path depends only on n_kv (the round envelope), so MTP == plain holds per build.
-    static const bool allc_env = !getenv("AI_Q4X_QSA_ALLCELLS") || atoi(getenv("AI_Q4X_QSA_ALLCELLS")) != 0;
+    static const bool allc_env = getenv("AI_Q4X_QSA_ALLCELLS") && atoi(getenv("AI_Q4X_QSA_ALLCELLS")) != 0;
     const bool        allc     = allc_env && r > 0 && use_sparse && D == 256 && Hq == 12 * Hkv &&
                                  n_kv <= (int64_t) qp.top_k + r - 1;
     Tensor            iota;
