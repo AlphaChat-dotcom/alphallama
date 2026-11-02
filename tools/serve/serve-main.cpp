@@ -1549,7 +1549,29 @@ int main(int argc, char ** argv) {
     }
 
     // Initialize backend
-    const char * model_name = "alphallama";
+    // The model id in /v1/models and in every response: ALPHA_MODEL_ID if set, else the model file's name without its
+    // directory, ".gguf" and a "-00001-of-00002" shard suffix (agents pick their prompt format from the id).
+    std::string model_id = "alphallama";
+    if (const char * e = getenv("ALPHA_MODEL_ID")) {
+        if (*e) model_id = e;
+    } else if (model_path && *model_path) {
+        std::string s = model_path;
+        while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+        const size_t sl = s.find_last_of("/\\");
+        if (sl != std::string::npos) s = s.substr(sl + 1);
+        if (s.size() > 5 && s.compare(s.size() - 5, 5, ".gguf") == 0) s.resize(s.size() - 5);
+        // "-NNNNN-of-NNNNN" (15 characters) from a split model
+        if (s.size() > 15 && s[s.size() - 15] == '-' && s.compare(s.size() - 9, 4, "-of-") == 0) {
+            bool digits = true;
+            for (size_t i = s.size() - 14; i < s.size(); ++i) {
+                if (i >= s.size() - 9 && i < s.size() - 5) continue;
+                digits = digits && isdigit((unsigned char) s[i]);
+            }
+            if (digits) s.resize(s.size() - 15);
+        }
+        if (!s.empty()) model_id = s;
+    }
+    const char * model_name = model_id.c_str();
     common_chat_templates_ptr chat_tmpls;  // initialized after model load
 
     // Local backend state (only used if --backend local)

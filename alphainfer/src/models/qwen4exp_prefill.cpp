@@ -593,7 +593,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                                    B.n_slots, pf_spare_P_, ncap, (int32_t *) pr.data, cr, (int32_t *) pp.data, cp,
                                    (int32_t *) ps.data, cs, pf_dplan_ovf_)) {
                 fprintf(stderr, "[q4x-prefill] device plan declined (slots > 1024)%c", 10);
-                abort();
+                throw std::runtime_error("q4x prefill: device plan declined (slots > 1024)");
             }
         };
         plan_range(0, k * Tb, tgr, ngr, tgp, ngp, tgs, ngs);
@@ -742,7 +742,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                                            pass == 0 ? pgr : pass == 1 ? pgs : pgp, pass == 0 ? ngr : pass == 1 ? ngs : ngp,
                                            K, F, N, k, Tb, psc)) {
                 fprintf(stderr, "[q4x-prefill] big-batch gate/up declined a shape%c", 10);
-                abort();
+                throw std::runtime_error("q4x prefill: big-batch gate/up declined a shape");
             }
         }
         kern::q4x_experts_wide_qact(stv, K, F, k, Tb, psc);
@@ -762,7 +762,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                                                pass == 0 ? pdr : pass == 1 ? pds : pdp, pass == 0 ? ndr_q : pass == 1 ? nds_q : ndp_q,
                                                K, F, N, k, Tb, psc, pex, col_lo)) {
                     fprintf(stderr, "[q4x-prefill] big-batch down declined a shape%c", 10);
-                    abort();
+                    throw std::runtime_error("q4x prefill: big-batch down declined a shape");
                 }
             }
         });
@@ -1078,7 +1078,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
             if (!kern::q4x_experts_wide(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd, px, K,
                                         pass == 0 ? ppr : pps, pass == 0 ? nr : ns, K, F, N, k, T, psc, pe)) {
                 fprintf(stderr, "[q4x-prefill] wide grouped kernel declined a shape\n");
-                abort();
+                throw std::runtime_error("q4x prefill: wide grouped kernel declined a shape");
             }
         });
     };
@@ -1403,9 +1403,40 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                                                                 (int64_t) Bl.up.nb[2], (int) Bl.down.type, Bl.down.data,
                                                                 (int64_t) Bl.down.nb[1], (int64_t) Bl.down.nb[2], s.n_embd,
                                                                 Bl.up.ne[1], Bl.down.ne[1], std::min(moe_big, SC));
+            // the narrow path over rows [a, b): per moe_rows slice, HC read -> moe_prefill -> scatter (same text as the
+            // big path, md5-checked when PF_MOE_BIG went in)
+            auto narrow_rows = [&](int64_t a, int64_t b) {
+                for (int64_t m0 = a; m0 < b; m0 += moe_rows) {
+                    Device::Scope sc(dev_);
+                    const int64_t c = m0 / sub, Tm = std::min(moe_rows, b - m0);
+                    const Tensor Rb = R_all.view(s.n_embd, s.hc, Tm, 1, (size_t) s.n_embd * 4, (size_t) HW * 4,
+                                                 (size_t) HW * 4 * Tm, (size_t) (HW * m0) * 4);
+                    Tensor R = Rb;
+                    op::q4x::HcRead f = op::q4x::hc_read(dev_, R, L.hc_ffn, s.rms_eps);
+                    chk("hc_read(ffn) mixed", il, c, f.mixed);
+                    pc.lap(g_pf.mixer);
+                    Tensor y = moe_prefill(il, f.mixed);
+                    pc.t = std::chrono::steady_clock::now();
+                    chk("moe out", il, c, y);
+                    op::q4x::hc_scatter_into(dev_, Rb, y, f.inject);
+                    chk("hc_scatter(ffn)", il, c, Rb);
+                    pc.lap(g_pf.tail);
+                }
+            };
             for (int64_t m0 = 0; big_ok && m0 < SC; m0 += moe_big) {
-                Device::Scope sc(dev_);
                 const int64_t Tb = std::min(moe_big, SC - m0);
+                // [crash fix] big_ok above tested T = min(moe_big, SC), but a super-chunk's LAST batch can be
+                // 1..8 rows (12294 = 3 x 4096 + 6, 24582 = 6 x 4096 + 6 tokens), which the wide split path declines (T < 9):
+                // the prefill then aborted the whole server. Test
+                // the ACTUAL batch with the kernel's own predicate; a batch it refuses takes the narrow path.
+                if (!kern::q4x_experts_wide_split_ok((int) Bl.up.type, Bl.up.data, Bl.gate.data, (int64_t) Bl.up.nb[1],
+                                                     (int64_t) Bl.up.nb[2], (int) Bl.down.type, Bl.down.data,
+                                                     (int64_t) Bl.down.nb[1], (int64_t) Bl.down.nb[2], s.n_embd, Bl.up.ne[1],
+                                                     Bl.down.ne[1], Tb)) {
+                    narrow_rows(m0, m0 + Tb);
+                    continue;
+                }
+                Device::Scope sc(dev_);
                 Tensor fm  = dev_.ws_alloc(F32, s.n_embd, Tb);
                 Tensor ijb = dev_.ws_alloc(F32, s.hc, Tb);
                 auto col = [](const Tensor & t, int64_t s0, int64_t Ts) {
@@ -1433,22 +1464,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
                 }
                 pc.lap(g_pf.tail);
             }
-            for (int64_t m0 = 0; !big_ok && m0 < SC; m0 += moe_rows) {
-                Device::Scope sc(dev_);
-                const int64_t c = m0 / sub, Tm = std::min(moe_rows, SC - m0);
-                const Tensor Rb = R_all.view(s.n_embd, s.hc, Tm, 1, (size_t) s.n_embd * 4, (size_t) HW * 4, (size_t) HW * 4 * Tm,
-                                             (size_t) (HW * m0) * 4);
-                Tensor R = Rb;
-                op::q4x::HcRead f = op::q4x::hc_read(dev_, R, L.hc_ffn, s.rms_eps);
-                chk("hc_read(ffn) mixed", il, c, f.mixed);
-                pc.lap(g_pf.mixer);
-                Tensor y = moe_prefill(il, f.mixed);
-                pc.t = std::chrono::steady_clock::now();
-                chk("moe out", il, c, y);
-                op::q4x::hc_scatter_into(dev_, Rb, y, f.inject);
-                chk("hc_scatter(ffn)", il, c, Rb);
-                pc.lap(g_pf.tail);
-            }
+            if (!big_ok) narrow_rows(0, SC);
             hash_R("moe", il);
         }
         pc.t = std::chrono::steady_clock::now();
@@ -1515,7 +1531,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
     if (pf_dplan_ovf_) {   // [AI_Q4X_PF_DEVPLAN] a bank needed more records than its cap: the output is not trustworthy
         int ovf = 0;
         cudaMemcpy(&ovf, pf_dplan_ovf_, 4, cudaMemcpyDeviceToHost);
-        if (ovf) { fprintf(stderr, "[q4x-prefill] FATAL: device plan overflow (a bank's records exceeded its cap)%c", 10); abort(); }
+        if (ovf) { fprintf(stderr, "[q4x-prefill] device plan overflow (a bank's records exceeded its cap)%c", 10); throw std::runtime_error("q4x prefill: device plan overflow"); }
     }
     static bool said = false;
     if (!said) {
