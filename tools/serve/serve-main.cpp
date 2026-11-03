@@ -489,6 +489,16 @@ static std::string make_sse_reasoning_chunk(int request_id, const std::string & 
     return "data: " + delta.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }
 
+// Thinking goes to reasoning_content (deepseek-style extraction, as llama-server does); ALPHA_REASONING_FORMAT=none
+// keeps it inline in content.
+static common_reasoning_format alpha_reasoning_format() {
+    static const common_reasoning_format f = [] {
+        const char * e = getenv("ALPHA_REASONING_FORMAT");
+        return (e && strcmp(e, "none") == 0) ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_DEEPSEEK;
+    }();
+    return f;
+}
+
 // Parse the model's native chat output into an OpenAI assistant message (content, reasoning_content, tool_calls)
 // with the common_chat parser of the request's template. The streaming and the non-streaming paths both use it, so a
 // reply comes back the same way either way. Malformed output degrades to plain content, never an error.
@@ -498,6 +508,7 @@ static void parse_chat_reply(const common_chat_params & cchat, const std::string
     finish_reason = "stop";
     common_chat_parser_params pp(cchat);   // format + generation_prompt from the template
     pp.parse_tool_calls = true;
+    pp.reasoning_format = alpha_reasoning_format();
     if (!cchat.parser.empty()) pp.parser.load(cchat.parser);   // the PEG parser spec
     common_chat_msg parsed;
     bool ok = true;
@@ -992,6 +1003,66 @@ static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_p
 // the draft head from <model dir>/MTP/ (fast verify: output is not token-identical to plain greedy;
 // ALPHA_AI_MTP_K=0 serves plain decode), and a routing profile (dre-profile*.bin beside the model or in MTP/) that
 // seeds the expert pool. Every setting is a default: an explicit env or flag wins.
+// Sampling for a request that sends no temperature on the AlphaInfer backend. It used to be greedy (the engine was
+// greedy-only), and greedy decoding traps thinking models in repetition loops on long agent turns: a sentence repeated
+// 30+ times inside the thinking until the token limit. An engine that samples now takes the model's own recommendation
+// from the GGUF (general.sampling.temp / top_k / top_p / min_p, written by the converter from the model card), else
+// temperature 0.7 / top_k 40 / top_p 0.95 / min_p 0, the defaults of the other backends. Each field the request sends
+// wins over its default; ALPHA_DEFAULT_TEMP / _TOP_K / _TOP_P / _MIN_P override the defaults (ALPHA_DEFAULT_TEMP=0 =
+// greedy as before).
+struct alpha_default_sampling { float temp = 0.7f; int top_k = 40; float top_p = 0.95f; float min_p = 0.0f; std::string source = "built-in"; };
+static alpha_default_sampling g_default_sampling;
+
+static void alpha_load_default_sampling(const char * model_path) {
+    alpha_default_sampling & d = g_default_sampling;
+    struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * gc = model_path ? gguf_init_from_file(model_path, gp) : nullptr;
+    if (gc) {
+        auto num = [&](const char * key, double & out) {
+            const int64_t k = gguf_find_key(gc, key);
+            if (k < 0) return false;
+            switch (gguf_get_kv_type(gc, k)) {
+                case GGUF_TYPE_FLOAT32: out = gguf_get_val_f32(gc, k); return true;
+                case GGUF_TYPE_FLOAT64: out = gguf_get_val_f64(gc, k); return true;
+                case GGUF_TYPE_INT32:   out = gguf_get_val_i32(gc, k); return true;
+                case GGUF_TYPE_UINT32:  out = gguf_get_val_u32(gc, k); return true;
+                default: return false;
+            }
+        };
+        double v; bool any = false;
+        if (num("general.sampling.temp",  v)) { d.temp  = (float) v; any = true; }
+        if (num("general.sampling.top_k", v)) { d.top_k = (int)   v; any = true; }
+        if (num("general.sampling.top_p", v)) { d.top_p = (float) v; any = true; }
+        if (num("general.sampling.min_p", v)) { d.min_p = (float) v; any = true; }
+        if (any) d.source = "model file";
+        gguf_free(gc);
+    }
+    bool env = false;
+    if (const char * e = getenv("ALPHA_DEFAULT_TEMP"))  { d.temp  = (float) atof(e); env = true; }
+    if (const char * e = getenv("ALPHA_DEFAULT_TOP_K")) { d.top_k = atoi(e);         env = true; }
+    if (const char * e = getenv("ALPHA_DEFAULT_TOP_P")) { d.top_p = (float) atof(e); env = true; }
+    if (const char * e = getenv("ALPHA_DEFAULT_MIN_P")) { d.min_p = (float) atof(e); env = true; }
+    if (env) d.source += " + ALPHA_DEFAULT_*";
+}
+
+#ifdef ALPHA_HAS_ALPHAINFER
+// AlphaInfer request: no temperature -> the default sampling when the engine samples (each other field the request
+// leaves out takes its default too), greedy when it does not. A request that sends a temperature keeps every field it
+// sent; the fields it leaves out keep the handler's generic values.
+template <typename J>
+static void alpha_apply_default_sampling(const J & body, alphaserve::InferenceRequest & ireq) {
+    auto absent = [&](const char * k) { return !body.contains(k) || body[k].is_null(); };
+    if (!absent("temperature")) return;
+    const bool ai_samples = alphaserve::ai_engine_live() && alphaserve::ai_engine_live()->supports_sampling();
+    const alpha_default_sampling & d = g_default_sampling;
+    if (!ai_samples || !(d.temp > 0.0f)) { ireq.temperature = 0.0f; return; }
+    ireq.temperature = d.temp;
+    if (absent("top_k")) ireq.top_k = d.top_k;
+    if (absent("top_p")) ireq.top_p = d.top_p;
+    if (absent("min_p")) ireq.min_p = d.min_p;
+}
+#endif
+
 static bool alpha_auto_qwen4exp(const char * model_path) {
     const char * ae = getenv("ALPHA_AUTO");
     if ((ae && atoi(ae) == 0) || !model_path) return false;
@@ -2767,6 +2838,13 @@ int main(int argc, char ** argv) {
         model = llama_model_load_from_file(model_path, mp);
         if (!model) { fprintf(stderr, "[serve] failed to load the vocabulary of %s\n", model_path); return 1; }
         vocab = llama_model_get_vocab(model);
+        alpha_load_default_sampling(model_path);
+        {
+            const alpha_default_sampling & d = g_default_sampling;
+            fprintf(stderr, "[serve] default sampling (requests without a temperature): temperature %.2f top_k %d top_p %.2f "
+                            "min_p %.2f, from the %s (greedy if the engine cannot sample)\n",
+                    d.temp, d.top_k, d.top_p, d.min_p, d.source.c_str());
+        }
         // image input on the AlphaInfer path: the projector (mtmd) encodes on our side and the adapter hands the
         // embeddings + M-RoPE positions to ai_engine_prefill_mm. Loaded before the engine so its auto sizing (context,
         // expert slots) sees the projector's VRAM. ALPHA_MMPROJ_CPU=1 encodes on the CPU instead (no VRAM; an image
@@ -3173,6 +3251,10 @@ int main(int argc, char ** argv) {
                     }
                     if (body.contains("think") && body["think"].is_boolean()) enable_thinking = body["think"].get<bool>();
                     inputs.enable_thinking = enable_thinking;
+                    // The parser extracts the thinking into reasoning_content only when it is built with a reasoning
+                    // format: with NONE, a template that opens <think> itself (Qwen3.x, Flash-Next) left the whole
+                    // thinking in content.
+                    inputs.reasoning_format = alpha_reasoning_format();
                     cchat  = common_chat_templates_apply(chat_tmpls.get(), inputs);
                     prompt = cchat.prompt;
                     // tool_choice=required/none returns a parser that assumes a grammar forces the shape, so it
@@ -3274,10 +3356,11 @@ int main(int argc, char ** argv) {
             ireq.min_p = body.value("min_p", 0.0f);
             ireq.seed = body.value("seed", -1);
             #ifdef ALPHA_HAS_ALPHAINFER
-            // AlphaInfer is greedy-only: absent sampling fields mean greedy (not the 0.7 / 40 / 0.95 defaults above), and an
-            // explicit temperature > 0 is a clear 400 up front, never a truncated 200 from a refused batch.
+            // AlphaInfer: absent sampling fields take the model's default sampling when the engine samples (see
+            // alpha_default_sampling), else greedy; an explicit temperature > 0 on a greedy-only engine is a clear 400 up
+            // front, never a truncated 200 from a refused batch.
             if (mode == MODE_ALPHAINFER) {
-                if (!body.contains("temperature") || body["temperature"].is_null()) ireq.temperature = 0.0f;
+                alpha_apply_default_sampling(body, ireq);
                 // A temperature > 0 is served greedy by default (the engine has no sampling yet) and the reply says so in
                 // X-Alpha-Sampling: greedy, rather than failing chat clients that always send one. ALPHA_AI_LENIENT=0 refuses it
                 // with a 400 instead. ALPHA_AI_LENIENT=1 also accepts response_format json_object without enforcement (the
@@ -3389,8 +3472,19 @@ int main(int argc, char ** argv) {
                     }
                     if (trig_words.empty()) trig_hold_all = true;
                 }
+                // The template opened <think> itself (the generation prompt ends with it): the reply starts inside the
+                // thinking, with no opener of its own to classify, so the stream starts in reasoning mode.
+                bool think_opened = false;
+                {
+                    const size_t o = prompt.rfind("<think>");
+                    if (o != std::string::npos && prompt.find("</think>", o) == std::string::npos) {
+                        size_t e = o + 7;
+                        while (e < prompt.size() && isspace((unsigned char) prompt[e])) e++;
+                        think_opened = e == prompt.size() && alpha_reasoning_format() != COMMON_REASONING_FORMAT_NONE;
+                    }
+                }
                 res.set_chunked_content_provider("text/event-stream",
-                    [&, pr, req_id, cchat, req_tools, trig_words, trig_hold_all, n_prompt = n_tok_timing,
+                    [&, pr, req_id, cchat, req_tools, trig_words, trig_hold_all, think_opened, n_prompt = n_tok_timing,
                      usage_in_stream = (body.contains("stream_options") && body["stream_options"].is_object() &&
                                         body["stream_options"].value("include_usage", false))](size_t, httplib::DataSink & sink) -> bool {
                         std::string chunk, utf8_tail;
@@ -3405,6 +3499,7 @@ int main(int argc, char ** argv) {
                         std::string head;
                         bool think_stream = false;  // state 1 on a <think> opener: stream the reasoning
                         size_t think_pos = 0;       // head offset of the first reasoning byte not yet sent
+                        if (think_opened && strip_state == 0) { strip_state = 1; think_stream = true; }
                         bool peer_dead = false;    // sink.write fails once the client is gone
                         std::string sent;          // content already sent (tool mode: not sent again after the parse)
                         auto emit = [&](const std::string & t) {
@@ -3619,10 +3714,11 @@ int main(int argc, char ** argv) {
         ireq.min_p = body.value("min_p", 0.0f);
         ireq.seed = body.value("seed", -1);
         #ifdef ALPHA_HAS_ALPHAINFER
-        // AlphaInfer is greedy-only: absent sampling fields mean greedy (not the 0.7 / 40 / 0.95 defaults above), and an
-        // explicit temperature > 0 is a clear 400 up front, never a truncated 200 from a refused batch.
+        // AlphaInfer: absent sampling fields take the model's default sampling when the engine samples (see
+        // alpha_default_sampling), else greedy; an explicit temperature > 0 on a greedy-only engine is a clear 400 up
+        // front, never a truncated 200 from a refused batch.
         if (mode == MODE_ALPHAINFER) {
-            if (!body.contains("temperature") || body["temperature"].is_null()) ireq.temperature = 0.0f;
+            alpha_apply_default_sampling(body, ireq);
             // A temperature > 0 is served greedy by default (the engine has no sampling yet) and the reply says so in
             // X-Alpha-Sampling: greedy, rather than failing chat clients that always send one. ALPHA_AI_LENIENT=0 refuses it
             // with a 400 instead. ALPHA_AI_LENIENT=1 also accepts response_format json_object without enforcement (the
