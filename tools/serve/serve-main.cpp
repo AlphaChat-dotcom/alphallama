@@ -1382,6 +1382,14 @@ int main(int argc, char ** argv) {
         mode = MODE_ALPHAINFER;
         if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
         if (!ctx_explicit) n_ctx   = 32768;
+        // The engine workspace defaults to 640 MiB, sized for 32K cells: on an RTX 5090 a ~100K-token prompt at
+        // -c 131072 overflowed it ("[ai] FATAL: workspace overflow"), and 1536 MiB served 125K-token prompts. Scale it
+        // with the context above 32K (640 MiB + 10 MiB per 1K cells: 1600 at 131072); an explicit AI_Q4X_WS_MB wins.
+        if (n_ctx > 32768 && !getenv("AI_Q4X_WS_MB")) {
+            const long ws_mb = 640 + (long) ((n_ctx - 32768 + 1023) / 1024) * 10;
+            setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
+            fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
+        }
         setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
         // MTP drafts 3 deep, each draft kept only while its own top-1 probability is >= 0.5 (AI_Q4X_MTP_MINP), on every
         // card. Sets A / V / R vs depth 2: 4080 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1; 3090 +4-6%; 5090 +9 / +7 / +3%.

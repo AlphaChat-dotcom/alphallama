@@ -136,6 +136,12 @@ private:
 
     std::vector<float>    vecs;   // size() * n_embd, row-major, L2-normalized
     std::vector<uint32_t> ids;
+    // True while every id pushed so far strictly exceeded the previous one, which is what
+    // /api/corpus/index produces (chunk_id = row number). When it holds, every id is DISTINCT, so
+    // the per-document "strongest window per chunk" bookkeeping in search_vec has nothing to do
+    // and can be skipped. Sentence-window mode, re-indexing an existing chunk_id, or any
+    // out-of-order id clears it and the map path is used unchanged.
+    bool                  ids_monotonic = true;
 
     // IVF ANN index (optional; built by build_ann when size() >= ANN_MIN).
     std::vector<float>                 centroids;   // ann_nlist * n_embd (L2-normalized samples)

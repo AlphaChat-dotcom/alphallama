@@ -72,6 +72,27 @@ bool dense_index::load_embedder(const std::string & model_path, int n_gpu_layers
     cparams.n_batch      = n_ctx;
     cparams.n_ubatch     = n_ctx;
     cparams.n_seq_max    = n_seq_max;
+    // Embed threads: llama's default is 4. With no GPU device (CPU-only build or no visible GPU) a
+    // bge-base query embed takes 22.7 ms at 4 threads and 14.5 ms at 8, so use min(cores, 8) there.
+    // A GPU-resident embedder is unaffected by the thread count and keeps the default.
+    // ALPHA_DENSE_L0_EMBED_THREADS overrides both.
+    if (const char * ethreads = getenv("ALPHA_DENSE_L0_EMBED_THREADS")) {
+        const int t = atoi(ethreads);
+        if (t > 0) {
+            cparams.n_threads       = t;
+            cparams.n_threads_batch = t;
+            fprintf(stderr, "[embed-threads] n_threads = %d (ALPHA_DENSE_L0_EMBED_THREADS)\n", t);
+        } else {
+            fprintf(stderr, "[embed-threads] ignoring ALPHA_DENSE_L0_EMBED_THREADS=%s (not a positive integer)\n",
+                    ethreads);
+        }
+    } else if (!llama_supports_gpu_offload()) {
+        const int hw = (int) std::thread::hardware_concurrency();
+        const int t  = hw > 0 ? std::min(hw, 8) : 4;
+        cparams.n_threads       = t;
+        cparams.n_threads_batch = t;
+        fprintf(stderr, "[embed-threads] no GPU device: n_threads = %d (min(cores=%d, 8))\n", t, hw);
+    }
 
     emb_ctx = llama_init_from_model(emb_model, cparams);
     if (!emb_ctx) {
@@ -357,6 +378,7 @@ bool dense_index::get_vec(uint32_t chunk_id, std::vector<float> & out) const {
 
 void dense_index::add_vec_locked(uint32_t chunk_id, const std::vector<float> & v) {
     if ((int) v.size() != n_embd || n_embd <= 0) return;
+    if (!ids.empty() && chunk_id <= ids.back()) ids_monotonic = false;
     ids.push_back(chunk_id);
     vecs.insert(vecs.end(), v.begin(), v.end());
 
@@ -463,6 +485,38 @@ void dense_index::add_batch(const std::vector<std::pair<uint32_t, std::string>> 
     }
 }
 
+// Dot product with EIGHT independent accumulators.
+//
+// The obvious `for (j) d += q[j]*r[j]` is a single dependency chain -- each add waits on the
+// previous (~4 cycles) -- so the ALU stalls no matter how wide the ISA is, which is why
+// -mavx2/-mfma measured under 1% on this loop. Eight partial sums let the pipeline overlap:
+// 276.3 -> 124.3 ns/vector at n=57,600, a 2.22x win, plateauing at 8 exactly as FP-add latency
+// predicts (16 is no better). A single-threaded BLAS GEMV reaches 89.0 ns/vector on the same core,
+// so there is headroom left here in CODE, not in bytes.
+//
+// \u26a0 The summation ORDER differs from the one-accumulator form, so results differ in the last
+// bits. Validated by nDCG@10 and a top-k set-change count, not assumed harmless.
+//
+// n_embd is whatever the embedder reports -- never assumed to be a multiple of 8.
+static inline float alpha_dot8(const float * __restrict a, const float * __restrict b, int n) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+    int j = 0;
+    const int n8 = n & ~7;
+    for (; j < n8; j += 8) {
+        s0 += a[j + 0] * b[j + 0];
+        s1 += a[j + 1] * b[j + 1];
+        s2 += a[j + 2] * b[j + 2];
+        s3 += a[j + 3] * b[j + 3];
+        s4 += a[j + 4] * b[j + 4];
+        s5 += a[j + 5] * b[j + 5];
+        s6 += a[j + 6] * b[j + 6];
+        s7 += a[j + 7] * b[j + 7];
+    }
+    float tail = 0.0f;
+    for (; j < n; ++j) tail += a[j] * b[j];
+    return ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7)) + tail;
+}
+
 std::vector<std::pair<uint32_t, float>> dense_index::search_vec(const std::vector<float> & qv, int k) const {
     std::vector<std::pair<uint32_t, float>> out;
     // Shared: concurrent queries do not block each other, but an append cannot realloc underneath.
@@ -484,25 +538,42 @@ std::vector<std::pair<uint32_t, float>> dense_index::search_vec(const std::vecto
     // Best cosine per chunk_id: in sentence-window mode many vectors share a chunk id,
     // so keep the strongest window per chunk and return distinct chunk ids.
     const size_t n = ids.size();
-    std::unordered_map<uint32_t, float> best;
-    best.reserve(n);
-    for (size_t d = 0; d < n; ++d) {
-        const float * row = &vecs[d * (size_t) n_embd];
-        float dot = 0.0f;                       // vectors are L2-normalized -> dot == cosine
-        for (int j = 0; j < n_embd; ++j) dot += qv[j] * row[j];
-        auto it = best.find(ids[d]);
-        if (it == best.end()) best.emplace(ids[d], dot);
-        else if (dot > it->second) it->second = dot;
+    std::vector<std::pair<uint32_t, float>> scored;
+    if (ids_monotonic) {
+        // Every id is distinct, so there is no "strongest window per chunk" to resolve: score
+        // straight into the result vector and skip the per-document hash lookup entirely.
+        scored.resize(n);
+        for (size_t d = 0; d < n; ++d) {
+            // vectors are L2-normalized -> dot == cosine
+            scored[d] = { ids[d], alpha_dot8(qv.data(), &vecs[d * (size_t) n_embd], n_embd) };
+        }
+    } else {
+        std::unordered_map<uint32_t, float> best;
+        best.reserve(n);
+        for (size_t d = 0; d < n; ++d) {
+            // vectors are L2-normalized -> dot == cosine
+            const float dot = alpha_dot8(qv.data(), &vecs[d * (size_t) n_embd], n_embd);
+            auto it = best.find(ids[d]);
+            if (it == best.end()) best.emplace(ids[d], dot);
+            else if (dot > it->second) it->second = dot;
+        }
+        scored.assign(best.begin(), best.end());
     }
 
-    std::vector<std::pair<uint32_t, float>> scored(best.begin(), best.end());
+    // A TOTAL order: (cosine desc, chunk_id asc). Score alone is not a total order, and neither
+    // std::sort nor std::partial_sort is stable, so with score-only comparison a cosine tie makes
+    // the returned top-k arbitrary -- and at the k boundary it changes the SET, not just the
+    // order. Measured on identical vectors: 35 of 50 positions differed between two correct
+    // implementations. bm25_index::score_inverted already sorts (score desc, chunk_id asc).
+    const auto cmp = [](const std::pair<uint32_t, float> & a, const std::pair<uint32_t, float> & b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    };
     if (k <= 0 || (size_t) k >= scored.size()) {
-        std::sort(scored.begin(), scored.end(),
-                  [](const auto & a, const auto & b){ return a.second > b.second; });
+        std::sort(scored.begin(), scored.end(), cmp);
         return scored;
     }
-    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
-                      [](const auto & a, const auto & b){ return a.second > b.second; });
+    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(), cmp);
     out.assign(scored.begin(), scored.begin() + k);
     return out;
 }

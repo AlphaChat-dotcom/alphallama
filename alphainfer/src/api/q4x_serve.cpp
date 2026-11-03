@@ -357,6 +357,10 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
         m.dev.upload(m.samp_dev, &m.samp_host, 0, sizeof(m.samp_host));
         m.dev.synchronize();
     }
+    // [AI_Q4X_PF_WARM, default 4608 tokens; 0 = off] a dummy prefill past the layer-stream minimum (3072 rows) and one
+    // 4096-row MoE batch, so the backend's pool reaches the prefill's high-water at start. Its temporaries depend on
+    // the fixed slice sizes (sub-chunk 256, MoE rows 1024 / batch 4096), not the prompt length.
+    if (const int64_t warm = env_int("AI_Q4X_PF_WARM", 4608); warm > 0) m.run->prefill_warmup(warm);
     fprintf(stderr, "[ai-api] q4x engine: 1 stream, ctx %lld, %d expert slots, workspace %zu MiB, %s; FAST decode "
                     "(not token-identical to plain decode)\n", (long long) m.ctx, slots, ws,
             !m.mtp ? "plain decode" : m.copy_min > 0 ? "MTP + suffix copy" : "MTP drafts");

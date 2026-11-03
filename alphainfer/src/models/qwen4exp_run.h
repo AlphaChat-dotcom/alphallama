@@ -61,6 +61,10 @@ public:
     std::vector<int32_t> mtp_draft(int32_t pending, int n, float tau = 0.0f, std::vector<float> * probs = nullptr);
     // Layer-major prefill of n prompt tokens in doorbell mode (qwen4exp_prefill.cpp); returns the last sub-chunk's
     // logits, and every row's when all_logits is given (scoring). Falls back to kDoorbellT-row rounds if its buffers do not fit.
+    // AI_Q4X_PF_WARM: one dummy prefill of n tokens at start, then reset + residency reset: the backend's memory pool
+    // grows to the prefill's high-water now, while VRAM is free, instead of inside a later request (where cuMemCreate
+    // can fail and ggml aborts). Returns false when skipped (n too small for the context).
+    bool                 prefill_warmup(int64_t n);
     Tensor               prefill(const int32_t * tokens, int64_t n, std::vector<float> * all_logits = nullptr);
     void                 set_mtp_keep(int n) { mtp_keep_ = n < 1 ? 1 : n; }   // drafts never cut by tau (>= 1)
     // AI_DRAFT_VOCAB: the MTP draft head's rows (the verify head stays full): ids ascending -> a compact device copy

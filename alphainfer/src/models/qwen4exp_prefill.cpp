@@ -270,6 +270,14 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
         // [AI_Q4X_LEND] the state and the scratch over the lent layers' banks (lend_end copies their experts back)
         lend_begin(soff + (size_t) nb_want * lscr_a);
         pf_buf_ = pf_scr_ = lend_buf_; pf_buf_off_ = 0; pf_scr_off_ = soff; pf_S_ = S; pf_sub_ = sub;
+        static bool said_lent = false;
+        if (!said_lent) {
+            said_lent = true;
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            fprintf(stderr, "[q4x-prefill] scratch: lent (state + %d expert buffer(s) in the lent banks), free %zu MiB%c", nb_want,
+                    fb >> 20, 10);
+        }
         scr = lscr;
         dev_.mem_report("prefill_alloc (lent)");
         cudaMemsetAsync((char *) dev_.buffer_base(lend_buf_) + soff, 0, scr, (cudaStream_t) adapter::stream(dev_));
@@ -300,6 +308,14 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
             return false;
         }
         pf_buf_ = b1; pf_scr_ = b2; pf_buf_off_ = pf_scr_off_ = 0; pf_S_ = S; pf_sub_ = sub;
+        static bool said_fresh = false;
+        if (!said_fresh) {
+            said_fresh = true;
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            fprintf(stderr, "[q4x-prefill] scratch: fresh (%.0f + %.0f MiB allocated), free %zu MiB%c", bytes / 1048576.0,
+                    scr / 1048576.0, fb >> 20, 10);
+        }
         dev_.mem_report("prefill_alloc");
         cudaMemset(dev_.buffer_base(b2), 0, scr);   // never-written scratch slots read as zero weights (finite, masked)
     }
@@ -1114,6 +1130,27 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
         ret = op::add(dev_, ret, yp);
     }
     return ret;
+}
+
+bool Qwen4ExpRun::prefill_warmup(int64_t n) {
+    n = std::min<int64_t>(n, max_ctx_ - 16);
+    if (n <= kDoorbellT) return false;
+    size_t f0 = 0, f1 = 0, tot = 0;
+    dev_.synchronize();
+    cudaMemGetInfo(&f0, &tot);
+    std::vector<int32_t> ids((size_t) n);
+    for (int64_t i = 0; i < n; ++i) ids[(size_t) i] = (int32_t) (1000 + (i * 7919) % 50000);   // arbitrary ordinary ids
+    const auto t0 = std::chrono::steady_clock::now();
+    reset();
+    prefill(ids.data(), n);
+    dev_.synchronize();
+    reset();
+    if (doorbell_) reset_residency();
+    dev_.synchronize();
+    cudaMemGetInfo(&f1, &tot);
+    fprintf(stderr, "[q4x-prefill] pool warm-up: %lld-token prefill in %.1f s; free VRAM %zu -> %zu MiB (the backend pool now holds the prefill's high-water)%c",
+            (long long) n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), f0 >> 20, f1 >> 20, 10);
+    return true;
 }
 
 Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float> * all_logits) {
