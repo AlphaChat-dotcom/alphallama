@@ -295,6 +295,7 @@ bool intelligence_init_corpus(intelligence_ctx & ctx, const std::string & corpus
     ctx.corpus_dir = corpus_dir;
     if (!ctx.bm25) {
         static bm25_index bm25_instance;
+        bm25_instance.warn_unfinalized = false;   // small resident corpus, never finalized: the forward scan
         ctx.bm25 = &bm25_instance;
     }
     if (!ctx.entities) {

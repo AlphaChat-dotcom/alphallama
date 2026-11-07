@@ -282,8 +282,15 @@ struct class_profile {
 
 static const std::vector<class_profile> & class_profiles() {
     static const std::vector<class_profile> p = {
+        // AI_Q4X_PF_STREAM2=0 (one prefill expert buffer, not two): with the double buffer, 2.0.3 at bare -m on an RTX 4080
+        // ran out of VRAM within 3 chat requests (captured graphs + a 1.1 GB second prefill scratch); with one, 37 requests
+        // ran clean (2026-11-08). The 4080 production launcher has pinned it since 2026-11-03.
+        // AI_GRAPH_MAX=8 (captured-round profiles, default 16): RTX 4080 soak of 62 chat requests (thinking on, max_tokens
+        // 3072, two 8K prompts): with 16, 5 low-memory-valve evictions; with 8, none, at 102.4 vs 103.4 tok/s (noise);
+        // 0 OOM / decode errors / aborts either way (2026-11-08).
         { "16 GB", 14.0, 20.0, "RTX 4080: 1.12x Strata 0.2.8 (2026-10-30)",
-          { { "AI_Q4X_LEND", "1" }, { "ALPHA_AI_MTP_K", "3" }, { "AI_Q4X_MTP_MINP", "0.5" } } },
+          { { "AI_Q4X_LEND", "1" }, { "ALPHA_AI_MTP_K", "3" }, { "AI_Q4X_MTP_MINP", "0.5" }, { "AI_Q4X_PF_STREAM2", "0" },
+            { "AI_GRAPH_MAX", "8" } } },
         { "24 GB", 20.0, 28.0, "RTX 3090: 1.14-1.18x Strata 0.2.8 (2026-11-01, two runs)",
           { { "ALPHA_AI_MTP_K", "3" }, { "AI_Q4X_LEND", "1" }, { "AI_Q4X_MTP_MINP", "0.5" },
             { "AI_Q4X_PLE_GATE", "1" }, { "AI_Q4X_EXP_FORK", "2" }, { "AI_Q4X_ROUTE_RING", "1" },

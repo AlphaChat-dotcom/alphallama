@@ -49,6 +49,10 @@
 #ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
 #endif
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>   // __cpuidex (the AVX2 check at start)
+#endif
+#include <chrono>
 
 // Marlin INT4 Tensor Core hook for ggml Q4_K decode
 extern "C" void marlin_hook_enable();
@@ -952,8 +956,9 @@ static std::string sha256_file(const char * path) {
 }
 } // namespace
 
-// SHA-256 of a model file, cached in ~/.cache/alphallama/sha256.tsv keyed on path, size and mtime.
-static std::string alpha_model_sha256_cached(const char * path) {
+// SHA-256 of a model file, cached in ~/.cache/alphallama/sha256.tsv keyed on path, size and mtime. lookup_only: return
+// the cached value or "" without hashing.
+static std::string alpha_model_sha256_cached(const char * path, bool lookup_only = false) {
     struct stat st;
     if (stat(path, &st) != 0) return "";
     const char * home = getenv("HOME");
@@ -967,6 +972,7 @@ static std::string alpha_model_sha256_cached(const char * path) {
             if (line.size() > key.size() + 1 && line.compare(0, key.size(), key) == 0 && line[key.size()] == '\t') return line.substr(key.size() + 1);
         }
     }
+    if (lookup_only) return "";
     fprintf(stderr, "[auto] hashing %s once to check it against the AlphaInfer-validated file (cached afterwards)...\n", path);
     const std::string h = sha256_file(path);
     if (!h.empty()) {
@@ -990,7 +996,26 @@ static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_p
     if (stat(model_path, &st) != 0) return nullptr;
     for (const auto & r : k_ai_validated) {
         if (r.sm_major != prop.major || r.sm_minor != prop.minor || r.size != (long long) st.st_size) continue;   // cheap filters
-        if (alpha_model_sha256_cached(model_path) == r.sha256) return &r;
+        const std::string h = alpha_model_sha256_cached(model_path, /*lookup_only=*/true);
+        if (!h.empty()) {
+            if (h == r.sha256) return &r;
+            continue;
+        }
+        // Not hashed yet. Hashing the whole file before serving cost a first start ~58 s (35B, 22.7 GB) / ~40 s (27B)
+        // on an RTX 4080 box. An exact size match on this GPU picks the row now; the hash runs in the background and is
+        // cached, and a mismatch is reported (the next start then takes the generic path). The row only chooses tuned
+        // defaults, so a wrong pick costs speed, never correctness.
+        fprintf(stderr, "[auto] %s matches an AlphaInfer-validated file by size; checking its SHA-256 in the background\n", model_path);
+        std::thread([p = std::string(model_path), want = std::string(r.sha256)]() {
+            const std::string got = alpha_model_sha256_cached(p.c_str());
+            if (got != want) {
+                fprintf(stderr, "[auto] WARNING: %s is NOT the validated file (SHA-256 %s); it runs with the validated file's "
+                                "settings now, and the next start uses the generic path\n", p.c_str(), got.substr(0, 16).c_str());
+            } else {
+                fprintf(stderr, "[auto] SHA-256 of %s checked: the validated file\n", p.c_str());
+            }
+        }).detach();
+        return &r;
     }
     return nullptr;
 #endif
@@ -1119,6 +1144,98 @@ static std::string alpha_q4x_find(const char * model_path, bool profile) {
 }
 #endif // ALPHA_HAS_ALPHAINFER
 
+// Thinking for a chat request that does not say (chat_template_kwargs.enable_thinking / "think"): on, the model's own
+// default. ALPHA_DEFAULT_THINKING=0 turns it off server-wide, for clients that cannot show reasoning_content and would
+// otherwise display nothing until the thinking ends.
+static bool g_default_thinking = true;
+
+// The model's bytes on disk: a split GGUF ("-00001-of-00003.gguf") counts every part. 0 if unknown.
+static uint64_t alpha_model_bytes(const char * model_path) {
+    if (!model_path) return 0;
+    std::string p = model_path;
+    struct stat st;
+    const size_t n = p.size();
+    // "-NNNNN-of-MMMMM.gguf" is 20 characters
+    if (n > 20 && p.compare(n - 5, 5, ".gguf") == 0 && p[n - 20] == '-' && p.compare(n - 14, 4, "-of-") == 0) {
+        const int parts = atoi(p.substr(n - 10, 5).c_str());
+        uint64_t total = 0;
+        for (int i = 1; i <= parts && parts > 0 && parts < 1000; i++) {
+            char num[8];
+            snprintf(num, sizeof(num), "%05d", i);
+            const std::string q = p.substr(0, n - 19) + num + p.substr(n - 14);
+            if (stat(q.c_str(), &st) == 0) total += (uint64_t) st.st_size;
+        }
+        if (total > 0) return total;
+    }
+    return stat(p.c_str(), &st) == 0 ? (uint64_t) st.st_size : 0;
+}
+
+// Hardware this package cannot run, said at start instead of as a crash or a silent hang later. The CPU check is fatal
+// (the CPU backend is built for AVX2 / FMA and would die on an illegal instruction at its first op; ALPHA_SKIP_CPU_CHECK=1
+// skips it); the GPU check only warns, since a local build may carry code for older GPUs.
+static bool alpha_hardware_check() {
+#if defined(__x86_64__) || defined(_M_X64)
+    bool avx2 = true;
+#if defined(_MSC_VER)
+    int r[4] = {0, 0, 0, 0};
+    __cpuidex(r, 7, 0);
+    const bool a2 = (r[1] & (1 << 5)) != 0;
+    __cpuidex(r, 1, 0);
+    const bool fma = (r[2] & (1 << 12)) != 0;
+    avx2 = a2 && fma;
+#elif defined(__GNUC__)
+    __builtin_cpu_init();
+    avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+    if (!avx2 && !getenv("ALPHA_SKIP_CPU_CHECK")) {
+        fprintf(stderr,
+            "[serve] ERROR: this CPU has no AVX2 / FMA. The AlphaLlama packages are built for x86-64 CPUs with AVX2 and\n"
+            "[serve]        FMA (Intel Haswell / 2013 and newer, AMD Zen and newer); on this CPU they would stop with an\n"
+            "[serve]        illegal instruction. Build from source with -DGGML_NATIVE=ON for this machine, or set\n"
+            "[serve]        ALPHA_SKIP_CPU_CHECK=1 to try anyway.\n");
+        return false;
+    }
+#endif
+#ifdef GGML_USE_CUDA
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess) { cudaGetLastError(); ndev = 0; }
+    for (int d = 0; d < ndev; d++) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) { cudaGetLastError(); continue; }
+        const int cc = prop.major * 10 + prop.minor;
+        if (cc < 75) {
+            fprintf(stderr,
+                "[serve] WARNING: GPU %d (%s) has compute capability %d.%d. The AlphaLlama CUDA packages carry GPU code\n"
+                "[serve]          for compute 7.5 (RTX 20 series) and newer, so on this GPU they fail with \"no kernel\n"
+                "[serve]          image\" or run very slowly. Use the Vulkan package, or the CPU (CUDA_VISIBLE_DEVICES=).\n",
+                d, prop.name, prop.major, prop.minor);
+        } else if (cc < 80) {
+            fprintf(stderr,
+                "[serve] note: GPU %d (%s, compute %d.%d) runs the standard engine; the fastest path (AlphaInfer) needs\n"
+                "[serve]       compute 8.0+ (RTX 30 series and newer).\n", d, prop.name, prop.major, prop.minor);
+        }
+    }
+#endif
+    return true;
+}
+
+// The one line to look for: the API answers from here on. Also says where the reply's thinking goes, since a client that
+// does not show reasoning_content displays nothing until the thinking is over.
+static void alpha_ready_banner(const char * host, int port, const std::string & model_id, double startup_s) {
+    fprintf(stderr,
+        "==================================================================\n"
+        " READY  http://%s:%d/v1   model \"%s\"   (started in %.0f s)\n"
+        "   Thinking: %s%s%s. It streams as reasoning_content; a chat app that does not\n"
+        "   show reasoning displays nothing until the answer starts. Per request: \"reasoning_effort\":\n"
+        "   \"low\" | \"medium\" | \"high\", or \"chat_template_kwargs\": {\"enable_thinking\": false}; for the\n"
+        "   whole server: ALPHA_DEFAULT_REASONING_EFFORT / ALPHA_DEFAULT_THINKING=0.\n"
+        "==================================================================\n",
+        host, port, model_id.c_str(), startup_s,
+        g_default_thinking ? "on by default" : "off by default (ALPHA_DEFAULT_THINKING=0)",
+        g_default_thinking && getenv("ALPHA_DEFAULT_REASONING_EFFORT") ? ", effort " : "",
+        g_default_thinking && getenv("ALPHA_DEFAULT_REASONING_EFFORT") ? getenv("ALPHA_DEFAULT_REASONING_EFFORT") : "");
+}
+
 int main(int argc, char ** argv) {
     // Engine identity banner: alphallama and alphallama-serve are different engines with different speed and
     // endpoints; announce which one is running.
@@ -1131,6 +1248,8 @@ int main(int argc, char ** argv) {
         "   'alphallama' is the retrieval/dev twin (LUT_DIRECT MoE).\n"
         "==================================================================\n");
     fprintf(stderr, "%s (%s), build %s\n", alphallama_version_name(), alphallama_version(), llama_build_info());
+    const auto t_process_start = std::chrono::steady_clock::now();
+    if (const char * e = getenv("ALPHA_DEFAULT_THINKING")) g_default_thinking = atoi(e) != 0;
 #if !defined(_WIN32)
     if (getenv("ALPHA_SEGV_TRACE")) signal(SIGSEGV, alpha_segv_handler);
 #endif
@@ -1461,6 +1580,11 @@ int main(int argc, char ** argv) {
             setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
             fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
         }
+        // Thinking effort when the request names none: low. RTX 4080, 6 prompts x 2 reps per setting (thinking on,
+        // max_tokens 3072): first answer token median 1.23 s / worst 1.9 s at low vs 1.27 s / 7.5 s at the template's
+        // default (xhigh), every checkable answer correct either way (Strata 0.2.8's default: worst 9.7 s). A request's
+        // own reasoning_effort, or ALPHA_DEFAULT_REASONING_EFFORT, wins.
+        setenv("ALPHA_DEFAULT_REASONING_EFFORT", "low", /*overwrite=*/ 0);
         setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
         // MTP drafts 3 deep, each draft kept only while its own top-1 probability is >= 0.5 (AI_Q4X_MTP_MINP), on every
         // card. Sets A / V / R vs depth 2: 4080 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1; 3090 +4-6%; 5090 +9 / +7 / +3%.
@@ -1617,6 +1741,21 @@ int main(int argc, char ** argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    if (need_model) {
+        if (!alpha_hardware_check()) return 1;
+        // Say up front that loading takes a while and how to tell when it is done: a first start reads the whole model
+        // from disk (minutes for a large model on a slow disk) and calibrates for this machine, and the HTTP port
+        // only answers once the model is loaded.
+        const uint64_t mb = alpha_model_bytes(model_path);
+        char size_str[32] = "";
+        if (mb) snprintf(size_str, sizeof(size_str), " (%.1f GB)", mb / 1e9);
+        fprintf(stderr,
+            "[serve] Loading %s%s. The first start reads the whole model from disk and calibrates for this\n"
+            "[serve] machine, which can take several minutes on a slow disk; a restart is faster. The API answers once\n"
+            "[serve] the READY banner below appears (/health returns 503 \"loading\" until then).\n",
+            model_path, size_str);
+    }
 
     // Initialize intelligence layer
     alphaserve::intelligence_ctx intel_ctx;
@@ -3237,11 +3376,12 @@ int main(int argc, char ** argv) {
                     inputs.parallel_tool_calls = body.value("parallel_tool_calls", true);
                     inputs.use_jinja = true;
                     inputs.add_generation_prompt = true;
-                    bool enable_thinking = true;
+                    bool enable_thinking = g_default_thinking;
                     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+                        // every value as JSON text: the template layer parses each one, so a raw string ("low") was a
+                        // JSON parse error and the request a 400 (chat_template_kwargs {"reasoning_effort": "low"})
                         for (auto & el : body["chat_template_kwargs"].items()) {
-                            inputs.chat_template_kwargs[el.key()] = el.value().is_string()
-                                ? el.value().get<std::string>() : el.value().dump();
+                            inputs.chat_template_kwargs[el.key()] = el.value().dump();
                         }
                         auto & ck = body["chat_template_kwargs"];
                         if (ck.contains("enable_thinking")) {
@@ -3250,6 +3390,20 @@ int main(int argc, char ** argv) {
                         }
                     }
                     if (body.contains("think") && body["think"].is_boolean()) enable_thinking = body["think"].get<bool>();
+                    // OpenAI's top-level "reasoning_effort" (low / medium / high; "none" = no thinking) for templates that
+                    // take one (Flash-Next: low, medium, xhigh = high, the default); chat_template_kwargs wins if it has one
+                    if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string() &&
+                        !inputs.chat_template_kwargs.count("reasoning_effort")) {
+                        const std::string re = body["reasoning_effort"].get<std::string>();
+                        if (re == "none") enable_thinking = false;
+                        else if (!re.empty()) inputs.chat_template_kwargs["reasoning_effort"] = json(re).dump();
+                    }
+                    // ALPHA_DEFAULT_REASONING_EFFORT: the effort of a thinking request that names none (AlphaServe sets "low"
+                    // for Flash-Next, see the auto path)
+                    static const char * default_effort = getenv("ALPHA_DEFAULT_REASONING_EFFORT");
+                    if (enable_thinking && default_effort && *default_effort && !inputs.chat_template_kwargs.count("reasoning_effort")) {
+                        inputs.chat_template_kwargs["reasoning_effort"] = json(std::string(default_effort)).dump();
+                    }
                     inputs.enable_thinking = enable_thinking;
                     // The parser extracts the thinking into reasoning_content only when it is built with a reasoning
                     // format: with NONE, a template that opens <think> itself (Qwen3.x, Flash-Next) left the whole
@@ -3847,7 +4001,7 @@ int main(int argc, char ** argv) {
         if (warm) {
             g_warm_ready = false;
             ggml_cuda_dre_tier_defer();   // ALPHA_DRE_TIER: filled after the warm-up request, not inside it
-            warm_thread = std::thread([port]() {
+            warm_thread = std::thread([port, host_s = std::string(host), model_id, t_process_start]() {
                 const int64_t t0 = ggml_time_us();
                 httplib::Client cli("127.0.0.1", port);
                 cli.set_read_timeout(600, 0);
@@ -3868,7 +4022,12 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "[serve] warm-up request %s in %.0f ms -- /health is ok from now on\n",
                         r && r->status == 200 ? "done" : "FAILED", (ggml_time_us() - t0) / 1000.0);
                 g_warm_ready = true;
+                alpha_ready_banner(host_s.c_str(), port, model_id, std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - t_process_start).count());
             });
+        } else {
+            alpha_ready_banner(host, port, model_id, std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t_process_start).count());
         }
     }
 

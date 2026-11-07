@@ -277,6 +277,19 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
     // own round capture: ggml's CUDA graphs off, before the device is initialised (as the CLI and Engine)
     op::set_capture(op::Capture::Own);
     if (!m.dev.init(0)) throw std::runtime_error("q4x: device init failed");
+    {   // [16 GB class, AI_Q4X_PF_STREAM2 default 0 on cards of <= 17 GiB] the layer stream's second 1.1 GiB prefill scratch
+        // is left out: at the defaults 2.0.3 ran out of memory within 3 chat requests on an RTX 4080 (thinking on,
+        // max_tokens 3072: the captured profiles grew to 31 MiB free, a verify launch failed, the next prompt's GET_ROWS
+        // ran out of memory); with one buffer, 37 requests ran with 0 OOM / decode errors. An explicit
+        // AI_Q4X_PF_STREAM2 wins.
+        size_t fr = 0, tot = 0;
+        m.dev.memory_info(&fr, &tot);
+        if (tot > 0 && tot <= (size_t) 17 << 30 && !getenv("AI_Q4X_PF_STREAM2")) {
+            env_default("AI_Q4X_PF_STREAM2", "0");
+            fprintf(stderr, "[ai-api] q4x %.1f GiB card: one prefill scratch buffer (AI_Q4X_PF_STREAM2=0, the 16 GB class default)\n",
+                    tot / 1073741824.0);
+        }
+    }
     if (!m.prog.load(m.dev, c.model_path, c.verbose)) throw std::runtime_error("q4x: model load failed: " + c.model_path);
     m.V = m.prog.spec().n_vocab;
     if (c.mtp_k > 0) {
