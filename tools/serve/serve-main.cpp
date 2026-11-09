@@ -156,11 +156,16 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int spl
 // Server default --reasoning-budget N / ALPHA_REASONING_BUDGET (-1 = unlimited); per request "reasoning_budget" (alias
 // "thinking_budget", also inside chat_template_kwargs) and "reasoning_budget_message" (the line written before
 // </think>; "" for none). Works on /v1/chat/completions (text and image) and /v1/completions.
+// Answer room (default on, ALPHA_ANSWER_ROOM=0 turns it off): max_tokens counts the thinking too, so a thinking request
+// with no budget of its own and max_tokens >= 1024 has its thinking closed early enough to leave the answer a quarter of
+// max_tokens (at least 512, at most half). Without it a long think on a capped request (an agent harness sending 8192)
+// ended in the middle of the thinking with no answer. Same rule as Strata 0.2.8's answer_room.
 static int         g_reasoning_budget = -1;
+static bool        g_answer_room = true;
 static std::string g_reasoning_budget_msg = "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n";
 template <typename J>
 static void alpha_reasoning_budget(const J & body, const std::string & prompt, const llama_vocab * vocab,
-                                   alphaserve::InferenceRequest & ireq) {
+                                   alphaserve::InferenceRequest & ireq) {   // after ireq.max_tokens is set
     int budget = g_reasoning_budget;
     std::string msg = g_reasoning_budget_msg;
     auto pick = [&](const J & o) {
@@ -171,6 +176,10 @@ static void alpha_reasoning_budget(const J & body, const std::string & prompt, c
     };
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) pick(body["chat_template_kwargs"]);
     pick(body);
+    if (budget < 0 && g_answer_room && ireq.max_tokens >= 1024) {
+        const int m = ireq.max_tokens;
+        budget = m - std::min(std::max(512, m / 4), m / 2);
+    }
     if (budget < 0) return;
     ireq.reasoning_budget = budget;
     // template-opened thinking: the generation prompt ends with "<think>" (a model that writes <think> itself is
@@ -1225,15 +1234,16 @@ static void alpha_ready_banner(const char * host, int port, const std::string & 
     fprintf(stderr,
         "==================================================================\n"
         " READY  http://%s:%d/v1   model \"%s\"   (started in %.0f s)\n"
-        "   Thinking: %s%s%s. It streams as reasoning_content; a chat app that does not\n"
-        "   show reasoning displays nothing until the answer starts. Per request: \"reasoning_effort\":\n"
-        "   \"low\" | \"medium\" | \"high\", or \"chat_template_kwargs\": {\"enable_thinking\": false}; for the\n"
-        "   whole server: ALPHA_DEFAULT_REASONING_EFFORT / ALPHA_DEFAULT_THINKING=0.\n"
+        "   Thinking: %s%s%s%s. It streams as reasoning_content;\n"
+        "   a chat app that does not show reasoning displays nothing until the answer starts. Per request:\n"
+        "   \"reasoning_effort\": \"low\" | \"medium\" | \"high\", or \"chat_template_kwargs\": {\"enable_thinking\": false};\n"
+        "   for the whole server: ALPHA_DEFAULT_REASONING_EFFORT / ALPHA_DEFAULT_THINKING=0 / ALPHA_ANSWER_ROOM=0.\n"
         "==================================================================\n",
         host, port, model_id.c_str(), startup_s,
         g_default_thinking ? "on by default" : "off by default (ALPHA_DEFAULT_THINKING=0)",
         g_default_thinking && getenv("ALPHA_DEFAULT_REASONING_EFFORT") ? ", effort " : "",
-        g_default_thinking && getenv("ALPHA_DEFAULT_REASONING_EFFORT") ? getenv("ALPHA_DEFAULT_REASONING_EFFORT") : "");
+        g_default_thinking && getenv("ALPHA_DEFAULT_REASONING_EFFORT") ? getenv("ALPHA_DEFAULT_REASONING_EFFORT") : "",
+        g_default_thinking && g_answer_room ? ", answer room kept at max_tokens >= 1024" : "");
 }
 
 int main(int argc, char ** argv) {
@@ -1281,6 +1291,7 @@ int main(int argc, char ** argv) {
     int ubatch_prefill = 0;   // --ubatch-prefill: runtime-grow target for long prompts
     const char * override_tensor = nullptr;  // --override-tensor 'pattern=CPU'
     { const char * rb = getenv("ALPHA_REASONING_BUDGET"); if (rb && *rb) g_reasoning_budget = atoi(rb); }   // --reasoning-budget overrides
+    { const char * ar = getenv("ALPHA_ANSWER_ROOM"); if (ar && *ar) g_answer_room = atoi(ar) != 0; }
     const char * mmproj_path = getenv("ALPHA_MMPROJ");   // --mmproj FILE: image input through this projector (built-in engine)
 #ifdef ALPHA_DELTANET
     const char * deltanet_state = nullptr;      // --deltanet-state PATH (load a prebuilt recurrent state)
@@ -1580,11 +1591,9 @@ int main(int argc, char ** argv) {
             setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
             fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
         }
-        // Thinking effort when the request names none: low. RTX 4080, 6 prompts x 2 reps per setting (thinking on,
-        // max_tokens 3072): first answer token median 1.23 s / worst 1.9 s at low vs 1.27 s / 7.5 s at the template's
-        // default (xhigh), every checkable answer correct either way (Strata 0.2.8's default: worst 9.7 s). A request's
-        // own reasoning_effort, or ALPHA_DEFAULT_REASONING_EFFORT, wins.
-        setenv("ALPHA_DEFAULT_REASONING_EFFORT", "low", /*overwrite=*/ 0);
+        // Thinking effort when the request names none: the template's own default (xhigh), as Strata 0.2.8 does; the
+        // answer room keeps a long think from eating the whole max_tokens. 2.0.4 set "low" here (first answer token
+        // worst 1.9 s vs 7.5 s on an RTX 4080); ALPHA_DEFAULT_REASONING_EFFORT=low gets that back.
         setenv("ALPHA_AI_EXPERT_SLOTS", "auto", /*overwrite=*/ 0);
         // MTP drafts 3 deep, each draft kept only while its own top-1 probability is >= 0.5 (AI_Q4X_MTP_MINP), on every
         // card. Sets A / V / R vs depth 2: 4080 126.4 / 141.9 / 223.0 vs 113.8 / 127.4 / 208.1; 3090 +4-6%; 5090 +9 / +7 / +3%.
@@ -3502,8 +3511,9 @@ int main(int argc, char ** argv) {
             ireq.request_id = req_id;
             ireq.prompt_tokens = std::move(tokens);
             ireq.mm = mmp;
+            ireq.max_tokens = body.contains("max_tokens") || !body.contains("max_completion_tokens")
+                            ? body.value("max_tokens", 200) : body.value("max_completion_tokens", 200);
             alpha_reasoning_budget(body, prompt, vocab, ireq);
-            ireq.max_tokens = body.value("max_tokens", 200);
             ireq.temperature = body.value("temperature", 0.7f);
             ireq.top_k = body.value("top_k", 40);
             ireq.top_p = body.value("top_p", 0.95f);
@@ -3860,8 +3870,9 @@ int main(int argc, char ** argv) {
         alphaserve::InferenceRequest ireq;
         ireq.request_id = req_id;
         ireq.prompt_tokens = std::move(tokens);
+        ireq.max_tokens = body.contains("max_tokens") || !body.contains("max_completion_tokens")
+                        ? body.value("max_tokens", 200) : body.value("max_completion_tokens", 200);
         alpha_reasoning_budget(body, prompt, vocab, ireq);
-        ireq.max_tokens = body.value("max_tokens", 200);
         ireq.temperature = body.value("temperature", 0.7f);
         ireq.top_k = body.value("top_k", 40);
         ireq.top_p = body.value("top_p", 0.95f);
