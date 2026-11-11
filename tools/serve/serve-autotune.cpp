@@ -278,6 +278,9 @@ struct class_profile {
     double       min_gib, max_gib;
     const char * evidence;
     std::vector<std::pair<const char *, const char *>> env;
+    // ALPHA_PREFILL_FAST=1: the class's measured faster prefill that is NOT bit-identical to the default (empty: none
+    // measured on this class, the switch is ignored there)
+    std::vector<std::pair<const char *, const char *>> fast_prefill = {};
 };
 
 static const std::vector<class_profile> & class_profiles() {
@@ -291,13 +294,21 @@ static const std::vector<class_profile> & class_profiles() {
         { "16 GB", 14.0, 20.0, "RTX 4080: 1.12x Strata 0.2.8 (2026-10-30)",
           { { "AI_Q4X_LEND", "1" }, { "ALPHA_AI_MTP_K", "3" }, { "AI_Q4X_MTP_MINP", "0.5" }, { "AI_Q4X_PF_STREAM2", "0" },
             { "AI_GRAPH_MAX", "8" } } },
+        // 2026-11-10 (RTX 3090, vs Strata 0.2.12): the routed prefill stream (AI_Q4X_PF_RSTREAM: the layer's
+        // copies ordered by a routing prior and filtered by the layer's routing, bit-identical to the plain layer stream:
+        // hashes 1473/1473, full logits 4092/4092 rows) and the late lend give-back (AI_Q4X_LEND_ASYNC=2: every publish
+        // waits, so each round sees the synchronous residency -- the text of =0, not the timing-dependent =1). Pooled median
+        // TTFT A / V / R 0.209 / 1.101 / 1.240 s vs 0.220 / 1.298 / 1.403 without them (Strata 0.312 / 1.096 / 1.252).
+        // Measured on the 3090 only. ALPHA_PREFILL_FAST=1 adds the CPU tail (0.218 / 1.014 / 1.225 s; NLL +0.005 +- 0.003).
         { "24 GB", 20.0, 28.0, "RTX 3090: 1.14-1.18x Strata 0.2.8 (2026-11-01, two runs)",
           { { "ALPHA_AI_MTP_K", "3" }, { "AI_Q4X_LEND", "1" }, { "AI_Q4X_MTP_MINP", "0.5" },
             { "AI_Q4X_PLE_GATE", "1" }, { "AI_Q4X_EXP_FORK", "2" }, { "AI_Q4X_ROUTE_RING", "1" },
             { "AI_Q4X_STREAM_SPLIT", "1" }, { "AI_Q4X_PF_COPY_OVERLAP", "1" }, { "AI_Q4X_PF_SHARE_GBS", "48" },
             { "AI_Q4X_PF_STREAM_MIN", "1024" }, { "AI_Q4X_PF_NBUF", "2" }, { "AI_Q4X_RESERVE_EXTRA_MB", "400" },
             { "AI_Q4X_ADMIT", "256" }, { "AI_Q4X_ADMIT_STAGE", "640" }, { "AI_Q4X_ADMIT_THR", "1.0" },
-            { "AI_Q4X_ADMIT_RATIO", "1.1" }, { "AI_Q4X_LEND_ASYNC", "0" } } },
+            { "AI_Q4X_ADMIT_RATIO", "1.1" }, { "AI_Q4X_LEND_ASYNC", "2" }, { "AI_Q4X_PF_RSTREAM", "1" },
+            { "AI_Q4X_PF_RSTREAM_CHUNK", "8" } },
+          { { "AI_Q4X_PF_RSTREAM_CPU", "1" }, { "AI_Q4X_PF_RSTREAM_MIN", "256" }, { "AI_Q4X_PF_STREAM_MIN", "3072" } } },
         // the 5090's best measured run minus two knobs: LEND_ASYNC (the first request after a lent prefill is not repeatable) and
         // TAIL_RANK 6 (+1-2%, pending the KL / lm-eval check). Draft min-p 0 measured +2.6% V over 0.5 here.
         { "32 GB", 28.0, 1e9, "RTX 5090: 1.10-1.12x Strata 0.2.8 (2026-11-01)",
@@ -326,6 +337,23 @@ static void apply_class_profile(size_t vram_total) {
             setenv(kv.first, kv.second, 1);
             g_profile_keys.insert(kv.first);
             fprintf(stderr, "[profile] %s=%s\n", kv.first, kv.second);
+        }
+        const char * fast = getenv("ALPHA_PREFILL_FAST");
+        if (fast && atoi(fast) != 0) {
+            if (cp.fast_prefill.empty()) {
+                fprintf(stderr, "[profile] ALPHA_PREFILL_FAST: no fast prefill measured on the %s class -- ignored\n", cp.name);
+            } else {
+                fprintf(stderr, "[profile] ALPHA_PREFILL_FAST=1: faster prefill, NOT bit-identical to the default (CPU-computed experts)\n");
+                for (const auto & kv : cp.fast_prefill) {   // over the profile's own values; an env you set wins
+                    if (getenv(kv.first) && !g_profile_keys.count(kv.first)) {
+                        fprintf(stderr, "[profile] %s=%s (set by you; fast prefill has %s)\n", kv.first, getenv(kv.first), kv.second);
+                        continue;
+                    }
+                    setenv(kv.first, kv.second, 1);
+                    g_profile_keys.insert(kv.first);
+                    fprintf(stderr, "[profile] %s=%s (fast prefill)\n", kv.first, kv.second);
+                }
+            }
         }
         return;
     }

@@ -348,8 +348,20 @@ static void signal_handler(int) {
 
 // JSON helpers
 
+// OpenAI usage block. cached_tokens = prompt tokens served from the prefix / KV cache instead of prefilled (the field
+// OpenAI, DeepSeek and OpenRouter use; clients weight cached input at a lower price).
+static json alpha_usage(int n_prompt, int n_completion, int n_cached) {
+    return json{
+        {"prompt_tokens",         n_prompt},
+        {"completion_tokens",     n_completion},
+        {"total_tokens",          n_prompt + n_completion},
+        {"prompt_tokens_details", json{{"cached_tokens", std::min(std::max(0, n_cached), n_prompt)}}},
+    };
+}
+
 static json make_completion_response(int request_id, const std::string & text, int n_tokens,
-                                     const std::string & model_name, const std::string & finish_reason) {
+                                     const std::string & model_name, const std::string & finish_reason,
+                                     int n_prompt = 0, int n_cached = 0) {
     return json{
         {"id",      "cmpl-" + std::to_string(request_id)},
         {"object",  "text_completion"},
@@ -361,11 +373,7 @@ static json make_completion_response(int request_id, const std::string & text, i
             {"logprobs",      nullptr},
             {"finish_reason", finish_reason},
         }})},
-        {"usage", json{
-            {"prompt_tokens",     0},
-            {"completion_tokens", n_tokens},
-            {"total_tokens",      n_tokens},
-        }},
+        {"usage", alpha_usage(n_prompt, n_tokens, n_cached)},
     };
 }
 
@@ -3614,11 +3622,7 @@ int main(int argc, char ** argv) {
                         {"message", message},
                         {"finish_reason", finish_reason},
                     }})},
-                    {"usage", json{
-                        {"prompt_tokens", n_tok_timing},
-                        {"completion_tokens", pr->n_tokens},
-                        {"total_tokens", n_tok_timing + pr->n_tokens},
-                    }},
+                    {"usage", alpha_usage(n_tok_timing, pr->n_tokens, pr->n_cached)},
                 };
                 res.set_content(resp.dump(-1, ' ', false, json::error_handler_t::replace)   /* generated text may end mid-UTF-8: never throw */, "application/json");
             } else {
@@ -3809,8 +3813,7 @@ int main(int argc, char ** argv) {
                             json u = {
                                 {"id", "chatcmpl-" + std::to_string(req_id)}, {"object", "chat.completion.chunk"},
                                 {"created", (int64_t) time(nullptr)}, {"model", model_name}, {"choices", json::array()},
-                                {"usage", {{"prompt_tokens", n_prompt}, {"completion_tokens", pr->n_tokens},
-                                           {"total_tokens", n_prompt + pr->n_tokens}}},
+                                {"usage", alpha_usage(n_prompt, pr->n_tokens, pr->n_cached)},
                             };
                             std::string us = "data: " + u.dump() + "\n\n";
                             sink.write(us.c_str(), us.size());
@@ -3869,6 +3872,7 @@ int main(int argc, char ** argv) {
 
         alphaserve::InferenceRequest ireq;
         ireq.request_id = req_id;
+        const int n_prompt_c = (int) tokens.size();
         ireq.prompt_tokens = std::move(tokens);
         ireq.max_tokens = body.contains("max_tokens") || !body.contains("max_completion_tokens")
                         ? body.value("max_tokens", 200) : body.value("max_completion_tokens", 200);
@@ -3940,7 +3944,8 @@ int main(int argc, char ** argv) {
                                 "application/json");
                 return;
             }
-            auto resp = make_completion_response(req_id, pr->text, pr->n_tokens, model_name, pr->error ? "error" : pr->length ? "length" : "stop");
+            auto resp = make_completion_response(req_id, pr->text, pr->n_tokens, model_name, pr->error ? "error" : pr->length ? "length" : "stop",
+                                                 n_prompt_c, pr->n_cached);
             res.set_content(resp.dump(-1, ' ', false, json::error_handler_t::replace)   /* generated text may end mid-UTF-8: never throw */, "application/json");
         } else {
             res.set_header("Cache-Control", "no-cache");

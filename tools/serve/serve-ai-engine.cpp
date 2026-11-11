@@ -30,6 +30,14 @@ extern "C" {
 int ai_engine_supports_sampling(const ai_engine * e) ALPHA_AI_WEAK;
 int ai_engine_set_sampling(ai_engine * e, int stream_id, float temperature, int top_k, float top_p, float min_p,
                            uint64_t seed) ALPHA_AI_WEAK;
+int64_t ai_engine_prompt_cached(const ai_engine * e, int stream_id) ALPHA_AI_WEAK;
+}
+
+// usage.prompt_tokens_details.cached_tokens: the prompt tokens stream s's last prefill took from the engine's kept state
+// (AlphaInfer prefix reuse), recorded parallel to res.sampled for the scheduler. 0 with a library that does not say.
+static void ai_note_cached(alphaserve::BatchResult & res, const ai_engine * eng, int s) {
+    res.slot_cached.resize(res.sampled.size() - 1, -1);
+    res.slot_cached.push_back(ai_engine_prompt_cached ? (int) ai_engine_prompt_cached(eng, s) : 0);
 }
 
 namespace alphaserve {
@@ -455,6 +463,7 @@ bool ai_gpu_engine::process_one() {
         res.slot_ids.push_back(s);
         res.sampled.push_back((llama_token) first);
         res.slot_extra.emplace_back();
+        res.slot_cached.assign(res.sampled.size(), -1); res.slot_cached.back() = 0;   // image prompt: prefilled whole
         n_tokens_ += 1;
         res.n_slots = (int) res.sampled.size();
         out_->try_push(std::move(res));
@@ -537,6 +546,7 @@ bool ai_gpu_engine::process_one() {
             res.slot_ids.push_back(s);
             res.sampled.push_back((llama_token) first);
             res.slot_extra.emplace_back();
+            ai_note_cached(res, eng_, s);
             n_tokens_ += 1;
         }
         prefill_done.clear();
@@ -560,6 +570,7 @@ bool ai_gpu_engine::process_one() {
         res.slot_ids.push_back(s);
         res.sampled.push_back((llama_token) first);
         res.slot_extra.emplace_back();
+        ai_note_cached(res, eng_, s);
         n_tokens_ += 1;
     }
 

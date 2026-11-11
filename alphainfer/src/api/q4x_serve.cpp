@@ -425,11 +425,16 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
     }
     feed_open_ = false;
     // AI_Q4X_PREFIX_REUSE (default 1): a chat resends its history: continue from the committed tokens when the prompt
-    // extends them (the previous prompt + answer), else rewind to the last prompt's checkpoint when the prompt still
-    // extends that (a regenerate / an edited last turn), else start over. At least one new token is always prefilled
-    // (its logits give the first token). The reused state was built by the earlier prefill + decode rounds, so the
-    // text can differ from a fresh prefill's by FAST-mode rounding, as any prompt cache.
+    // extends them (the previous prompt + answer), else rewind to the longest saved resume point inside the prompt's
+    // common prefix with the history -- the last prompt's end (a regenerate), or, with AI_Q4X_PREFIX_CKPT (default 1),
+    // any super-chunk boundary of the earlier prompts (an agent's history edited part way: compaction, thinking dropped
+    // from old turns, a rewritten message; 5090 2.0.5: an 18.4K prompt with a sentence appended was prefilled from token
+    // 0, 4.98 s vs 1.10 s for the same prompt) -- else start over. At least one new token is always prefilled (its logits
+    // give the first token). The reused state was built by the earlier prefill + decode rounds, so the text can differ
+    // from a fresh prefill's by FAST-mode rounding, as any prompt cache.
     static const bool reuse = env_int("AI_Q4X_PREFIX_REUSE", 1) != 0;
+    static const bool ck_mid = reuse && env_int("AI_Q4X_PREFIX_CKPT", 1) != 0;
+    m.run->checkpoint_mid(ck_mid);
     int64_t           start = 0;
     if (reuse) {
         const std::vector<int32_t> & h = m.run->history();
@@ -449,8 +454,10 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
         }
         if (hn > 0 && common == hn && n > hn) {
             start = hn;
-        } else if (ck > 0 && common >= ck && n > ck && m.run->restore_checkpoint()) {
-            start = ck;
+        } else {
+            const int64_t lim = std::min<int64_t>(common, (int64_t) n - 1);   // >= 1 token left to prefill
+            const int64_t at  = m.run->checkpoint_at_most(lim);
+            if (at > 0 && m.run->restore_checkpoint(lim)) start = at;
         }
     }
     if (start == 0) m.run->reset();
@@ -489,8 +496,8 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
         m.run->checkpoint();
         ck_first_ = first;
     }
-    if (start > 0) fprintf(stderr, "[ai-api] q4x prefix reuse: %lld of %d prompt tokens kept, %lld prefilled\n",
-                           (long long) start, n, (long long) (n - start));
+    if (start > 0) fprintf(stderr, "[ai-api] q4x prefix reuse: %lld of %d prompt tokens kept, %lld prefilled (%zu resume points)\n",
+                           (long long) start, n, (long long) (n - start), m.run->checkpoint_count());
     m.hist.assign(tokens, tokens + n);
     m.hist.push_back(first);
     prefilled_ = true;

@@ -23,12 +23,21 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace ai {
 
@@ -64,6 +73,179 @@ struct PfTiming {
     }
 };
 PfTiming g_pf;
+// [AI_Q4X_PF_STAT=1] one line per layer-major prefill: rows, mode, expert copies and their bytes, the CPU share's columns,
+// the lent layers and the bytes given back, host wall time to the return (the give-back copies are queued, not waited for)
+std::atomic<uint64_t> g_pf_copy_bytes{ 0 };   // the issuer thread adds to it too
+uint64_t g_pf_back_bytes = 0;
+int      g_pf_lent_n = 0;
+// [AI_Q4X_PF_ALLOC_ROWS, default 1; 0 = the super-chunk's rounded size] the prompt's rows, for prefill_alloc's choice of
+// one scratch buffer or the layer stream's ring: prefill() streams from AI_Q4X_PF_STREAM_MIN ROWS on, but the buffers
+// were sized by the super-chunk rounded up to 256, so a staged prompt of 769-1023 rows (stream minimum 1024) got the
+// double buffer it never reads -- and lent 7 layers for it instead of 4 (3 x 203 experts streamed in again and ~1.2
+// GiB more given back; RTX 3090, the same prompts with 4 layers lent: 0.06-0.12 s less).
+int64_t  g_pf_alloc_rows = 0;
+
+// [AI_Q4X_PF_RSTREAM=1, default 0 until measured] the ROUTED layer stream. The layer stream copies every non-resident
+// expert of every layer whatever the prompt routes to: 16253 experts, 27.3 GiB at 203 slots on the 3090, which is 1.30-
+// 1.38 s for any prompt of 1.3-2K tokens -- the PCIe link's rate (22 GB/s), with the GPU computing 0.5-0.8 s of it
+// (RTX 3090, 2026-11-10; Strata 0.2.12 reads the same prompts in 1.05-1.26 s). Here a helper thread issues a layer's copies
+// a few experts at a time, the experts earlier prompts routed to most first (g_rs_pop), never more than two chunks
+// ahead of the link; when the layer's routing reaches the host (the read-back the plans need anyway) the copies NOT
+// yet issued are filtered: an expert no token of the batch routes to is dropped (it had no column: the same bits), and
+// with AI_Q4X_PF_RSTREAM_CPU=1 (default 0) the lightest routed ones go to the CPU pool when its job -- a fixed serial
+// part plus a cost per decode pass, both measured -- ends before the link would have copied them (the staged walk's
+// kernels, AI_Q4X_PF_SHARE; other bits than the GPU's). Slots stay the layer stream's (pf_nonres_ order), so the plans
+// do not change. One MoE batch per layer only (rows <= AI_Q4X_PF_MOE_BIG), the double-buffered stream, the route overlap
+// on and the device plan off; anything else runs the plain layer stream.
+// [AI_Q4X_PF_RSTREAM_HOLD, default 1 column; 0 = off] HOLD-BACK: an expert the prior expects fewer columns for (over
+// this prompt's rows) is not copied before the routing at all -- 3090 run 2: issued blind down the whole list, 12-24% of the
+// copies made before the routing were of unrouted experts (2.1-5 GiB of a link-bound prompt). The issuer goes on to the
+// next layer's expected experts meanwhile and returns to the held ones once the routing has filtered them -- or when
+// it has nothing else to issue: held as a hard rule (3090 run 3), prompts of 2.4K rows and more, where the GPU and not the
+// link sets the pace, lost 0.05-0.2 s to copies that then ran after the routing with the expert kernels waiting.
+struct RsJob {
+    void *       free_ev = nullptr, * ready_ev = nullptr;   // the scratch buffer is free / this layer's copies have landed
+    char *       dst[3] = { nullptr, nullptr, nullptr };
+    const char * src[3] = { nullptr, nullptr, nullptr };
+    size_t       eb[3] = { 0, 0, 0 }, db[3] = { 0, 0, 0 };  // an expert's bytes in the source / a slot's in the scratch
+    std::vector<int32_t> ids;     // slot -> expert (pf_nonres_ order: ascending ids)
+    std::vector<int32_t> order;   // slots in issue order
+    std::vector<char>    state;   // per slot: 0 pending, 1 issued, 2 not copied (unrouted, or the CPU's)
+    size_t       next = 0, hold = 0;   // order[hold..) waits for the routing (hold == order.size(): nothing held)
+    bool         started = false, done = false, filtered = false;
+};
+struct RsIssuer {
+    std::mutex                          mu;
+    std::condition_variable             cv;
+    std::deque<std::shared_ptr<RsJob>>  q;
+    std::vector<std::shared_ptr<RsJob>> jobs;   // by layer
+    std::atomic<bool>                   stop{ false };
+    std::thread                         th;
+    cudaStream_t                        cs = nullptr;
+    cudaEvent_t                         ev[2] = { nullptr, nullptr };
+    int                                 chunk = 16;
+    void run() {
+#ifdef __linux__
+        {   // the creating thread is pinned to the launch core (pin_launch_thread): this one must not share it
+            cpu_set_t all;
+            CPU_ZERO(&all);
+            for (int i = 0; i < CPU_SETSIZE; ++i) CPU_SET(i, &all);
+            sched_setaffinity(0, sizeof(all), &all);
+        }
+#endif
+        int nev = 0;
+        for (;;) {
+            std::shared_ptr<RsJob> j;
+            std::vector<int32_t>   c;
+            bool                   fin = false;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                for (;;) {
+                    if (stop.load()) return;
+                    auto lim_of = [](RsJob & x) {   // skips what is no longer pending; the end of what may be issued now
+                        while (x.next < x.order.size() && x.state[(size_t) x.order[x.next]] != 0) ++x.next;
+                        return x.filtered ? x.order.size() : std::min(x.hold, x.order.size());
+                    };
+                    if (!q.empty()) {   // the front job ends once nothing of it is pending (a held tail: once filtered)
+                        RsJob & f = *q.front();
+                        lim_of(f);
+                        if (f.next == f.order.size() && (f.filtered || f.hold >= f.order.size())) { j = q.front(); fin = true; break; }
+                    }
+                    for (auto & cand : q) {   // else the first job with an entry it may issue (the next layer's expected
+                        if (lim_of(*cand) > cand->next) { j = cand; break; }   // experts while this one's tail is held)
+                    }
+                    bool spec = false;
+                    if (!j)                   // else the link is idle: a held tail goes unfiltered rather than not at all
+                        for (auto & cand : q)
+                            if (cand->next < cand->order.size()) { j = cand; spec = true; break; }
+                    if (j) {
+                        const size_t lim = spec ? j->order.size() : lim_of(*j);
+                        while (j->next < lim && (int) c.size() < chunk) {
+                            const int32_t sl = j->order[j->next++];
+                            if (j->state[(size_t) sl] == 0) { j->state[(size_t) sl] = 1; c.push_back(sl); }
+                        }
+                        break;
+                    }
+                    cv.wait(lk);
+                }
+            }
+            if (!j->started) {   // the buffer's previous layer has run its MoE (the event was recorded when the job was queued)
+                cudaStreamWaitEvent(cs, (cudaEvent_t) j->free_ev, 0);
+                j->started = true;
+            }
+            if (fin) {           // every slot issued or filtered: the layer's copies end here
+                cudaEventRecord((cudaEvent_t) j->ready_ev, cs);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    j->done = true;
+                    q.pop_front();
+                }
+                cv.notify_all();
+                continue;
+            }
+            std::sort(c.begin(), c.end());
+            for (int r = 0; r < 3; ++r) {
+                const bool merge = j->db[r] == j->eb[r];
+                for (size_t i = 0; i < c.size();) {
+                    size_t n = i + 1;
+                    if (merge)
+                        while (n < c.size() && c[n] == c[n - 1] + 1 && j->ids[(size_t) c[n]] == j->ids[(size_t) c[n - 1]] + 1) ++n;
+                    cudaMemcpyAsync(j->dst[r] + (size_t) c[i] * j->db[r], j->src[r] + (size_t) j->ids[(size_t) c[i]] * j->eb[r],
+                                    (n - i) * j->eb[r], cudaMemcpyHostToDevice, cs);
+                    g_pf_copy_bytes += (n - i) * j->eb[r];
+                    i = n;
+                }
+            }
+            // at most two chunks ahead of the link: what is not issued yet can still be filtered by the routing, and a
+            // small ordered upload of the compute stream (the CPU share's rows) waits behind two chunks, not a layer
+            cudaEventRecord(ev[nev & 1], cs);
+            if (nev > 0)
+                while (!stop.load() && cudaEventQuery(ev[(nev - 1) & 1]) != cudaSuccess)
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+            ++nev;
+        }
+    }
+    void start(cudaStream_t s) {
+        cs = s;
+        cudaEventCreateWithFlags(&ev[0], cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&ev[1], cudaEventDisableTiming);
+        th = std::thread([this]() { run(); });
+    }
+    ~RsIssuer() {
+        stop.store(true);
+        cv.notify_all();
+        if (th.joinable()) th.join();
+        if (ev[0]) cudaEventDestroy(ev[0]);
+        if (ev[1]) cudaEventDestroy(ev[1]);
+    }
+};
+std::unique_ptr<RsIssuer>       g_rs;        // live for one super-chunk of a routed-stream prefill
+std::vector<std::vector<float>> g_rs_pop;    // per layer, per expert: columns per 1000 prompt rows, decayed over prompts
+bool                            g_rs_warm = false;   // the pool warm-up's arbitrary ids are not a prior
+int                             g_rs_seen = 0;       // prompts in the prior (0: nothing is held back)
+int64_t                         g_rs_rows = 0;       // this super-chunk's rows
+double   g_rs_A = 5e-5, g_rs_F = 5e-3;   // the CPU job's cost per decode pass and its fixed part (s), running means
+double   g_rs_job_s = 0, g_rs_fix_s = 0;
+uint64_t g_rs_groups = 0;
+uint64_t g_rs_blind = 0, g_rs_wasted = 0, g_rs_routed = 0, g_rs_dropped = 0, g_rs_cpu_e = 0, g_rs_cpu_cols = 0;
+float *  g_rs_wpin = nullptr, * g_rs_xpin = nullptr, * g_rs_ypin = nullptr;   // pinned staging: routing weights, x, the CPU's rows
+size_t   g_rs_wcap = 0, g_rs_xcap = 0, g_rs_ycap = 0;
+float * rs_pin(float *& p, size_t & cap, size_t n) {
+    if (cap < n) {
+        if (p) cudaFreeHost(p);
+        cudaHostAlloc((void **) &p, n * 4, cudaHostAllocDefault);
+        cap = n;
+    }
+    return p;
+}
+void rs_wait(int il) {   // the layer's copies are all issued (nothing left to filter)
+    std::shared_ptr<RsJob> j = g_rs->jobs[(size_t) il];
+    std::unique_lock<std::mutex> lk(g_rs->mu);
+    j->filtered = true;   // its held tail too
+    g_rs->cv.notify_all();
+    g_rs->cv.wait(lk, [&] { return j->done; });
+    for (char st : j->state) g_rs_blind += st == 1;
+}
 struct PfClock {
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     void lap(double & acc) {
@@ -172,6 +354,8 @@ void Qwen4ExpRun::lend_end() {
         cudaEventRecord((cudaEvent_t) lend_ev_, (cudaStream_t) lend_stream_);
         lend_back_ = true;
         lent_      = false;
+        g_pf_back_bytes = moved;
+        g_pf_lent_n     = lend_n_;
         static bool said_a = false;
         if (!said_a) {
             said_a = true;
@@ -202,6 +386,8 @@ void Qwen4ExpRun::lend_end() {
         cudaMemcpyAsync(B.table.data, pin, (size_t) E * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
     }
     lent_ = false;
+    g_pf_back_bytes = moved;
+    g_pf_lent_n     = lend_n_;
     static bool said = false;
     if (!said) {
         said = true;
@@ -212,8 +398,15 @@ void Qwen4ExpRun::lend_end() {
 
 // [AI_Q4X_LEND_ASYNC] map the lent layers again once their give-back copies have landed (wait = block for them); the
 // tables go up on the compute stream, ordered before the next round
+// [AI_Q4X_LEND_ASYNC=2] LATE give-back: the copies leave the first token's path as with =1, but every publish point
+// (the start of the next round, a residency reset, the next lend) WAITS for them, so each round sees the residency the
+// synchronous give-back gives it -- the text is that of AI_Q4X_LEND_ASYNC=0. With =1 a round that started before the
+// copies landed computed the lent layers' experts on the CPU pool (other kernels, other rounding), and how many rounds
+// did depended on timing: the first request after a full prefill was not run-to-run identical.
 void Qwen4ExpRun::lend_publish(bool wait) {
     if (!lend_back_) return;
+    static const bool late = getenv("AI_Q4X_LEND_ASYNC") && atoi(getenv("AI_Q4X_LEND_ASYNC")) == 2;
+    if (late) wait = true;
     if (wait) cudaEventSynchronize((cudaEvent_t) lend_ev_);
     else if (cudaEventQuery((cudaEvent_t) lend_ev_) != cudaSuccess) return;
     const int E  = prog_.spec().n_expert;
@@ -257,6 +450,8 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
         lscr = std::max(lscr, (size_t) ((int) il >= lend_from_ ? s.n_expert : s.n_expert - banks_[il].n_slots) * per + 3 * 256);
     }
     const size_t soff = (bytes + 255) / 256 * 256;
+    static const bool alloc_rows = !getenv("AI_Q4X_PF_ALLOC_ROWS") || atoi(getenv("AI_Q4X_PF_ALLOC_ROWS")) != 0;
+    const int64_t     Sr = alloc_rows && g_pf_alloc_rows > 0 ? std::min<int64_t>(S, g_pf_alloc_rows) : S;   // the rows prefill() compares
     // ring size this super-chunk will use (the layer stream double/triple-buffers only from the stream minimum on)
     static const int  nbuf_env = getenv("AI_Q4X_PF_NBUF") ? atoi(getenv("AI_Q4X_PF_NBUF")) : 2;
     static const bool lend2_env = !getenv("AI_Q4X_LEND2") || atoi(getenv("AI_Q4X_LEND2")) != 0;
@@ -264,7 +459,7 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
                                (!getenv("AI_Q4X_PF_STREAM2") || atoi(getenv("AI_Q4X_PF_STREAM2")) != 0);
     const int64_t smin_env = env_i64("AI_Q4X_PF_STREAM_MIN", env_i64("AI_Q4X_PF_SHARE", 1) != 0 && miss_ ? 3072 : 1024);
     const size_t  lscr_a   = (lscr + 255) / 256 * 256;
-    int nb_want = lend2_env && stream_env && S >= smin_env ? std::max(1, std::min(3, nbuf_env)) : 1;
+    int nb_want = lend2_env && stream_env && Sr >= smin_env ? std::max(1, std::min(3, nbuf_env)) : 1;
     while (nb_want > 1 && soff + (size_t) nb_want * lscr_a > lend_bytes_) --nb_want;
     if (lend_buf_ >= 0 && soff + lscr <= lend_bytes_) {
         // [AI_Q4X_LEND] the state and the scratch over the lent layers' banks (lend_end copies their experts back)
@@ -331,7 +526,7 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
     // (the staged walk, below the stream minimum, never reads it)
     const int64_t s2_min = env_i64("AI_Q4X_PF_STREAM_MIN", env_i64("AI_Q4X_PF_SHARE", 1) != 0 && miss_ ? 3072 : 1024);
     const int     E = s.n_expert;
-    if (want_stream && want_double && pf_scr2_ < 0 && pf_spare_P_ == 0 && S >= s2_min) {
+    if (want_stream && want_double && pf_scr2_ < 0 && pf_spare_P_ == 0 && Sr >= s2_min) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         if ((int64_t) fb >= (int64_t) scr + s2_margin) {
@@ -435,6 +630,7 @@ static void pf_copy_experts(const Tensor * const src[3], const Tensor * const ds
             if (merge) while (j < i1 && nr[j] == nr[j - 1] + 1) ++j;
             cudaMemcpyAsync((char *) dst[r]->data + (i - i0) * dst[r]->nb[2], (const char *) src[r]->data + (size_t) nr[i] * eb,
                             (j - i) * eb, cudaMemcpyHostToDevice, cs);
+            g_pf_copy_bytes += (j - i) * eb;
             i = j;
         }
     }
@@ -473,6 +669,47 @@ void Qwen4ExpRun::pf_stream_layer(int il) {
     const int b = pf_b(il);
     cudaStream_t cs = (cudaStream_t) pf_cstream_, st = (cudaStream_t) adapter::stream(dev_);
     cudaEventRecord((cudaEvent_t) pf_ev_free_[b], st);   // everything queued so far (the previous user of buffer b)
+    if (g_rs) {   // [AI_Q4X_PF_RSTREAM] the layer's copies as a job of the issuer thread, the prior's heavy experts first
+        Tensor sg, su, sd;
+        pf_bank_b(il, b, sg, su, sd);
+        const auto &   m = prog_.layers()[(size_t) il].moe;
+        const Tensor * src[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+        const Tensor * dst[3] = { &sg, &su, &sd };
+        auto j = std::make_shared<RsJob>();
+        j->free_ev  = pf_ev_free_[b];
+        j->ready_ev = pf_ev_ready_[b];
+        for (int r = 0; r < 3; ++r) {
+            j->src[r] = (const char *) src[r]->data;
+            j->dst[r] = (char *) dst[r]->data;
+            j->eb[r]  = src[r]->nb[2];
+            j->db[r]  = dst[r]->nb[2];
+        }
+        j->ids = pf_nonres_[(size_t) il];
+        j->state.assign(j->ids.size(), 0);
+        j->order.resize(j->ids.size());
+        std::iota(j->order.begin(), j->order.end(), 0);
+        const std::vector<float> & pop = g_rs_pop[(size_t) il];
+        const RsJob *              jp  = j.get();
+        std::stable_sort(j->order.begin(), j->order.end(), [&pop, jp](int32_t x, int32_t y) {
+            return pop[(size_t) jp->ids[(size_t) x]] > pop[(size_t) jp->ids[(size_t) y]];
+        });
+        static const double rs_hold = getenv("AI_Q4X_PF_RSTREAM_HOLD") ? atof(getenv("AI_Q4X_PF_RSTREAM_HOLD")) : 1.0;
+        j->hold = j->order.size();
+        if (rs_hold > 0 && g_rs_seen > 0) {   // the prior's columns per 1000 rows, over this prompt's rows
+            size_t h = 0;
+            while (h < j->order.size() &&
+                   (double) pop[(size_t) j->ids[(size_t) j->order[h]]] * (double) g_rs_rows / 1000.0 >= rs_hold) ++h;
+            j->hold = h;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_rs->mu);
+            g_rs->jobs[(size_t) il] = j;
+            g_rs->q.push_back(j);
+        }
+        g_rs->cv.notify_all();
+        pf_buf_layer_[b] = il;
+        return;
+    }
     cudaStreamWaitEvent(cs, (cudaEvent_t) pf_ev_free_[b], 0);
     Tensor sg, su, sd;
     pf_bank_b(il, b, sg, su, sd);
@@ -545,7 +782,8 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         } else if (pf_buf_layer_[b] != il) {
             pf_stream_layer(il);
         }
-        cudaStreamWaitEvent((cudaStream_t) st, (cudaEvent_t) pf_ev_ready_[spare ? 0 : b], 0);
+        // [AI_Q4X_PF_RSTREAM] the routed stream waits below, after the routing has filtered what is not issued yet
+        if (!g_rs) cudaStreamWaitEvent((cudaStream_t) st, (cudaEvent_t) pf_ev_ready_[spare ? 0 : b], 0);
     }
     auto slice_of = [&](const Tensor & t, int64_t s0, int64_t Ts) {   // columns [s0, s0 + Ts) of a contiguous [N, Tb]
         return t.view(t.ne[0], Ts, 1, 1, t.nb[1], t.nb[1] * (size_t) Ts, t.nb[1] * (size_t) Ts, t.nb[1] * (size_t) s0);
@@ -569,6 +807,13 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
     std::vector<Tensor> tdr, tds, tdp;
     int ngr = 0, ngs = 0, ngp = 0;
     std::vector<int> ndr, nds, ndp;
+    // [AI_Q4X_PF_RSTREAM] the experts the CPU pool computes for this batch (empty: none), and its job's columns
+    std::vector<char>    rs_cpu_e;
+    std::vector<int32_t> rs_tok, rs_ids, rs_cols;
+    std::vector<float>   rs_w;
+    int                  rs_groups = 0;
+    static const bool    rs_share  = env_i64("AI_Q4X_PF_SHARE", 1) != 0 && env_i64("AI_Q4X_PF_RSTREAM_CPU", 0) != 0;
+    const bool           rs_cpu_ok = g_rs && rs_share && miss_ && !devplan && overlap && fm.contiguous();
     const int rec_w = kern::q4x_experts_wide_rec(), wcols_w = kern::q4x_experts_wide_cols();
     if (devplan) {
         if (il == 0) cudaStreamSynchronize((cudaStream_t) st);   // a super-chunk's start: the previous one's plans were read
@@ -649,6 +894,14 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                 cudaMemcpyAsync(pf_sel_pin_ + s0 * k, routes[(size_t) q].sel.data, (size_t) (Ts * k) * 4, cudaMemcpyDeviceToHost,
                                 (cudaStream_t) pf_rstream_);
             }
+            if (rs_cpu_ok) {   // the routing weights too: a CPU column's weight goes with its job
+                rs_pin(g_rs_wpin, g_rs_wcap, (size_t) (k * Tb));
+                for (int64_t q = 0; q < nsl; ++q) {
+                    const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
+                    cudaMemcpyAsync(g_rs_wpin + s0 * k, routes[(size_t) q].weights.data, (size_t) (Ts * k) * 4,
+                                    cudaMemcpyDeviceToHost, (cudaStream_t) pf_rstream_);
+                }
+            }
             for (int64_t q = 0; q < nsl; ++q) {
                 Device::Scope sc(dev_);
                 const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
@@ -665,6 +918,80 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
             }
         }
         ck.lap(g_pf.route_sync);
+        if (g_rs) {
+            // [AI_Q4X_PF_RSTREAM] the routing filters this layer's copies that are not issued yet: no column -> dropped;
+            // [AI_Q4X_PF_RSTREAM_CPU] of the routed ones, sorted by columns, the CPU takes the prefix that minimises the
+            // larger of its time (a fixed serial part F + A per decode pass of up to 4 columns, both measured on this
+            // path's own jobs) and the link's for the rest (an expert's bytes over AI_Q4X_PF_RSTREAM_GBS, default 20
+            // GB/s) -- and only when that beats the link alone by 1 ms (3090 run 2: without F it took ~10 experts a layer, and
+            // each job's ~7 ms of quantising, staging and summing made every prompt slower)
+            static const double rs_bw   = (double) env_i64("AI_Q4X_PF_RSTREAM_GBS", 20) * 1e9;
+            static const int    rs_cmax = (int) env_i64("AI_Q4X_PF_RSTREAM_CMAX", 0);   // > 0: the CPU takes no expert above it
+            std::shared_ptr<RsJob> j = g_rs->jobs[(size_t) il];
+            std::vector<int> cnt((size_t) E, 0);
+            for (int32_t e : sel) ++cnt[(size_t) e];
+            const double C = (double) (L.moe.gate_exps.nb[2] + L.moe.up_exps.nb[2] + L.moe.down_exps.nb[2]) / rs_bw;
+            const double A = 1.15 * g_rs_A;
+            std::vector<std::pair<int, int32_t>> cand;   // (columns, slot) of the routed experts still pending
+            {
+                std::lock_guard<std::mutex> lk(g_rs->mu);
+                for (size_t sl = 0; sl < j->ids.size(); ++sl) {
+                    const int c = cnt[(size_t) j->ids[sl]];
+                    if (j->state[sl] == 1) { ++g_rs_blind; g_rs_wasted += c == 0; continue; }
+                    if (j->state[sl] != 0) continue;
+                    if (c == 0) { j->state[sl] = 2; ++g_rs_dropped; continue; }
+                    cand.push_back({ c, (int32_t) sl });
+                }
+                size_t take = 0;
+                if (rs_cpu_ok && !cand.empty()) {
+                    std::sort(cand.begin(), cand.end());
+                    const double t0 = C * (double) cand.size();
+                    double       best = t0, cpu = g_rs_F;
+                    for (size_t i = 0; i < cand.size(); ++i) {
+                        if (rs_cmax > 0 && cand[i].first > rs_cmax) break;
+                        cpu += A * (double) ((cand[i].first + 3) / 4);
+                        const double t = std::max(cpu, C * (double) (cand.size() - i - 1));
+                        if (t < best) { best = t; take = i + 1; }
+                    }
+                    if (best > t0 - 1e-3) take = 0;
+                }
+                if (take > 0) rs_cpu_e.assign((size_t) E, 0);
+                for (size_t i = 0; i < take; ++i) {
+                    j->state[(size_t) cand[i].second] = 2;
+                    rs_cpu_e[(size_t) j->ids[(size_t) cand[i].second]] = 1;
+                    rs_groups += (cand[i].first + 3) / 4;
+                }
+                g_rs_cpu_e  += take;
+                g_rs_routed += cand.size() - take;
+                j->filtered = true;   // the held tail may go now
+            }
+            g_rs->cv.notify_all();
+            if (!rs_cpu_e.empty()) {   // the CPU's job: x and the weights from the device, its columns in (token, slot) order
+                for (int64_t c = 0; c < k * Tb; ++c) {
+                    const int32_t e = sel[(size_t) c];
+                    if (!rs_cpu_e[(size_t) e]) continue;
+                    rs_tok.push_back((int32_t) (c / k));
+                    rs_ids.push_back(e);
+                    rs_cols.push_back((int32_t) c);
+                    rs_w.push_back(g_rs_wpin[c]);
+                }
+                rs_pin(g_rs_xpin, g_rs_xcap, (size_t) (N * Tb));
+                rs_pin(g_rs_ypin, g_rs_ycap, (size_t) (N * Tb));
+                cudaMemcpyAsync(g_rs_xpin, fm.data, (size_t) (N * Tb) * 4, cudaMemcpyDeviceToHost, (cudaStream_t) pf_rstream_);
+                cudaStreamSynchronize((cudaStream_t) pf_rstream_);
+                miss_->host_job_begin(il, g_rs_xpin, (int) Tb, rs_tok.data(), rs_ids.data(), rs_w.data(), (int) rs_ids.size(),
+                                      g_rs_ypin);
+                pf_shared_cols_ += rs_ids.size();
+                g_rs_cpu_cols   += rs_ids.size();
+            }
+            if (!g_rs_warm) {   // the prior for the next prompts
+                std::vector<float> & pop = g_rs_pop[(size_t) il];
+                const float          a   = g_rs_seen > 0 ? 0.3f : 1.0f;
+                for (int e = 0; e < E; ++e) pop[(size_t) e] = (1.0f - a) * pop[(size_t) e] + a * (float) cnt[(size_t) e] * 1000.0f / (float) Tb;
+                if (il + 1 == (int) prog_.layers().size()) ++g_rs_seen;
+            }
+            ck.lap(g_pf.copies);
+        }
         // owner plans: gate/up over every column of the batch, down per slice (records split at the kernel's column cap)
         const int rec = kern::q4x_experts_wide_rec(), wcols = kern::q4x_experts_wide_cols();
         const int cap = pf_cap(il);
@@ -687,6 +1014,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                 const int32_t r = B.table_h[(size_t) e];
                 if (r >= 0)                                          add(pr, own_r, nr_, r, (int) cc);
                 else if (spare && pf_spare_of_[(size_t) e] >= 0)     add(pp, own_p, np_, pf_spare_of_[(size_t) e], (int) cc);
+                else if (!rs_cpu_e.empty() && rs_cpu_e[(size_t) e])  continue;   // the CPU's column: no GPU owner (ex zeroed below)
                 else                                                 add(ps, own_s, ns_, pf_slot_of_[(size_t) e], (int) cc);
             }
         };
@@ -734,6 +1062,7 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         }
         ck.lap(g_pf.plan);
     }
+    const bool    rs_cpu = !rs_cpu_e.empty();
     const int64_t K = fm.ne[0], F = B.up.ne[1];
     Tensor scr = dev_.ws_alloc(F32, (int64_t) (kern::q4x_experts_scratch_bytes(K, F, k, Tb) / 4) + 64, 1);
     Tensor ex  = dev_.ws_alloc(F32, N, k, std::min(slice, Tb));
@@ -750,19 +1079,40 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
     void *        psc = scr.data;
     Device *      dv  = &dev_;
     const int32_t * pgr = (const int32_t *) tgr.data, * pgs = (const int32_t *) tgs.data, * pgp = (const int32_t *) tgp.data;
-    adapter::native(dev_, [=]() {
-        void * stv = adapter::stream(*dv);
-        for (int pass = 0; pass < npass; ++pass) {
-            const Bank & bk = pass == 0 ? br : pass == 1 ? bs : bp;
-            if (!kern::q4x_experts_wide_gu(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd, px, K, pass == 0,
-                                           pass == 0 ? pgr : pass == 1 ? pgs : pgp, pass == 0 ? ngr : pass == 1 ? ngs : ngp,
-                                           K, F, N, k, Tb, psc)) {
-                fprintf(stderr, "[q4x-prefill] big-batch gate/up declined a shape%c", 10);
-                throw std::runtime_error("q4x prefill: big-batch gate/up declined a shape");
+    // gate/up passes [p0, p1) (0 the resident bank, 1 the scratch, 2 the spare); wait_ev: the scratch's copies, before pass 1
+    auto gu_passes = [=](int p0, int p1, void * wait_ev, bool qact) {
+        adapter::native(dev_, [=]() {
+            void * stv = adapter::stream(*dv);
+            for (int pass = p0; pass < p1; ++pass) {
+                const Bank & bk = pass == 0 ? br : pass == 1 ? bs : bp;
+                if (pass == 1 && wait_ev) cudaStreamWaitEvent((cudaStream_t) stv, (cudaEvent_t) wait_ev, 0);
+                if (!kern::q4x_experts_wide_gu(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd, px, K, pass == 0,
+                                               pass == 0 ? pgr : pass == 1 ? pgs : pgp, pass == 0 ? ngr : pass == 1 ? ngs : ngp,
+                                               K, F, N, k, Tb, psc)) {
+                    fprintf(stderr, "[q4x-prefill] big-batch gate/up declined a shape%c", 10);
+                    throw std::runtime_error("q4x prefill: big-batch gate/up declined a shape");
+                }
             }
+            if (qact) kern::q4x_experts_wide_qact(stv, K, F, k, Tb, psc);
+        });
+    };
+    if (g_rs) {
+        // [AI_Q4X_PF_RSTREAM] the resident bank's gate/up runs while what the routing left of the layer's copies lands
+        // (the staged walk's AI_Q4X_PF_COPY_OVERLAP); only the scratch pass waits for them. 3090 run 3: with the bytes cut to
+        // 15-22 GiB the prompt was no longer link-bound but serial per layer -- routing, then the rest of the copies,
+        // then all of the MoE.
+        gu_passes(0, 1, nullptr, false);
+        std::shared_ptr<RsJob> j = g_rs->jobs[(size_t) il];
+        {
+            std::unique_lock<std::mutex> lk(g_rs->mu);
+            g_rs->cv.wait(lk, [&] { return j->done; });
+            for (char stt : j->state) pf_streamed_ += stt == 1;
         }
-        kern::q4x_experts_wide_qact(stv, K, F, k, Tb, psc);
-    });
+        ck.lap(g_pf.copies);
+        gu_passes(1, npass, pf_ev_ready_[b], true);
+    } else {
+        gu_passes(0, npass, nullptr, true);
+    }
     float * pex = (float *) ex.data;
     for (int64_t q = 0; q < nsl; ++q) {
         const int64_t s0 = q * slice, Ts = std::min(slice, Tb - s0);
@@ -770,8 +1120,16 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         const int32_t * pdp = (const int32_t *) tdp[(size_t) q].data;
         const int ndr_q = ndr[(size_t) q], nds_q = nds[(size_t) q], ndp_q = ndp[(size_t) q];
         const int64_t col_lo = s0 * k;
+        // the CPU's columns have no owner: they must read as 0 in the weighted sum, not as the previous slice's values.
+        // Each one zeroed on its own (~50 a layer, 8 KB each): zeroing the whole N x k x slice buffer per slice (84 MB)
+        // cost what the tail saved (3090 run 5, 1297 rows: copy wait -0.16 s, GPU time +0.16 s)
+        std::vector<int32_t> zc;
+        for (int32_t c : rs_cols)
+            if ((int64_t) c >= s0 * k && (int64_t) c < (s0 + Ts) * k) zc.push_back((int32_t) ((int64_t) c - s0 * k));
+        const size_t col_nb = (size_t) N * 4;
         adapter::native(dev_, [=]() {
             void * stv = adapter::stream(*dv);
+            for (int32_t c : zc) cudaMemsetAsync((char *) pex + (size_t) c * col_nb, 0, col_nb, (cudaStream_t) stv);
             for (int pass = 0; pass < npass; ++pass) {
                 const Bank & bk = pass == 0 ? br : pass == 1 ? bs : bp;
                 if (!kern::q4x_experts_wide_dn(stv, bk.tg, bk.u, bk.g, bk.rbg, bk.ebg, bk.td, bk.d, bk.rbd, bk.ebd,
@@ -790,6 +1148,23 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         op::copy_into(dev_, y, slice_of(Y, s0, Ts), "q4x pf big moe out");
     }
     ck.lap(g_pf.moe_enq);
+    if (rs_cpu) {   // the CPU's rows, added once its job is done (an ordered copy from pinned staging the next layer's job
+                    // rewrites only after its own route read-back, i.e. after this copy ran)
+        miss_->host_job_wait();
+        {   // the job's fixed part (+ 1.5 ms for the x download and the rows' upload) and its cost per decode pass, measured
+            // on this path's jobs only (the staged walk's model keeps its own)
+            const double w = (double) miss_->host_job_ns() * 1e-9, f = (double) miss_->host_job_fix_ns() * 1e-9;
+            g_rs_F = 0.7 * g_rs_F + 0.3 * (f + 1.5e-3);
+            if (rs_groups > 0) g_rs_A = 0.7 * g_rs_A + 0.3 * std::max(0.0, w - f) / (double) rs_groups;
+            g_rs_job_s  += w;
+            g_rs_fix_s  += f;
+            g_rs_groups += (uint64_t) rs_groups;
+        }
+        ck.lap(g_pf.share_wait);
+        Tensor yp = dev_.ws_alloc(F32, N, Tb);
+        cudaMemcpyAsync(yp.data, g_rs_ypin, (size_t) (N * Tb) * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
+        return op::add(dev_, Y, yp);
+    }
     return Y;
 }
 
@@ -914,6 +1289,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
             pf_n_ = (int) nr.size();
             const int b = pf_b(il);
             if (pf_buf_layer_[b] != il) pf_stream_layer(il);   // not queued at the layer's start (should not happen)
+            if (g_rs) rs_wait(il);   // [AI_Q4X_PF_RSTREAM] a layer on the narrow path takes every copy (nothing filtered)
             cudaStreamWaitEvent((cudaStream_t) st, (cudaEvent_t) pf_ev_ready_[b], 0);
         }
     } else if (pf_layer_ != il) {   // a new layer: its scratch starts empty
@@ -962,6 +1338,7 @@ Tensor Qwen4ExpRun::moe_prefill(int il, const Tensor & x) {
             const void * sp = (const char *) src[r]->data + (size_t) e * src[r]->nb[2];
             if (cst != st) dcopies.push_back({ dp, sp, (size_t) src[r]->nb[2] });
             else cudaMemcpyAsync(dp, sp, src[r]->nb[2], cudaMemcpyHostToDevice, (cudaStream_t) cst);
+            g_pf_copy_bytes += src[r]->nb[2];
         }
         pf_streamed_++;
     }
@@ -1142,7 +1519,9 @@ bool Qwen4ExpRun::prefill_warmup(int64_t n) {
     for (int64_t i = 0; i < n; ++i) ids[(size_t) i] = (int32_t) (1000 + (i * 7919) % 50000);   // arbitrary ordinary ids
     const auto t0 = std::chrono::steady_clock::now();
     reset();
+    g_rs_warm = true;
     prefill(ids.data(), n);
+    g_rs_warm = false;
     dev_.synchronize();
     reset();
     if (doorbell_) reset_residency();
@@ -1169,6 +1548,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
     // every layer again and re-stream most of the non-resident experts
     if (n > S && n <= S + S / 8) S = (n + sub - 1) / sub * sub;
     S = std::min<int64_t>(S, std::max<int64_t>(sub, (n + sub - 1) / sub * sub));   // no bigger than the prompt
+    g_pf_alloc_rows = n;
     bool fit = doorbell_ && n > kDoorbellT && prefill_alloc(S, sub);
     while (!fit && doorbell_ && n > kDoorbellT && S > 1024 && pf_buf_ < 0) {
         S /= 2;
@@ -1189,6 +1569,16 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         return lg;
     }
     const int64_t HW = s.hc_dim(), V = s.n_vocab;
+    static const bool pf_stat = getenv("AI_Q4X_PF_STAT") && atoi(getenv("AI_Q4X_PF_STAT")) != 0;
+    const auto        pf_t0   = std::chrono::steady_clock::now();
+    const uint64_t    pf_b0 = g_pf_copy_bytes, pf_c0 = pf_streamed_, pf_s0 = pf_shared_cols_;
+    g_pf_back_bytes = 0;
+    g_pf_lent_n     = 0;
+    g_rs_blind = g_rs_wasted = g_rs_routed = g_rs_dropped = g_rs_cpu_e = g_rs_cpu_cols = g_rs_groups = 0;
+    g_rs_job_s = g_rs_fix_s = 0;
+    const double pf_ph0[8] = { g_pf.mixer, g_pf.route_sync, g_pf.plan, g_pf.copies, g_pf.moe_enq, g_pf.share_wait, g_pf.mtp, g_pf.ple };
+    struct RsEnd { ~RsEnd() { g_rs.reset(); } } rs_end;   // [AI_Q4X_PF_RSTREAM] the issuer thread ends with the prefill
+    bool rs_used = false;
     char * pb = (char *) dev_.buffer_base(pf_buf_) + pf_buf_off_;
     auto raw = [&](size_t off, int type, int64_t n0, int64_t n1 = 1, int64_t n2 = 1) {
         Tensor t; t.buf = pf_buf_; t.type = type; t.ne[0] = n0; t.ne[1] = n1; t.ne[2] = n2;
@@ -1278,7 +1668,21 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         // with the CPU share on, batches up to 3072 rows take the staged walk so they can hand the CPU its share;
         // above that every expert streams
         static const int64_t stream_min = env_i64("AI_Q4X_PF_STREAM_MIN", env_i64("AI_Q4X_PF_SHARE", 1) != 0 && miss_ ? 3072 : 1024);
-        pf_stream_now_ = pf_stream_on_ && SC >= stream_min;
+        // [AI_Q4X_PF_RSTREAM] see RsJob: one MoE batch per layer, route overlap, no device plan
+        static const bool rs_env = getenv("AI_Q4X_PF_RSTREAM") && atoi(getenv("AI_Q4X_PF_RSTREAM")) != 0 &&
+                                   (!getenv("AI_Q4X_PF_ROUTE_OVERLAP") || atoi(getenv("AI_Q4X_PF_ROUTE_OVERLAP")) != 0) &&
+                                   !(getenv("AI_Q4X_PF_DEVPLAN") && atoi(getenv("AI_Q4X_PF_DEVPLAN")) != 0);
+        static const int64_t rs_big   = env_i64("AI_Q4X_PF_MOE_BIG", 4096);
+        static const int     rs_chunk = (int) std::max<int64_t>(1, env_i64("AI_Q4X_PF_RSTREAM_CHUNK", 16));
+        // [AI_Q4X_PF_RSTREAM_MIN, default 0 = from the stream minimum] the routed stream for shorter prompts too, on the
+        // ONE scratch buffer they have (prefill_alloc: 4 layers lent, not the ring's 7): the staged walk issues a
+        // layer's copies only after its routing, with the link idle through the mixer; here the prior's experts copy
+        // under the mixer (the buffer is free once the previous layer's MoE has run) and the routing filters the rest
+        static const int64_t rs_min = env_i64("AI_Q4X_PF_RSTREAM_MIN", 0);
+        const bool rs_fit = rs_env && SC > kDoorbellT && SC <= rs_big && pf_spare_P_ == 0 &&
+                            rs_big > std::max<int64_t>(sub, env_i64("AI_Q4X_PF_MOE_ROWS", 1024));
+        const bool rs_low = rs_fit && rs_min > 0 && SC >= rs_min && SC < stream_min && pf_scr2_ < 0 && pf_nb_ == 1;
+        pf_stream_now_ = pf_stream_on_ && (SC >= stream_min || rs_low);
         if (pf_stream_now_) {
             pf_nonres_.assign(layers.size(), {});
             for (size_t l = 0; l < layers.size(); ++l) {
@@ -1288,6 +1692,17 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
             }
             pf_buf_layer_[0] = pf_buf_layer_[1] = pf_buf_layer_[2] = -1;
             pf_spare_layer_[0] = pf_spare_layer_[1] = -1;
+            // [AI_Q4X_PF_RSTREAM] the double buffer from the stream minimum on, the single one below it (rs_low)
+            g_rs.reset();
+            if (rs_fit && pf_stream_now_ && ((pf_scr2_ >= 0 && pf_nb_ == 2) || rs_low)) {
+                g_rs.reset(new RsIssuer);
+                g_rs->jobs.assign(layers.size(), nullptr);
+                g_rs->chunk = rs_chunk;
+                g_rs_rows   = SC;
+                if (g_rs_pop.size() != layers.size()) g_rs_pop.assign(layers.size(), std::vector<float>((size_t) s.n_expert, 0.0f));
+                g_rs->start((cudaStream_t) pf_cstream_);
+                rs_used = true;
+            }
             if (pf_stream_now_ && pf_scr2_ >= 0) pf_stream_layer(0);
         }
         // Debug: AI_Q4X_PF_NANCHK=1 on sub-chunk 0 of each layer, report the first stage whose output is non-finite
@@ -1564,6 +1979,10 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
             }
         }
         pc.lap(g_pf.mtp);
+        // [AI_Q4X_PREFIX_CKPT] a resume point at every super-chunk boundary inside the prompt (the serve layer saves the
+        // prompt's end itself, after its first token): the recurrent state is gdn_ / ple_ in place and the MTP head's
+        // carry is in mtp_H_, so the state here is exactly where a prefill starting at this position would begin
+        if (ck_mid_ && s0 + SC < n) checkpoint();
     }
     if (pf_dplan_ovf_) {   // [AI_Q4X_PF_DEVPLAN] a bank needed more records than its cap: the output is not trustworthy
         int ovf = 0;
@@ -1602,6 +2021,22 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         pf_spare_layer_[0] = pf_spare_layer_[1] = -1;
         pf_S_ = 0;
         pf_buf_layer_[0] = pf_buf_layer_[1] = pf_buf_layer_[2] = -1;
+    }
+    if (pf_stat) {
+        fprintf(stderr, "[q4x-pf-stat] rows %lld | %s | %llu expert copies %.0f MiB | cpu share %llu columns | lent %d layers, %.0f MiB back%s | %.3f s%c",
+                (long long) n, rs_used ? "rstream" : pf_stream_now_ ? "stream" : "staged", (unsigned long long) (pf_streamed_ - pf_c0),
+                (g_pf_copy_bytes - pf_b0) / 1048576.0, (unsigned long long) (pf_shared_cols_ - pf_s0), g_pf_lent_n,
+                g_pf_back_bytes / 1048576.0, lend_back_ ? " (async)" : "",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0).count(), 10);
+        if (g_pf.on)   // AI_Q4X_PF_TIMING: this prefill's host phases
+            fprintf(stderr, "[q4x-pf-stat] host s: mixer enqueue %.3f | route sync %.3f | plan+uploads %.3f | copy issue/wait %.3f | moe enqueue %.3f | cpu share wait %.3f | mtp fill %.3f | ple %.3f%c",
+                    g_pf.mixer - pf_ph0[0], g_pf.route_sync - pf_ph0[1], g_pf.plan - pf_ph0[2], g_pf.copies - pf_ph0[3],
+                    g_pf.moe_enq - pf_ph0[4], g_pf.share_wait - pf_ph0[5], g_pf.mtp - pf_ph0[6], g_pf.ple - pf_ph0[7], 10);
+        if (rs_used)
+            fprintf(stderr, "[q4x-pf-stat] rstream: %llu copied before the routing (%llu of them unrouted) + %llu after it | %llu dropped unrouted | CPU %llu experts, %llu columns, %llu passes, jobs %.3f s (fixed %.3f) | prior of %d prompts%c",
+                    (unsigned long long) g_rs_blind, (unsigned long long) g_rs_wasted, (unsigned long long) g_rs_routed,
+                    (unsigned long long) g_rs_dropped, (unsigned long long) g_rs_cpu_e, (unsigned long long) g_rs_cpu_cols,
+                    (unsigned long long) g_rs_groups, g_rs_job_s, g_rs_fix_s, g_rs_seen, 10);
     }
     return lg;
 }

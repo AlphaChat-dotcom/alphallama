@@ -135,6 +135,9 @@ struct BatchResult {
     // (clean stop, frees their pages for waiting requests) instead of letting them generate with
     // inconsistent KV. Empty in the common case (short gens never exhaust an over-subscribed pool).
     std::vector<int> exhausted_slots;
+    // Per-slot prompt tokens taken from a cache (prefix reuse inside the engine), parallel to sampled[]; -1 or absent =
+    // the engine does not say (the scheduler then uses the slot's own KV prefix match). Read at a prompt's first token.
+    std::vector<int> slot_cached;
 };
 
 // Scheduler -> Output
@@ -149,6 +152,7 @@ struct TokenEvent {
     bool is_error = false;     // finished by a decode error: the reply is truncated (finish_reason "error")
     bool is_length = false;    // finished by max_tokens / the context / the KV pool, not by the model (finish_reason "length")
     int n_generated = 0;       // total tokens generated so far for this slot
+    int n_cached = -1;         // first event only: prompt tokens served from cache, not prefilled (-1 = not this event)
 };
 
 // HTTP -> Scheduler

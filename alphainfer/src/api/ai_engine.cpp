@@ -282,6 +282,14 @@ int ai_engine_has_mtp(const ai_engine * e) {
     return const_cast<ai_engine_s *>(e)->engine.program().has_mtp() ? 1 : 0;
 }
 
+int64_t ai_engine_prompt_cached(const ai_engine * e, int stream_id) {
+    if (!e || stream_id < 0) { return 0; }
+#ifdef AI_Q4X_FORWARD
+    if (e->q4x) { return stream_id == 0 ? e->q4x->reused_tokens() : 0; }   // Flash-Next: AI_Q4X_PREFIX_REUSE
+#endif
+    return 0;   // the hybrid engine prefills every prompt whole (no prefix reuse)
+}
+
 int ai_engine_supports_sampling(const ai_engine * e) {
     if (!e) { return 0; }
 #ifdef AI_Q4X_FORWARD

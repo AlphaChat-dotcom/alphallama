@@ -61,6 +61,7 @@ public:
                         int ncols, float * yp);
     void host_job_wait();
     long long host_job_ns() const { return hj_ns_; }   // the last host job's duration on the pool (after host_job_wait)
+    long long host_job_fix_ns() const { return hj_fix_ns_; }   // ... and its serial part (x quantise, grouping, the sums)
 
     struct Stats {
         std::atomic<unsigned long long> rings{ 0 }, misses{ 0 }, busy_ns{ 0 }, skipped{ 0 };
@@ -112,6 +113,7 @@ private:
     const int32_t *       hj_tok_ = nullptr, * hj_ids_ = nullptr;
     float *               hj_yp_ = nullptr;
     long long             hj_ns_ = 0;
+    long long             hj_fix_ns_ = 0;
     std::vector<float>    hy_;           // its compact outputs, one row of N per listed column
     std::vector<char>     hneed_;        // its tokens with at least one listed column
     struct Group { int c0, n; };         // columns [c0, c0 + n) of cols_ share one expert (n <= 4)

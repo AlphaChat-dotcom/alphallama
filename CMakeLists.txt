@@ -32,7 +32,7 @@ else()
 endif()
 
 # Release name and semantic version, shown by --version, the build-info line and the server banners.
-set(ALPHALLAMA_VERSION      "2.0.5")
+set(ALPHALLAMA_VERSION      "2.0.6")
 set(ALPHALLAMA_VERSION_NAME "AlphaLlama v2")
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)

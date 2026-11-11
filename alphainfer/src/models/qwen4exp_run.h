@@ -78,11 +78,19 @@ public:
     // Returns the slots recopied.
     int    reset_residency();
     void   reset();
-    // Prefix reuse: save the recurrent state at the current position (host copy); rewind to it (false: none saved, or
-    // the history is already shorter). The committed tokens: history().
+    // Prefix reuse: save the recurrent state at the current position (host copy), one entry per position, kept sorted;
+    // rewind to the longest saved position <= max_len (false: none). The attention KV needs no copy: it is masked by
+    // position, and every saved position lies inside history(), so the KV below it is the history's. The committed
+    // tokens: history(). checkpoint_len(): the longest saved position (-1: none). checkpoint_mid(true): prefill() also
+    // saves at every super-chunk boundary inside a prompt (AI_Q4X_PREFIX_CKPT), so an edited prompt resumes from the
+    // last boundary before its first changed token instead of from token 0.
     void                         checkpoint();
-    bool                         restore_checkpoint();
-    int64_t                      checkpoint_len() const { return ck_len_; }
+    bool                         restore_checkpoint(int64_t max_len);
+    bool                         restore_checkpoint() { return restore_checkpoint(checkpoint_len()); }
+    int64_t                      checkpoint_len() const { return cks_.empty() ? -1 : cks_.back().len; }
+    int64_t                      checkpoint_at_most(int64_t max_len) const;
+    size_t                       checkpoint_count() const { return cks_.size(); }
+    void                         checkpoint_mid(bool on) { ck_mid_ = on; }
     const std::vector<int32_t> & history() const { return hist_; }
 
     int64_t position() const { return (int64_t) hist_.size(); }
@@ -193,8 +201,12 @@ private:
 
     std::vector<int32_t> hist_;            // committed tokens of the sequence
     std::vector<Tensor *>          recurrent_tensors();
-    int64_t                        ck_len_ = -1, ck_fill_p0_ = -1, ck_fill_m_ = 0;
-    std::vector<std::vector<char>> ck_buf_;
+    struct Ckpt {
+        int64_t                        len = -1, fill_p0 = -1, fill_m = 0;
+        std::vector<std::vector<char>> buf;
+    };
+    std::vector<Ckpt>              cks_;   // ascending len, all inside hist_
+    bool                           ck_mid_ = false;
     // doorbell mode
     struct SlotBank {
         Tensor gate, up, down, table;

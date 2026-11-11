@@ -252,6 +252,10 @@ void scheduler::process_gpu_results() {
             event.is_eos = llama_vocab_is_eog(vocab_, tok);
             event.is_length = stopped && slot.stop_length && !event.is_eos;
             event.n_generated = slot.n_generated;
+            // cached prompt tokens: the engine's own count when it reports one (AlphaInfer prefix reuse), else this
+            // slot's KV prefix match (0 when prefix caching is off or the prompt is multimodal)
+            event.n_cached = (i < (int) result.slot_cached.size() && result.slot_cached[i] >= 0)
+                             ? result.slot_cached[i] : std::max(0, slot.prefix_match_len);
             to_output_->try_push(std::move(event));
             if (stopped) {
                 double total_ms = (ggml_time_us() - slot.t_start) / 1000.0;

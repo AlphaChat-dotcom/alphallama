@@ -188,6 +188,9 @@ int ai_engine_max_tokens_per_round(const ai_engine * e);
 // The engine's effective MTP configuration after the policy: *out_mtp_k (may be lower than requested: exact verify
 // caps K at 3) and *out_exact (1 = every emitted token is bit-identical to plain decode on sm_86). Either may be NULL.
 int ai_engine_mtp_info(const ai_engine * e, int * out_mtp_k, int * out_exact);
+// Prompt tokens the stream's last prefill took from kept state (prefix reuse) instead of computing them; 0 when the
+// engine has no prefix reuse (or a bad stream id). Read it after the prefill that finishes the prompt.
+int64_t ai_engine_prompt_cached(const ai_engine * e, int stream_id);
 // One MTP round. Inputs are exactly ai_engine_decode's: per open stream, the last token it emitted (the pending
 // token; after prefill, *out_first) and that stream's position (prompt length after prefill, then + the number of
 // tokens the stream emitted). Every open stream must be named (a round is batch-rigid).

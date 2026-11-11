@@ -298,11 +298,13 @@ void MissPool::poll_loop() {
         }
         jmiss_ = hj_ids_; jtok_ = hj_tok_; jy_ = hy_.data();
         const int ng = (int) groups_.size();
+        const auto hj_t1 = std::chrono::steady_clock::now();
         if (nc > 0) {
             run_phase(l, 0, ng * (int) ((L.gate.ne[1] + kGuRows - 1) / kGuRows));
             run_phase(l, 2, nc);
             run_phase(l, 1, ng * (int) ((N_ + kDownRows - 1) / kDownRows));
         }
+        const auto hj_t2 = std::chrono::steady_clock::now();
         memset(hj_yp_, 0, (size_t) T * (size_t) N_ * sizeof(float));
         for (int i = 0; i < nc; ++i) {   // listed order (ascending t * k + j from the caller): a token's columns in slot order
             float *       yp = hj_yp_ + (size_t) hj_tok_[i] * N_;
@@ -311,7 +313,9 @@ void MissPool::poll_loop() {
             for (int64_t n = 0; n < N_; ++n) yp[n] += wc * yc[n];
         }
         stats_.misses.fetch_add((unsigned long long) nc, std::memory_order_relaxed);
-        hj_ns_ = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - hj_t0).count();
+        const auto hj_t3 = std::chrono::steady_clock::now();
+        hj_ns_     = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(hj_t3 - hj_t0).count();
+        hj_fix_ns_ = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>((hj_t1 - hj_t0) + (hj_t3 - hj_t2)).count();
     };
     while (!stop_.load(std::memory_order_relaxed)) {
         if (hj_pending_.load(std::memory_order_acquire)) {

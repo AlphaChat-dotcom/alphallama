@@ -225,16 +225,24 @@ void Qwen4ExpRun::reset() {
     fold_join(true);
     ple_gate_idle();
     hist_.clear();
-    ck_len_ = -1;
+    cks_.clear();
     if (mtp_on_) {   // no pending fill, no carried H (the head's K/V is masked by position)
         mtp_fill_m_ = 0;
         cudaMemset(mtp_H_.data, 0, (size_t) mtp_H_.nbytes());
     }
-    // recurrent state and PLE history start at zero (the KV is masked by position, so it needs no clear)
+    // recurrent state and PLE history start at zero (the KV is masked by position, so it needs no clear).
+    // [AI_Q4X_RESET_DEV, default 1; 0 = the uploads] zeroed on the device, in stream order: a zero-filled host buffer per
+    // tensor went up through a synchronous pageable copy each, ~10 ms of every request before its prompt was read
+    // (AI_Q4X_SERVE_TIMING "reuse/reset", 3090 2026-11-10: 9.6-10.3 ms on all 25 TEE prompts). The same zeros.
+    static const bool reset_dev = !getenv("AI_Q4X_RESET_DEV") || atoi(getenv("AI_Q4X_RESET_DEV")) != 0;
     std::vector<char> z;
     for (size_t il = 0; il < gdn_.size(); ++il) {
         for (const Tensor * t : { &gdn_[il].conv, &gdn_[il].ssm, &ple_[il].hist }) {
             if (!t->valid()) continue;
+            if (reset_dev && t->contiguous()) {
+                cudaMemsetAsync(t->data, 0, t->nbytes(), (cudaStream_t) adapter::stream(dev_));
+                continue;
+            }
             z.assign(t->nbytes(), 0);
             dev_.upload(*t, z.data(), 0, z.size());
         }
@@ -257,29 +265,58 @@ std::vector<Tensor *> Qwen4ExpRun::recurrent_tensors() {
 void Qwen4ExpRun::checkpoint() {
     fold_join(true);
     dev_.synchronize();
+    const int64_t len = (int64_t) hist_.size();
+    // entries past this position belong to a history that was rewound (restore_checkpoint keeps them only while the
+    // new prompt still contains them): never leave one that is not a prefix of hist_
+    while (!cks_.empty() && cks_.back().len >= len) cks_.pop_back();
+    // [AI_Q4X_PREFIX_CKPT_MAX, default 24] entries kept; the oldest middle one goes first (the prompt's start and its
+    // newest boundaries are where the next request resumes). 24 x the 16384-row super-chunk covers a 393K context.
+    static const size_t cap = (size_t) std::max(2, getenv("AI_Q4X_PREFIX_CKPT_MAX") ? atoi(getenv("AI_Q4X_PREFIX_CKPT_MAX")) : 24);
+    if (cks_.size() + 1 > cap) cks_.erase(cks_.begin() + 1);
+    Ckpt c;
     const std::vector<Tensor *> ts = recurrent_tensors();
-    ck_buf_.resize(ts.size());
+    c.buf.resize(ts.size());
     for (size_t i = 0; i < ts.size(); ++i) {
-        ck_buf_[i].resize(ts[i]->nbytes());
-        dev_.download(*ts[i], ck_buf_[i].data(), 0, ck_buf_[i].size());
+        c.buf[i].resize(ts[i]->nbytes());
+        dev_.download(*ts[i], c.buf[i].data(), 0, c.buf[i].size());
     }
-    ck_fill_p0_ = mtp_fill_p0_;
-    ck_fill_m_  = mtp_fill_m_;
-    ck_len_     = (int64_t) hist_.size();
+    c.fill_p0 = mtp_fill_p0_;
+    c.fill_m  = mtp_fill_m_;
+    c.len     = len;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        size_t b = 0;
+        for (const auto & v : c.buf) b += v.size();
+        fprintf(stderr, "[ai] q4x resume point: %.1f MiB of recurrent state per point (host), at most %zu points%c", b / 1048576.0, cap, 10);
+    }
+    cks_.push_back(std::move(c));
 }
 
-bool Qwen4ExpRun::restore_checkpoint() {
-    if (ck_len_ < 0 || ck_len_ > (int64_t) hist_.size()) return false;
+int64_t Qwen4ExpRun::checkpoint_at_most(int64_t max_len) const {
+    int64_t best = -1;
+    for (const Ckpt & c : cks_)
+        if (c.len <= max_len && c.len <= (int64_t) hist_.size()) best = c.len;
+    return best;
+}
+
+bool Qwen4ExpRun::restore_checkpoint(int64_t max_len) {
+    size_t k = cks_.size();
+    for (size_t i = 0; i < cks_.size(); ++i)
+        if (cks_[i].len <= max_len && cks_[i].len <= (int64_t) hist_.size()) k = i;
+    if (k == cks_.size() || cks_[k].len < 0) return false;
+    const Ckpt & c = cks_[k];
     fold_join(true);
     ple_gate_idle();
     dev_.synchronize();
     const std::vector<Tensor *> ts = recurrent_tensors();
-    if (ts.size() != ck_buf_.size()) return false;
-    for (size_t i = 0; i < ts.size(); ++i) dev_.upload(*ts[i], ck_buf_[i].data(), 0, ck_buf_[i].size());
+    if (ts.size() != c.buf.size()) return false;
+    for (size_t i = 0; i < ts.size(); ++i) dev_.upload(*ts[i], c.buf[i].data(), 0, c.buf[i].size());
     dev_.synchronize();   // Device::upload is unordered against the stream: land it before the next launch
-    mtp_fill_p0_ = ck_fill_p0_;
-    mtp_fill_m_  = ck_fill_m_;
-    hist_.resize((size_t) ck_len_);
+    mtp_fill_p0_ = c.fill_p0;
+    mtp_fill_m_  = c.fill_m;
+    hist_.resize((size_t) c.len);
+    cks_.resize(k + 1);   // the later ones were states of the history just cut off
     bells_live_ = false;   // the bells hold rounds past the checkpoint
     return true;
 }
