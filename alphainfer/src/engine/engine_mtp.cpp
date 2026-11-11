@@ -148,6 +148,9 @@ void Engine::prefill_mtp_range(int stream, const std::vector<int32_t> & prompt, 
             break;
         }
         const bool    last = off + T == n;
+        if (off > 0 && pfx_on() && !mm_.pos4 && (off % std::max<int64_t>(cfg_.chunk, 8192 / cfg_.chunk * cfg_.chunk) == 0 || last)) {
+            pfx_capture(stream, prompt, off);   // [AI_PREFIX_REUSE] the state through `off`, before this chunk
+        }
         dev_.ws_reset(0);
         auto in = stage_chunk(stream, prompt.data() + off, T, off, prog_.visible_cells(off, T));
         mm_attach(in, off, T);

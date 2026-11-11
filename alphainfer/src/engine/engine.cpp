@@ -922,6 +922,7 @@ void Engine::reset_streams(int B) {
     // stages a slot that holds no request.
     streams_.assign((size_t) B, Stream{});
     for (auto & st : streams_) st.done = true;
+    pfx_.assign((size_t) B, PfxCache{});   // every slot was zeroed: nothing cached survives
     // the first round verifies what the drafter produced at prefill: the DFlash2 block (mtp_k may exceed it for lookup)
     // and for MTP the chain's width, not the lookup cap, so a lookup engine whose lookup never arms takes the same
     // width sequence as a plain MTP engine
@@ -967,6 +968,14 @@ void Engine::reset_stream(int stream) {
     prog_.set_pos_override(stream, nullptr, 0);
     streams_[(size_t) stream]      = Stream{};
     streams_[(size_t) stream].done = true;   // idle until its next prefill
+    if ((size_t) stream < pfx_.size() && !pfx_[(size_t) stream].snaps.empty()) {
+        // [AI_PREFIX_REUSE] an idle slot riding along in a full-width round writes its dummy rows at its position:
+        // past the cached prompt, so the KV the next prompt may resume on stays intact (its recurrent state is
+        // restored from the host copy anyway)
+        const int64_t len = (int64_t) pfx_[(size_t) stream].toks.size();
+        if (len + 256 < prog_.kv().region_cells()) streams_[(size_t) stream].pos = len;
+        else pfx_[(size_t) stream] = PfxCache{};
+    }
     // Recomputed rather than adjusted. live_streams_ is exactly the count of streams not done, and an
     // incremental ++ here would drift the first time a slot is reset twice, or reset while still live.
     live_streams_ = 0;
@@ -981,6 +990,96 @@ void Engine::open_streams(int B) {
     }
     reset_streams(B);
     active_batch_ = B;
+}
+
+// [AI_PREFIX_REUSE, default 1; AI_PREFIX_CKPT_MAX resume points per slot, default 12] Prefix reuse for the hybrid
+// engine. A chat or agent resends its history every turn, and every turn was prefilled from token 0. Now the recurrent
+// state is copied to host memory at chunk boundaries of a prefill -- every 8192 rows and at the start of the last
+// chunk -- and a later prompt on the same slot resumes from the last boundary inside its common prefix with the
+// slot's previous prompt. The attention KV below that boundary is the slot's own (cells are masked by position, and a
+// reset neither clears them nor lets idle rows write below the cached length); the chunks after it run on the grid a
+// one-shot prefill would use. Not with DFlash2 or image input.
+bool Engine::pfx_on() const {
+    static const bool on = !getenv("AI_PREFIX_REUSE") || atoi(getenv("AI_PREFIX_REUSE")) != 0;
+    return on && !df2_ && !ws_calibrating_;
+}
+
+void Engine::pfx_capture(int stream, const std::vector<int32_t> & prompt, int64_t at) {
+    if ((size_t) stream >= pfx_.size() || at <= 0) return;
+    static const size_t cap = (size_t) std::max(1, getenv("AI_PREFIX_CKPT_MAX") ? atoi(getenv("AI_PREFIX_CKPT_MAX")) : 12);
+    PfxCache & c = pfx_[(size_t) stream];
+    while (!c.snaps.empty() && c.snaps.back().at >= at) c.snaps.pop_back();
+    if (c.snaps.size() >= cap) c.snaps.erase(c.snaps.begin() + 1);
+    dev_.synchronize();   // the chunks before `at` have run
+    StateSlots & sl = prog_.slots();
+    PfxSnap      p;
+    p.at = at;
+    p.buf.resize(sl.slot_bytes());
+    size_t o = 0;
+    for (int l = 0; l < sl.n_layers(); ++l) {
+        for (const Tensor & t : { sl.conv(l, stream), sl.ssm(l, stream) }) {
+            const size_t b = (size_t) t.ne[0] * 4;
+            dev_.download(t, p.buf.data() + o, 0, b);
+            o += b;
+        }
+    }
+    c.snaps.push_back(std::move(p));
+    // through prompt[at]: the MTP head's column `at` read it, and a resume at `at` needs the next prompt to have it too
+    c.toks.assign(prompt.begin(), prompt.begin() + std::min<int64_t>(at + 1, (int64_t) prompt.size()));
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "[ai] prefix reuse: %.1f MiB of recurrent state per resume point (host), at most %zu per slot\n",
+                sl.slot_bytes() / 1048576.0, cap);
+    }
+}
+
+int64_t Engine::pfx_resume(int stream, const int32_t * p, int64_t n, int64_t limit) const {
+    if ((size_t) stream >= pfx_.size() || limit <= 0) return 0;
+    const PfxCache & c = pfx_[(size_t) stream];
+    int64_t m = 0;
+    while (m < n && m < (int64_t) c.toks.size() && p[m] == c.toks[(size_t) m]) ++m;
+    limit = std::min(limit, m);
+    int64_t at = 0;
+    for (const PfxSnap & s : c.snaps) if (s.at <= limit) at = std::max(at, s.at);
+    return at;
+}
+
+void Engine::pfx_continue(int stream, int64_t at) {
+    PfxCache & c = pfx_[(size_t) stream];
+    size_t k = c.snaps.size();
+    for (size_t i = 0; i < c.snaps.size(); ++i) if (c.snaps[i].at == at) k = i;
+    if (k == c.snaps.size()) throw std::runtime_error("pfx_continue: no resume point at that position");
+    // the slot: a live KV region whose cells below `at` hold the cached prompt; a fresh Stream; the recurrent state
+    // uploaded from the host copy
+    prog_.kv().free_seq(stream);
+    prog_.kv().new_seq_at(stream);
+    prog_.set_rope_delta(stream, 0);
+    prog_.set_pos_override(stream, nullptr, 0);
+    streams_[(size_t) stream]      = Stream{};
+    streams_[(size_t) stream].done = true;
+    request_start();
+    dev_.synchronize();
+    StateSlots & sl = prog_.slots();
+    size_t o = 0;
+    for (int l = 0; l < sl.n_layers(); ++l) {
+        for (const Tensor & t : { sl.conv(l, stream), sl.ssm(l, stream) }) {
+            const size_t b = (size_t) t.ne[0] * 4;
+            dev_.upload(t, c.snaps[k].buf.data() + o, 0, b);
+            o += b;
+        }
+    }
+    dev_.synchronize();   // uploads are unordered against the compute stream
+    c.snaps.resize(k + 1);
+    c.cached = at;
+    live_streams_ = 0;
+    for (const auto & x : streams_) live_streams_ += x.done ? 0 : 1;
+    fprintf(stderr, "[ai] prefix reuse: slot %d resumes at %lld of the cached %zu tokens\n", stream, (long long) at,
+            c.toks.size());
+}
+
+int64_t Engine::prompt_cached(int stream) const {
+    return (size_t) stream < pfx_.size() ? pfx_[(size_t) stream].cached : 0;
 }
 
 int32_t Engine::prefill_one(int stream, const std::vector<int32_t> & prompt, Timing & tm) {
@@ -1047,12 +1146,42 @@ int32_t Engine::prefill_feed(int stream, const int32_t * tokens, int64_t n, bool
         throw std::runtime_error("prefill_feed: tokens must be non-null when n > 0");
     }
     if (!streams_[(size_t) stream].prefilling) {
-        reset_stream(stream);   // a new request starts from a zeroed slot, exactly as prefill_stream starts one
-        request_start();
+        const bool probe = pfx_on() && (size_t) stream < pfx_.size() && !pfx_[(size_t) stream].snaps.empty() && !mm_.pos4;
+        if (!probe) {
+            reset_stream(stream);   // a new request starts from a zeroed slot, exactly as prefill_stream starts one
+            request_start();
+            if ((size_t) stream < pfx_.size()) pfx_[(size_t) stream] = PfxCache{};
+        }
         streams_[(size_t) stream].prefilling = true;
+        streams_[(size_t) stream].probe      = probe;
+        streams_[(size_t) stream].pf.clear();
+        streams_[(size_t) stream].pf_off     = 0;
     }
     Stream & s = streams_[(size_t) stream];
     s.pf.insert(s.pf.end(), tokens, tokens + n);
+    if (s.probe) {   // [AI_PREFIX_REUSE] nothing has run yet: keep buffering while the prompt is still the cached one
+        const std::vector<int32_t> & c = pfx_[(size_t) stream].toks;
+        int64_t m = 0;
+        while (m < (int64_t) s.pf.size() && m < (int64_t) c.size() && s.pf[(size_t) m] == c[(size_t) m]) ++m;
+        if (!last && m == (int64_t) s.pf.size()) return -1;
+        const int64_t lim = last ? std::min<int64_t>(m - 1, (int64_t) s.pf.size() - 1) : m - 1;
+        const int64_t at  = pfx_resume(stream, s.pf.data(), (int64_t) s.pf.size(), lim);
+        std::vector<int32_t> pf;
+        pf.swap(s.pf);
+        if (at > 0) {
+            pfx_continue(stream, at);
+        } else {
+            reset_stream(stream);
+            request_start();
+            pfx_[(size_t) stream] = PfxCache{};
+        }
+        Stream & r = streams_[(size_t) stream];
+        r.prefilling = true;
+        r.probe      = false;
+        r.pf.swap(pf);
+        r.pf_off     = at;
+        return prefill_feed(stream, nullptr, 0, last, tm);
+    }
     if (last && s.pf.empty()) {
         reset_stream(stream);
         throw std::runtime_error("prefill_feed: empty prompt");
@@ -1373,8 +1502,16 @@ int32_t Engine::prefill_stream(int stream, const std::vector<int32_t> & prompt, 
     // Every request starts from a zeroed slot: an idle slot may have ridden along in full-width rounds since its reset
     // (3+ slots), and a caller that prefills a still-live slot without ai_engine_reset_stream would otherwise continue
     // from that slot's stale recurrent state. The reset is a KV free + one state memset.
-    reset_stream(stream);
-    request_start();
+    // [AI_PREFIX_REUSE] the last boundary inside the prompt's common prefix with the slot's cached prompt
+    const int64_t pfx_at = pfx_on() && !mm_.pos4 && !df2_on()
+                         ? pfx_resume(stream, prompt.data(), (int64_t) prompt.size(), (int64_t) prompt.size() - 1) : 0;
+    if (pfx_at > 0) {
+        pfx_continue(stream, pfx_at);
+    } else {
+        reset_stream(stream);
+        request_start();
+        if ((size_t) stream < pfx_.size()) pfx_[(size_t) stream] = PfxCache{};
+    }
     Stream & s = streams_[(size_t) stream];
     if (mm_.pos4) {   // image input: this prefill's rows carry explicit RoPE positions; later rows run at cell + delta
         const int64_t n = (int64_t) prompt.size();
@@ -1388,9 +1525,11 @@ int32_t Engine::prefill_stream(int stream, const std::vector<int32_t> & prompt, 
     if (df2_on()) {
         prefill_df2(stream, prompt, s);
     } else if (cfg_.mtp_k > 0) {
-        prefill_mtp(stream, prompt, s);
+        int64_t off = pfx_at;
+        prefill_mtp_range(stream, prompt, off, true, s);
     } else {
-        s.pend = prefill(stream, prompt);
+        int64_t off = pfx_at;
+        s.pend = prefill_range(stream, prompt, off, true);
     }
     s.pos  = (int64_t) prompt.size();
     prog_.set_pos_override(stream, nullptr, 0);   // the caller's arrays are not ours past this call
@@ -1561,6 +1700,9 @@ int32_t Engine::prefill_range(int stream, const std::vector<int32_t> & prompt, i
             break;
         }
         const bool    last = off + T == n;
+        if (off > 0 && pfx_on() && !mm_.pos4 && (off % std::max<int64_t>(cfg_.chunk, 8192 / cfg_.chunk * cfg_.chunk) == 0 || last)) {
+            pfx_capture(stream, prompt, off);   // [AI_PREFIX_REUSE] the state through `off`, before this chunk
+        }
         dev_.ws_reset(0);
         auto in = stage_chunk(stream, prompt.data() + off, T, off, prog_.visible_cells(off, T));
         mm_attach(in, off, T);

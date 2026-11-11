@@ -864,7 +864,10 @@ static const alpha_ai_validated k_ai_validated[] = {
       // speed mode: the DFlash2 drafter as a router plus n-gram lookup K128. The exact default is AI_WIDE_EXACT on a
       // batch-invariant library (AI_BI_FORK=ON), which the library enables by itself for dense exact rows.
       "AI_DF2_ROUTE=1 AI_DF2_HOST=1 AI_LOOKUP=1 AI_LOOKUP_ARM=8 AI_LOOKUP_NMIN=4 AI_LOOKUP_K=128 AI_GRAPH_MAX=32", 1,
-      nullptr, nullptr, nullptr, "Qwen3.8-27B-UD-Q4_K_M (RTX 3090)" },
+      // pin q4_0 as the 35B row does: auto picks the KV type from the VRAM left after MTP, so plain (MTP off) took a
+      // finer type than exact -- exact == plain 4/8 at a 32K context (8/8 pinned), and at the row's own context the
+      // plain engine left 48 MiB free and refused to start (RTX 3090, 2026-11-11)
+      "q4_0", nullptr, nullptr, "Qwen3.8-27B-UD-Q4_K_M (RTX 3090)" },
     // RTX 5090 (sm_120, libalphainfer built for sm_120a).
     { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 12, 0, 2, 98304, "exact", 3, nullptr,
       nullptr, 0, nullptr, nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 5090)" },
@@ -3058,6 +3061,9 @@ int main(int argc, char ** argv) {
         local_srv->init_scheduler_only(vocab, n_slots);
         // prompts must reach the engine whole: no slot prefix reuse (AlphaInfer prefills the full prompt itself)
         local_srv->disable_slot_prefix_match();
+        // but a conversation's next turn goes to the slot holding its previous prompt: the engine resumes it there
+        // (AI_PREFIX_REUSE; AI_PREFIX_REUSE=0 turns both off)
+        if (!getenv("AI_PREFIX_REUSE") || atoi(getenv("AI_PREFIX_REUSE")) != 0) local_srv->set_slot_affinity(true);
         // the adapter buffers prompt chunks anyway; large chunks just mean fewer scheduler round trips
         alphaserve::g_serve_n_batch = 8192;
         // ...and the prompt goes to the engine whole: the slot chunk would default to n_ubatch (a llama.cpp

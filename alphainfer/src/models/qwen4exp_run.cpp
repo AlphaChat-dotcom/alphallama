@@ -293,6 +293,77 @@ void Qwen4ExpRun::checkpoint() {
     cks_.push_back(std::move(c));
 }
 
+std::vector<std::pair<const Tensor *, size_t>> Qwen4ExpRun::conv_tensors(int64_t len) const {
+    std::vector<std::pair<const Tensor *, size_t>> v;
+    const auto & layers = prog_.layers();
+    auto rows = [&](const Tensor & t, int64_t n) {   // the first n columns of a contiguous [w, cells] tensor
+        if (!t.valid()) return;
+        n = std::min<int64_t>(n, t.ne[1]);
+        v.push_back({ &t, (size_t) n * t.nb[1] });
+    };
+    for (size_t il = 0; il < layers.size(); ++il) {
+        if (!layers[il].attn) continue;
+        rows(kv_[il].k, len);
+        rows(kv_[il].v, len);
+        rows(qsa_[il].keys, len);
+        if (layers[il].qsa_p.ratio > 0) rows(qsa_[il].pooled, len / layers[il].qsa_p.ratio + 1);
+    }
+    if (mtp_on_) { rows(mtp_kv_.k, len); rows(mtp_kv_.v, len); }
+    return v;
+}
+
+size_t Qwen4ExpRun::Conversation::bytes() const {
+    size_t b = hist.size() * 4;
+    for (const auto & r : rows) b += r.size();
+    for (const auto & c : ck_buf) for (const auto & x : c) b += x.size();
+    return b;
+}
+
+bool Qwen4ExpRun::conv_save(Conversation & c) {
+    const int64_t len = (int64_t) hist_.size();
+    if (len <= 0) return false;
+    if (checkpoint_len() != len) checkpoint();   // the state at the end (decode rounds moved it past the prompt's point)
+    fold_join(true);
+    dev_.synchronize();
+    c.hist = hist_;
+    const auto ts = conv_tensors(len);
+    c.rows.assign(ts.size(), {});
+    for (size_t i = 0; i < ts.size(); ++i) {
+        c.rows[i].resize(ts[i].second);
+        dev_.download(*ts[i].first, c.rows[i].data(), 0, ts[i].second);
+    }
+    c.ck_buf.clear(); c.ck_len.clear(); c.ck_p0.clear(); c.ck_m.clear();
+    for (const Ckpt & k : cks_) {
+        c.ck_buf.push_back(k.buf);
+        c.ck_len.push_back(k.len);
+        c.ck_p0.push_back(k.fill_p0);
+        c.ck_m.push_back(k.fill_m);
+    }
+    return true;
+}
+
+bool Qwen4ExpRun::conv_restore(const Conversation & c) {
+    const int64_t len = (int64_t) c.hist.size();
+    if (len <= 0 || len > max_ctx_ || c.ck_len.empty() || c.ck_len.back() != len) return false;
+    fold_join(true);
+    ple_gate_idle();
+    dev_.synchronize();
+    const auto ts = conv_tensors(len);
+    if (ts.size() != c.rows.size()) return false;
+    for (size_t i = 0; i < ts.size(); ++i) {
+        if (c.rows[i].size() != ts[i].second) return false;
+        dev_.upload(*ts[i].first, c.rows[i].data(), 0, ts[i].second);
+    }
+    hist_ = c.hist;
+    cks_.clear();
+    for (size_t i = 0; i < c.ck_len.size(); ++i) {
+        Ckpt k;
+        k.len = c.ck_len[i]; k.fill_p0 = c.ck_p0[i]; k.fill_m = c.ck_m[i]; k.buf = c.ck_buf[i];
+        cks_.push_back(std::move(k));
+    }
+    return restore_checkpoint(len);   // the recurrent state at the end; lands the uploads too (it synchronizes)
+}
+
 int64_t Qwen4ExpRun::checkpoint_at_most(int64_t max_len) const {
     int64_t best = -1;
     for (const Ckpt & c : cks_)

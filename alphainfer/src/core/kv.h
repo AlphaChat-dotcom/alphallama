@@ -59,6 +59,8 @@ public:
     Tensor conv(int layer, int slot, int n = 1) const;   // f32 [(K-1)*C, n]
     Tensor ssm(int layer, int slot, int n = 1) const;    // f32 [Sv*Sv*Hv, n]
     int    n_slots() const { return n_slots_; }
+    int    n_layers() const { return (int) conv_.size(); }
+    size_t slot_bytes() const { return (size_t) (conv_n_ + ssm_n_) * 4 * conv_.size(); }   // one slot's state, all layers
 
 private:
     int                 n_slots_ = 0;

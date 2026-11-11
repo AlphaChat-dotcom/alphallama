@@ -84,6 +84,22 @@ bool ai_gpu_engine::init(const ai_engine_params & params,
         fprintf(stderr, "[ai-engine] REFUSING TO SERVE: %s\n", last_error_.c_str());
         return false;
     }
+    // A first start with no workspace measurement for this configuration runs in BOOTSTRAP: the context is clamped
+    // (RTX 3090 35B: 12288 of 49152 cells per stream) while the workspace is measured in place, and the measurement
+    // is saved for later starts. Serving from it failed every prompt above the clamp ("sequence longer than its
+    // region") although the server announced the full context. The library says not to serve from a bootstrap engine:
+    // create it once more, now sized from the saved measurement.
+    if (ai_engine_calibration_state(eng_) == 2) {
+        fprintf(stderr, "[ai-engine] first start: the workspace was measured (context clamped to %lld cells/stream "
+                        "meanwhile); starting the engine again with the full context\n", (long long) ai_engine_ctx_cells(eng_));
+        ai_engine_destroy(eng_);
+        eng_ = ai_engine_create(&params, &err);
+        if (!eng_) {
+            last_error_ = std::string("ai_engine_create (after the workspace measurement) failed: ") + (err ? err : "(no message)");
+            fprintf(stderr, "[ai-engine] REFUSING TO SERVE: %s\n", last_error_.c_str());
+            return false;
+        }
+    }
 
     // AI_HOST_EMBD frees VRAM and is bit-identical, but is incompatible with MTP. The engine has
     // its own guard, but it is shadowed by an earlier has_mtp() check on current models and so

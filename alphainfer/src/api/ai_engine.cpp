@@ -287,7 +287,8 @@ int64_t ai_engine_prompt_cached(const ai_engine * e, int stream_id) {
 #ifdef AI_Q4X_FORWARD
     if (e->q4x) { return stream_id == 0 ? e->q4x->reused_tokens() : 0; }   // Flash-Next: AI_Q4X_PREFIX_REUSE
 #endif
-    return 0;   // the hybrid engine prefills every prompt whole (no prefix reuse)
+    try { return e->engine.stream_count() > stream_id ? e->engine.prompt_cached(stream_id) : 0; }   // AI_PREFIX_REUSE
+    catch (...) { return 0; }
 }
 
 int ai_engine_supports_sampling(const ai_engine * e) {

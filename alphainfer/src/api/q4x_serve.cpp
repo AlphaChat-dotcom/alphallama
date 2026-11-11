@@ -12,6 +12,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <list>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +84,8 @@ std::string find_sidecar(const std::string & model) {
 }  // namespace
 
 struct Q4xServe::Impl {
+    // [AI_Q4X_CONV_CACHE] conversations saved to host memory, most recently used first
+    std::list<Qwen4ExpRun::Conversation> convs;
     Device                       dev;
     Qwen4Exp                     prog;
     std::unique_ptr<Qwen4ExpRun> run;
@@ -436,6 +439,73 @@ int32_t Q4xServe::prefill(const int32_t * tokens, int n) {
     static const bool ck_mid = reuse && env_int("AI_Q4X_PREFIX_CKPT", 1) != 0;
     m.run->checkpoint_mid(ck_mid);
     int64_t           start = 0;
+    // [AI_Q4X_CONV_CACHE, default 2 saved conversations; 0 = off] more than one conversation's cache. One engine holds one
+    // conversation's state, so a request from another conversation (an agent's overseer between worker turns, a side
+    // request, another client) used to reset it and the next worker turn re-read its whole history (5090 2.0.5: ~116K
+    // tokens, ~43 s, 39 of 50 turns of one agent session). Now, before the current conversation is reset or replaced,
+    // it is saved to host memory -- history, resume points, and the KV / indexer / MTP-head rows of its positions -- if it
+    // is at least AI_Q4X_CONV_MIN (4096) tokens long; and when a saved conversation offers a resume point at least
+    // 1024 tokens further into the new prompt than the current one, it is restored instead of prefilling. Matching is
+    // by token prefix only (no conversation id). Host memory: at most AI_Q4X_CONV_CACHE_MB (8192), oldest dropped first.
+    static const int     conv_max = (int) env_int("AI_Q4X_CONV_CACHE", 2);
+    static const int64_t conv_min = env_int("AI_Q4X_CONV_MIN", 4096);
+    static const size_t  conv_cap = (size_t) env_int("AI_Q4X_CONV_CACHE_MB", 8192) << 20;
+    if (reuse && conv_max > 0) {
+        auto lcp = [&](const std::vector<int32_t> & h) {
+            int64_t c = 0;
+            while (c < (int64_t) h.size() && c < n && h[(size_t) c] == tokens[c]) ++c;
+            return c;
+        };
+        auto save_current = [&]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            Qwen4ExpRun::Conversation c;
+            if (!m.run->conv_save(c)) return;
+            const size_t b = c.bytes();
+            if (b > conv_cap) return;
+            m.convs.push_front(std::move(c));
+            size_t total = 0;
+            for (auto it = m.convs.begin(); it != m.convs.end();) {
+                total += it->bytes();
+                const int idx = (int) std::distance(m.convs.begin(), it);
+                if (idx >= conv_max || total > conv_cap) { total -= it->bytes(); it = m.convs.erase(it); } else ++it;
+            }
+            fprintf(stderr, "[ai-api] q4x conversation saved: %zu tokens, %.0f MiB host, %.2f s (%zu saved)\n",
+                    m.convs.front().hist.size(), b / 1048576.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), m.convs.size());
+        };
+        const std::vector<int32_t> & h0 = m.run->history();
+        const int64_t hn0 = (int64_t) h0.size(), c0 = lcp(h0);
+        int64_t cur = 0;
+        if (hn0 > 0 && c0 == hn0 && n > hn0) cur = hn0;
+        else if (c0 == n && n == m.run->checkpoint_len()) cur = n;
+        else cur = std::max<int64_t>(0, m.run->checkpoint_at_most(std::min<int64_t>(c0, (int64_t) n - 1)));
+        auto    best = m.convs.end();
+        int64_t best_at = 0;
+        for (auto it = m.convs.begin(); it != m.convs.end(); ++it) {
+            const int64_t len = (int64_t) it->hist.size(), c = lcp(it->hist);
+            int64_t at = 0;
+            if (c == len && n > len) at = len;
+            else for (int64_t L : it->ck_len) if (L <= std::min<int64_t>(c, (int64_t) n - 1)) at = std::max(at, L);
+            if (at > best_at) { best_at = at; best = it; }
+        }
+        if (best != m.convs.end() && best_at >= cur + 1024) {
+            const auto t0 = std::chrono::steady_clock::now();
+            Qwen4ExpRun::Conversation got = std::move(*best);
+            m.convs.erase(best);
+            if (hn0 >= conv_min) save_current();
+            if (m.run->conv_restore(got)) {
+                ck_first_ = -1;   // the regenerate shortcut's first token belonged to the conversation just saved
+                fprintf(stderr, "[ai-api] q4x conversation restored: %zu tokens, resume at %lld of %d, %.2f s\n",
+                        got.hist.size(), (long long) best_at, n,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            } else {
+                m.run->reset();
+                fprintf(stderr, "[ai-api] q4x conversation restore failed: prefilling from 0\n");
+            }
+        } else if (cur == 0 && hn0 >= conv_min) {
+            save_current();   // about to be reset below
+        }
+    }
     if (reuse) {
         const std::vector<int32_t> & h = m.run->history();
         const int64_t                hn = (int64_t) h.size();

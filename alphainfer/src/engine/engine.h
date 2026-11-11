@@ -161,6 +161,8 @@ public:
     // Reset one slot so the next request can reuse it. Must be followed by prefill_one before a step:
     // decode_step refuses a slot with fewer drafts than the round's k_in rather than staging garbage.
     void    reset_one(int stream);
+    // [AI_PREFIX_REUSE, default 1] prompt tokens the stream's last prefill took from its cache (0: none)
+    int64_t prompt_cached(int stream) const;
     // A new request is starting on a slot (called by the prefill paths after the slot reset). With one stream and
     // exact output (plain decode or the EXACT verify; AI_DOOR_RESET_PER_REQUEST=0|1 overrides), the doorbell offload
     // goes back to its initial residency, so the request's output does not depend on earlier requests (the CPU
@@ -293,7 +295,19 @@ private:
         std::vector<int32_t>                               lk_sh;
         int                                                lk_shi = 0, lk_run = 0, lk_miss = 0, lk_full = 0;
         bool                                               lk_armed = false;
+        // [AI_PREFIX_REUSE] chunked prefill: the tokens fed so far are still the stream's cached prompt, nothing run yet
+        bool                                               probe    = false;
     };
+    // [AI_PREFIX_REUSE] per stream: the last prompt and host copies of the slot's recurrent state at chunk boundaries
+    // inside it (the attention KV below a boundary is still the slot's, masked by position), so the next prompt that
+    // shares a prefix resumes from the last boundary inside it instead of from token 0
+    struct PfxSnap { int64_t at = 0; std::vector<char> buf; };
+    struct PfxCache { std::vector<int32_t> toks; std::vector<PfxSnap> snaps; int64_t cached = 0; };
+    std::vector<PfxCache> pfx_;
+    bool    pfx_on() const;
+    void    pfx_capture(int stream, const std::vector<int32_t> & prompt, int64_t at);
+    int64_t pfx_resume(int stream, const int32_t * p, int64_t n, int64_t limit) const;
+    void    pfx_continue(int stream, int64_t at);   // the slot holds the cached prompt through `at`; prefill from there
 
     void    reset_streams(int B);
     // Per-slot reset, so a caller-driven server can reuse a slot across requests. This cannot be

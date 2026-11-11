@@ -116,6 +116,9 @@ private:
 public:
     // Enable only for FlashInfer backend (ggml can't handle partial prefill)
     bool prefix_caching_enabled = false;
+    // the engine keeps each slot's prompt cache itself (AlphaInfer AI_PREFIX_REUSE): only the slot CHOICE prefers the
+    // idle slot whose last prompt shares the longest prefix; prompts still reach the engine whole
+    bool slot_affinity = false;
 
     // Disable slot-level prefix matching (M-RoPE models crash with partial KV reuse)
     void disable_slot_prefix_match() {

@@ -371,7 +371,7 @@ void scheduler::admit_new_requests() {
         // anywhere, take the least-recently-assigned idle slot (an empty slot first); first-idle would
         // always overwrite slot 0, so two alternating conversations would evict each other's cache every
         // turn. Changes only which idle slot is used, and only when prefix caching is on.
-        if (target && prefix_caching_enabled && slots_.size() > 1) {
+        if (target && (prefix_caching_enabled || slot_affinity) && slots_.size() > 1) {
             int best = 0;
             for (auto & s : slots_)
                 if (s.is_idle() && s.last_assign_seq < target->last_assign_seq) target = &s;
@@ -387,8 +387,25 @@ void scheduler::admit_new_requests() {
                     if (ck >= 4 && m >= ck && ck < (int)pt.size()) usable = ck;
                 } else {
                     usable = std::min(m, (int)pt.size() - 1);
+                    // slot affinity alone (the engine keeps the cache): a few shared tokens (a common opening line,
+                    // the chat template's header) are not a conversation -- below ALPHA_SLOT_AFFINITY_MIN (256) the
+                    // least-recently-assigned slot is taken, which leaves another conversation's slot alone (RTX 3090,
+                    // 35B, two alternating conversations: a 3-token match sent both to slot 0, and neither reused)
+                    static const int aff_min = getenv("ALPHA_SLOT_AFFINITY_MIN") ? atoi(getenv("ALPHA_SLOT_AFFINITY_MIN")) : 256;
+                    if (!prefix_caching_enabled && usable < aff_min) usable = 0;
                 }
                 if (usable > best) { best = usable; target = &s; }
+            }
+            // slot affinity alone, and no slot holds this prompt: of the idle slots take the one whose cached prompt
+            // is worth least (the shortest; least recently assigned among equals), so a one-off request does not
+            // evict a long conversation's cache (RTX 3090, two conversations + a 23-token side request on 2 slots:
+            // least-recently-assigned sent it to the 16.8K worker's slot, whose next turn then re-read 13 s)
+            if (best == 0 && slot_affinity && !prefix_caching_enabled) {
+                for (auto & s : slots_) {
+                    if (!s.is_idle()) continue;
+                    const size_t a = s.cached_prompt_tokens.size(), b = target->cached_prompt_tokens.size();
+                    if (a < b || (a == b && s.last_assign_seq < target->last_assign_seq)) target = &s;
+                }
             }
         }
 

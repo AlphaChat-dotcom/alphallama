@@ -76,6 +76,7 @@ public:
     int active_slots() const { return scheduler_.active_slots(); }
     void set_prefix_caching(bool enabled) { scheduler_.prefix_caching_enabled = enabled; }
     void disable_slot_prefix_match() { scheduler_.disable_slot_prefix_match(); }
+    void set_slot_affinity(bool on) { scheduler_.slot_affinity = on; }
     // ALPHA_HYBRID_PREFIX: checkpoint-based prefix reuse for hybrid/recurrent models
     void enable_hybrid_snapshot() { scheduler_.enable_hybrid_snapshot(); }
 

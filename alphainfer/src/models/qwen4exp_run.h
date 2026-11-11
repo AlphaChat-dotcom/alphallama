@@ -91,6 +91,19 @@ public:
     int64_t                      checkpoint_at_most(int64_t max_len) const;
     size_t                       checkpoint_count() const { return cks_.size(); }
     void                         checkpoint_mid(bool on) { ck_mid_ = on; }
+    // A whole conversation (history, resume points, and the KV / indexer / MTP-head rows of its positions) in host
+    // memory, so another conversation can use the engine and this one come back without being prefilled again.
+    struct Conversation {
+        std::vector<int32_t>           hist;
+        std::vector<std::vector<char>> rows;   // per saved tensor, its first rows (see conv_tensors)
+        std::vector<std::vector<std::vector<char>>> ck_buf;
+        std::vector<int64_t>           ck_len, ck_p0, ck_m;
+        size_t bytes() const;
+    };
+    // save the current conversation (a resume point at its end is taken first); false: nothing to save
+    bool                         conv_save(Conversation & c);
+    // make c the current conversation (its KV rows, resume points and history), resumed at its end
+    bool                         conv_restore(const Conversation & c);
     const std::vector<int32_t> & history() const { return hist_; }
 
     int64_t position() const { return (int64_t) hist_.size(); }
@@ -206,6 +219,8 @@ private:
         std::vector<std::vector<char>> buf;
     };
     std::vector<Ckpt>              cks_;   // ascending len, all inside hist_
+    // the position-indexed tensors of a conversation and their bytes for `len` positions
+    std::vector<std::pair<const Tensor *, size_t>> conv_tensors(int64_t len) const;
     bool                           ck_mid_ = false;
     // doorbell mode
     struct SlotBank {
