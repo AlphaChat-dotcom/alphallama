@@ -396,11 +396,15 @@ void scheduler::admit_new_requests() {
                 }
                 if (usable > best) { best = usable; target = &s; }
             }
-            // slot affinity alone, and no slot holds this prompt: of the idle slots take the one whose cached prompt
-            // is worth least (the shortest; least recently assigned among equals), so a one-off request does not
-            // evict a long conversation's cache (RTX 3090, two conversations + a 23-token side request on 2 slots:
-            // least-recently-assigned sent it to the 16.8K worker's slot, whose next turn then re-read 13 s)
-            if (best == 0 && slot_affinity && !prefix_caching_enabled) {
+            // slot affinity alone, and no slot holds this prompt. A short one-off request (under ALPHA_SLOT_SMALL, 1024
+            // tokens: a side question, a title or suggestion request) takes the idle slot whose cached prompt is worth
+            // least (the shortest, least recently assigned among equals), so it does not evict a long conversation's
+            // cache; anything longer is a conversation of its own and takes the least recently assigned slot (chosen
+            // above), so the most recent conversations keep theirs. RTX 3090, 2 slots, two conversations alternating plus
+            // a 23-token side request: least-recently-assigned for everything sent the side request onto the worker;
+            // smallest-cache for everything sent the overseer onto the worker (the newest, shorter cache) -- no reuse.
+            static const size_t small = getenv("ALPHA_SLOT_SMALL") ? (size_t) atoi(getenv("ALPHA_SLOT_SMALL")) : 1024;
+            if (best == 0 && slot_affinity && !prefix_caching_enabled && pt.size() < small) {
                 for (auto & s : slots_) {
                     if (!s.is_idle()) continue;
                     const size_t a = s.cached_prompt_tokens.size(), b = target->cached_prompt_tokens.size();
