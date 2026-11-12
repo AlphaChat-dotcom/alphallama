@@ -203,6 +203,11 @@ int ai_engine_decode_mtp(ai_engine * e,
                          const int32_t * tokens, const int32_t * positions,
                          const int32_t * seq_ids, int n_tokens,
                          int32_t * out_tokens, int32_t * out_seq_ids, int out_capacity, int * out_n);
+// Cap the NEXT ai_engine_decode_mtp round at max_tokens emitted tokens per stream (>= 1; 0 clears it). One round
+// only. A round's accepted drafts are decoded, so a caller that must choose a stream's following tokens itself (a
+// forced sequence such as a reasoning-budget close, the last tokens before max_tokens, the context edge) caps the
+// round first: at 1 the round emits exactly the pending token's successor, which the caller may then replace.
+int ai_engine_set_round_cap(ai_engine * e, int max_tokens);
 
 // Reset one slot so the next request can reuse it: frees that stream's KV region and zeroes its
 // recurrent state. Other slots are untouched -- KV regions are a static partition, so a slot's cells

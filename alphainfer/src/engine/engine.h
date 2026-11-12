@@ -158,6 +158,8 @@ public:
     // of scope until positions are authoritative.
     void    decode_step(const std::vector<DecodeIn> & in, std::vector<std::pair<int, int32_t>> & out,
                         Timing & tm);
+    // [round cap] the NEXT decode round emits at most n tokens per stream (n >= 1; 0 = no cap). One round only.
+    void    set_round_cap(int n) { round_cap_ = n; }
     // Reset one slot so the next request can reuse it. Must be followed by prefill_one before a step:
     // decode_step refuses a slot with fewer drafts than the round's k_in rather than staging garbage.
     void    reset_one(int stream);
@@ -221,6 +223,12 @@ private:
     bool        ws_bootstrap_   = false;   // derived workspace did not fit: running on the remainder to calibrate
     bool        ws_calibrated_now_ = false;   // this create ran the calibration (a bootstrap or a recalibration)
     int64_t     ws_cal_region_  = 0;       // envelope (cells per stream) the cached peak was measured up to
+    // Round fit on a fixed workspace (--ws-mib / ALPHA_AI_WS_MIB, which skip the calibration): the widest verify
+    // width k_in whose round fits at each envelope F, measured at init by recording rounds without launching them.
+    // decode_round narrows a round to it. Empty = no limit (calibrated workspace, or every width fits).
+    void        ws_fit_rounds();
+    int         ws_fit_k(int64_t F) const;
+    std::vector<std::pair<int64_t, int>> ws_fit_;   // (F, widest k_in that fits; -1 = none)
 
     // Fixed device ingress with pinned mirrors. A round of B streams x L rows uses a prefix.
     struct Ingress {
@@ -392,6 +400,7 @@ private:
     // on every call.
     std::vector<Stream>  streams_;
     int                  k_in_      = 0;
+    int                  round_cap_ = 0;   // set_round_cap: tokens per stream the next round may emit (0 = no cap)
     bool                 in_decode_ = false;
     std::vector<int32_t> vt_;        // scratch: pending token + k_in drafts
     std::vector<int>     acc_now_;   // scratch: per-round accept counts

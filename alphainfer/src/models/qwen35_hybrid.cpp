@@ -1916,6 +1916,17 @@ Tensor Qwen35Hybrid::forward(Device & dev, const Inputs & in, bool all_logits, G
         // layer's input copy) stay, as in an unscoped pass; a blanket clear would make those consumers quantise for
         // themselves, which is not bit-identical.
         drop_staged(mark);
+        // The merge kernel writes the next layer's norm (pre_normed) into norm_out_ only when that buffer holds the
+        // round; it is sized for decode rows, so a prefill chunk's pre_normed was carved in [mark, ...) -- the range
+        // just rolled back. Reusing it was a use-after-free: the next layer's mix slot and GDN intermediates landed on
+        // top of it while its projections still read it, so the leading rows of every later layer took garbage input
+        // (27B, a 56-token prompt: rows 0..14 of 40 of the 48 GDN layers; output diverged from llama.cpp until the
+        // prompt was long enough). Recompute the norm from the carry instead.
+        if (pre_normed.valid() && dev.ws_base() != nullptr) {
+            const char * lo = (const char *) dev.ws_base() + mark;
+            const char * hi = (const char *) dev.ws_base() + dev.ws_capacity();
+            if ((const char *) pre_normed.data >= lo && (const char *) pre_normed.data < hi) pre_normed = Tensor{};
+        }
         cur = dst;
     }
     if (taps_.valid() && taps_rows_ > 0) {   // AI_TAPS + AI_DUMP_DIR: the tap buffer, for tools that check it

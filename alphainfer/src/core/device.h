@@ -53,6 +53,10 @@ public:
     void         ws_tag(const char * t) { ws_tag_ = t; }
     const char * ws_high_tag() const { return ws_high_tag_.c_str(); }
     size_t ws_capacity() const { return ws_cap_; }
+    // Measure mode (the engine's round-fit probe): allocations past the capacity do not abort; they are counted in
+    // ws_need() and alias the start of the workspace. Only for a round that is recorded and never launched.
+    void   ws_measure(bool on) { ws_measure_ = on; ws_need_ = 0; }
+    size_t ws_need() const { return ws_need_; }
     void * ws_base() const { return ws_buf_ >= 0 ? (char *) buffer_base(ws_buf_) + ws_base_off_ : nullptr; }
     // Prefill slot lending: the workspace becomes `cap` bytes of buffer `buf` from byte `off` (borrowed device memory)
     // until ws_restore(), which puts the normal workspace back with its offset and high-water mark untouched (the
@@ -111,6 +115,8 @@ private:
     size_t ws_cap_  = 0;
     size_t ws_off_  = 0;
     size_t ws_high_ = 0;
+    bool   ws_measure_ = false;
+    size_t ws_need_    = 0;
     size_t ws_base_off_ = 0;   // ws_redirect: the borrowed range's start within ws_buf_
     struct WsSaved { int buf = -1; size_t cap = 0, off = 0, high = 0, base_off = 0; std::string high_tag; } ws_saved_;
     const char * ws_tag_ = "";

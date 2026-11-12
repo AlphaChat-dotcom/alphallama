@@ -414,6 +414,7 @@ bool ai_gpu_engine::process_one() {
     std::vector<int> prefill_done;                    // streams whose final prompt chunk is in this batch
     std::map<int, size_t> chunk_from;                 // chunked prefill: stream -> first prompt_ index of this batch's chunk
     const int n = (int) req.tokens.size();
+    int round_cap_ = 0x7fffffff;   // the smallest samp_n_left over this batch's decoding streams
     for (int i = 0; i < n; ++i) {
         const int s = i < (int) req.seq_ids.size() ? req.seq_ids[i] : 0;
         if (s < 0 || s >= n_streams_) {
@@ -429,6 +430,9 @@ bool ai_gpu_engine::process_one() {
                 fail_batch(req, res); out_->try_push(std::move(res)); return true;
             }
             dec[s] = { (int32_t) req.tokens[i], (int32_t) req.positions[i] };
+            // the scheduler's limit on this slot's step (max_tokens, the context edge, a reasoning budget, a forced
+            // close going one token per step): a round is batch-rigid, so it takes the smallest
+            if (i < (int) req.samp_n_left.size()) round_cap_ = std::min(round_cap_, (int) req.samp_n_left[i]);
             continue;
         }
         if ((int) req.positions[i] != (int) prompt_[s].size()) {
@@ -506,6 +510,9 @@ bool ai_gpu_engine::process_one() {
         int out_n = 0;
         int rc;
         if (mtp_k_ > 0) {
+            // without the cap a round commits up to K + 1 tokens between two forced tokens: the reasoning-budget close
+            // landed inside the answer ("```python\ndef" + "\n\n" + "def count_nums(", HumanEval on the 4080, 2026-11-11)
+            if (round_cap_ < mtp_k_ + 1 && !getenv("ALPHA_AI_NO_ROUND_CAP")) ai_engine_set_round_cap(eng_, std::max(1, round_cap_));
             rc = ai_engine_decode_mtp(eng_, toks.data(), pos.data(), seqs.data(), (int) toks.size(),
                                       out_tok.data(), out_seq.data(), max_round_tokens_, &out_n);
         } else {

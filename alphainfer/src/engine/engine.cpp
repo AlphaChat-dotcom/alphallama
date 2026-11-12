@@ -644,6 +644,135 @@ void Engine::ws_auto_calibrate() {
     }
 }
 
+// A fixed workspace (--ws-mib / ALPHA_AI_WS_MIB) skips the calibration, so nothing checks that a deep, wide round fits
+// it; one that does not aborts the process mid-request (27B on the RTX 4080: a lookup round near the 8192-cell edge
+// of a 640 MiB workspace). Here every round width decode_round can take is recorded -- not launched -- at every
+// envelope F with the workspace in measure mode, and the widest width that fits at each F is kept. decode_round
+// narrows a round to it, so a fixed workspace costs draft width at depth instead of the process.
+// AI_WS_FIT=0 turns the probe off; AI_WS_FIT_MARGIN_MB (default 16) is held back for what a live round adds.
+void Engine::ws_fit_rounds() {
+    ws_fit_.clear();
+    const int K = std::max(0, cfg_.mtp_k);
+    if (K == 0 || (getenv("AI_WS_FIT") && atoi(getenv("AI_WS_FIT")) == 0)) return;
+    static const size_t margin = (size_t) (getenv("AI_WS_FIT_MARGIN_MB") ? atol(getenv("AI_WS_FIT_MARGIN_MB")) : 16) << 20;
+    const size_t  cap = dev_.ws_capacity();
+    const int64_t B   = cfg_.max_batch;
+    const int64_t R   = prog_.kv().region_cells();
+    // the widths a round can take (as warm_mtp_profiles): the drafter's 0..kc, plus the AI_LOOKUP buckets up to K
+    const int kc   = df2_ ? std::min(K, (int) df2_->block_size() - 1) : chain_cap(K);
+    std::vector<int> ks;
+    for (int k = 0; k <= kc; ++k) ks.push_back(k);
+    if (lookup_cfg().on && !cfg_.exact_verify) {
+        for (int b : { 8, 16, 32, 64, 128 }) {
+            const int w = std::min(b, K);
+            if (w > kc && std::find(ks.begin(), ks.end(), w) == ks.end()) ks.push_back(w);
+        }
+    }
+    std::vector<int32_t> zeros((size_t) K + 1, 0);
+    auto need = [&](int64_t F, int k) {
+        const int64_t L = k + 1, T = L * B;
+        for (int b = 0; b < B; ++b) {
+            stage_rows(main_in_, b, b * L, T, zeros.data(), L, 0, F, false);
+            if (!df2_) stage_rows(head_in_, b, b * L, T, nullptr, L, 1, F, true);
+        }
+        main_in_.upload(dev_, L, B, F);
+        const auto vin = main_in_.view(L, B, F, 0);
+        Qwen35Hybrid::Inputs hin;
+        if (!df2_) {
+            head_in_.upload(dev_, L, B, F);
+            hin = head_in_.view(L, B, F, 0);
+        }
+        kern::q8_stage_clear();
+        dev_.ws_reset(0);
+        dev_.ws_measure(true);
+        {
+            op::Round r(dev_);
+            r.begin();
+            if (df2_) build_df2(vin);
+            else build_mtp(vin, hin, kc);
+            r.end();   // recorded only: past the capacity its pointers alias, so it must never launch
+        }
+        const size_t n = dev_.ws_need();
+        dev_.ws_measure(false);
+        dev_.ws_reset(0);
+        kern::q8_stage_clear();
+        return n;
+    };
+    // A round that step_round runs eagerly (AI_FFN_CPU wider than its t_max, streamed experts that do not fit the
+    // slots) launches as it builds, so it cannot be probed: its need is extrapolated linearly in the width from the
+    // two widest recordable widths at the same F (a round's workspace grows with its rows).
+    auto eager = [&](int k) {
+        const int64_t rows = B * (k + 1);
+        return (cfg_.expert_slots > 0 && !prog_.streamed_fixed_ok(rows)) ||
+               (prog_.cpu_ffn_tmax() > 0 && rows > prog_.cpu_ffn_tmax());
+    };
+    if (cfg_.eager) return;   // every round eager: nothing to record
+    const auto t0 = std::chrono::steady_clock::now();
+    bool narrowed = false, estimated = false;
+    size_t worst = 0;
+    for (int b = 0; b < B; ++b) prog_.kv().new_seq_at(b);   // staging reserves cells on an open region; freed below
+    try {
+        for (int64_t f = 256;; f *= 2) {
+            const int64_t F = std::min(f, R);
+            std::vector<double> n(ks.size(), -1.0);
+            int a = -1, b = -1;   // the two widest recordable widths (indices into ks)
+            for (size_t i = 0; i < ks.size(); ++i) {
+                if (eager(ks[i])) continue;
+                n[i] = (double) need(F, ks[i]);
+                a = b;
+                b = (int) i;
+            }
+            for (size_t i = 0; i < ks.size(); ++i) {
+                if (n[i] >= 0) continue;
+                estimated = true;
+                n[i] = a >= 0 ? n[(size_t) b] + (n[(size_t) b] - n[(size_t) a]) / (ks[(size_t) b] - ks[(size_t) a]) * (ks[i] - ks[(size_t) b])
+                              : 1e30;   // nothing to extrapolate from: treat as not fitting
+            }
+            int fit = -1;
+            for (size_t i = 0; i < ks.size(); ++i) {
+                if (n[i] + (double) margin <= (double) cap) fit = ks[i];
+                else break;   // wider rounds need at least as much
+            }
+            worst = std::max(worst, (size_t) std::min(n.back(), 1e15));
+            if (fit < ks.back()) narrowed = true;
+            ws_fit_.emplace_back(F, fit);
+            if (f >= R) break;
+        }
+    } catch (const std::exception & e) {   // the probe must never stop a start: serve as before, with the abort guard
+        dev_.ws_measure(false);
+        dev_.ws_reset(0);
+        kern::q8_stage_clear();
+        ws_fit_.clear();
+        prog_.kv().free_all();
+        fprintf(stderr, "[ai] ws fit: probe failed (%s) -- no round narrowing on this start\n", e.what());
+        return;
+    }
+    prog_.kv().free_all();   // nothing launched: no cell or recurrent state was written, the engine is as fresh as before
+    dev_.synchronize();
+    if (!narrowed) {
+        ws_fit_.clear();
+        if (cfg_.verbose) {
+            fprintf(stderr, "[ai] ws fit: every round fits the fixed %.0f MiB workspace (widest %.1f MiB + %zu MiB margin%s)\n",
+                    cap / 1048576.0, worst / 1048576.0, margin >> 20, estimated ? "; eager widths extrapolated" : "");
+        }
+        return;
+    }
+    std::string s;
+    for (const auto & [F, k] : ws_fit_) s += " F=" + std::to_string(F) + ":" + (k < 0 ? std::string("none") : std::to_string(k));
+    fprintf(stderr, "[ai] ws fit: the fixed %.0f MiB workspace does not hold the widest round (%.1f MiB + %zu MiB margin) "
+                    "at every depth -> widest verify per envelope:%s (probe %.2f s%s)%s\n",
+            cap / 1048576.0, worst / 1048576.0, margin >> 20, s.c_str(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+            estimated ? "; eager widths extrapolated" : "", ws_fit_.back().second < 0 ? " -- NOT EVEN A 1-ROW ROUND FITS AT THE DEEPEST ENVELOPE: raise --ws-mib or lower --ctx" : "");
+}
+
+int Engine::ws_fit_k(int64_t F) const {
+    for (const auto & [f, k] : ws_fit_) {
+        if (f >= F) return k;
+    }
+    return ws_fit_.empty() ? 1 << 30 : ws_fit_.back().second;
+}
+
 bool Engine::init(const EngineConfig & cfg) {
     cfg_ = cfg;
     // AI_CAPTURE = own (default) | backend | none
@@ -895,6 +1024,8 @@ bool Engine::init(const EngineConfig & cfg) {
     if (ws_cal_pending_) {
         ws_auto_calibrate();
         ws_calibrated_now_ = true;
+    } else if (ws_key_.empty() && cfg_.ws_bytes != 0) {
+        ws_fit_rounds();   // a fixed workspace: no calibration covers the deep, wide rounds
     }
     // Only on a start whose workspace is a measurement (the cached calibration, or a fixed --ws-mib): the lent chunk
     // size is derived from it, and the chunk boundaries -- so the output -- must not depend on whether this start
@@ -1930,16 +2061,33 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
             k_cap = std::max(0, 4 / B - 1);
             k_in  = std::min(k_in, k_cap);
         }
+        // [round cap] the caller's limit on this round's tokens per stream (ai_engine_set_round_cap: a forced token
+        // sequence, a reasoning budget, max_tokens, the context edge). A round emits its accepted drafts + 1, and
+        // accepted drafts are decoded -- the caller cannot replace them -- so the round verifies at most cap - 1.
+        if (mtp && round_cap_ > 0 && k_in > round_cap_ - 1) {
+            k_in = round_cap_ - 1;
+            for (Stream & s : st) s.lk_k = 0;   // a cut lookup round is not scored as a lookup miss
+        }
+        round_cap_ = 0;
         // the MTP chain drafts at most chain_cap(K) (<= 8, AI_MTP_CHAIN lower) while K stays the widest verify
         const int  kc_d  = df2_on() ? std::min(K, (int) df2_->block_size() - 1) : chain_cap(K);   // DFlash2: its full block
         // (not the MTP chain cap, which AI_DF2_ROUTE may set below the DFlash2 block)
         const int  k_out = mtp ? std::max(1, std::min(std::min(k_cap, kc_d),
                                                       cfg_.mtp_adapt ? choose_k(k_in) : K)) : 0;
-        const int64_t L  = k_in + 1;
         int64_t maxpos = 0;
         for (const auto & s : st) {
             maxpos = std::max(maxpos, s.pos);
         }
+        // [ws fit] a fixed workspace that does not hold this round at this depth: verify fewer drafts (ws_fit_rounds;
+        // the narrower round's envelope is no larger, so the width found at this one still fits it)
+        if (mtp && !ws_fit_.empty()) {
+            const int kf = ws_fit_k(frontier(maxpos + k_in + 1 + k_out + 2));
+            if (k_in > kf) {
+                k_in = std::max(0, kf);
+                for (Stream & s : st) s.lk_k = 0;   // a cut lookup round is not scored as a lookup miss
+            }
+        }
+        const int64_t L  = k_in + 1;
         const int64_t F = frontier(maxpos + L + k_out + 2);
         const int64_t T = L * B;
 

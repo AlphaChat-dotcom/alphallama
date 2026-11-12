@@ -162,6 +162,7 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int spl
 // ended in the middle of the thinking with no answer. Same rule as Strata 0.2.8's answer_room.
 static int         g_reasoning_budget = -1;
 static bool        g_answer_room = true;
+static bool        g_speed_drafter_missing = false;   // ALPHA_SPEED_MODE on a row whose speed drafter file is absent
 static std::string g_reasoning_budget_msg = "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n";
 template <typename J>
 static void alpha_reasoning_budget(const J & body, const std::string & prompt, const llama_vocab * vocab,
@@ -176,16 +177,21 @@ static void alpha_reasoning_budget(const J & body, const std::string & prompt, c
     };
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) pick(body["chat_template_kwargs"]);
     pick(body);
-    if (budget < 0 && g_answer_room && ireq.max_tokens >= 1024) {
+    // template-opened thinking: the generation prompt ends with "<think>" (a model that writes <think> itself is
+    // detected when it does)
+    const size_t o = prompt.rfind("<think>"), c = prompt.rfind("</think>");
+    const bool   open = o != std::string::npos && (c == std::string::npos || c < o) && prompt.size() - o <= 16;
+    // the answer room only for a request whose template opened thinking: with thinking off (the template closed the
+    // block, or none) a model that still writes <think> itself was force-closed at the room's budget, mid-answer
+    // (RTX 4080 27B HumanEval, max_tokens 1024: 5 of 164 code replies cut at 512 and broken). An explicit
+    // reasoning_budget / --reasoning-budget still applies to every request.
+    if (budget < 0 && g_answer_room && open && ireq.max_tokens >= 1024) {
         const int m = ireq.max_tokens;
         budget = m - std::min(std::max(512, m / 4), m / 2);
     }
     if (budget < 0) return;
     ireq.reasoning_budget = budget;
-    // template-opened thinking: the generation prompt ends with "<think>" (a model that writes <think> itself is
-    // detected when it does)
-    const size_t o = prompt.rfind("<think>"), c = prompt.rfind("</think>");
-    ireq.think_open = o != std::string::npos && (c == std::string::npos || c < o) && prompt.size() - o <= 16;
+    ireq.think_open = open;
     ireq.think_close = common_tokenize(vocab, msg + "</think>\n\n", false, true);
 }
 
@@ -1355,6 +1361,9 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--reasoning-budget") == 0 && i + 1 < argc) {
             g_reasoning_budget = atoi(argv[++i]);
         }
+        else if (strcmp(argv[i], "--decode-mode") == 0 && i + 1 < argc) {   // fast (default) | exact | plain
+            setenv("ALPHA_DECODE_MODE", argv[++i], 1);
+        }
         else if (strcmp(argv[i], "--reasoning-budget-message") == 0 && i + 1 < argc) {
             g_reasoning_budget_msg = argv[++i];
         }
@@ -1534,6 +1543,24 @@ int main(int argc, char ** argv) {
         mode = MODE_ALPHAINFER;
         if (!np_explicit)  n_slots = air->n_streams;   // the validated shape for this model
         if (!ctx_explicit) n_ctx   = air->ctx_total;
+        // Decode mode (--decode-mode / ALPHA_DECODE_MODE): fast (the default since 2.0.9: multi-token prediction with fast
+        // verify at the row's own MTP depth and shape -- not token-identical to plain greedy), exact (MTP whose output
+        // is token-identical to plain greedy; the default of the exact rows before 2.0.9) or plain (no MTP). An explicit
+        // AI_MTP_MODE / ALPHA_AI_MTP_K still wins; ALPHA_SPEED_MODE=1 adds the row's best-speed tuning on top of fast.
+        {
+            const char *      dm   = getenv("ALPHA_DECODE_MODE");
+            const std::string mode_s = dm && *dm ? dm : "fast";
+            if (mode_s == "plain") {
+                setenv("ALPHA_AI_MTP_K", "0", /*overwrite=*/ 0);
+                // plain never drafts: no lower-bit draft-head copy (360 MiB VRAM + the 682 MiB host row table on the
+                // 27B), which left the 3090 27B row 48 MiB free and refused to start in plain mode
+                setenv("AI_MTP_DRAFT_Q", "off", /*overwrite=*/ 0);
+            }
+            else if (mode_s == "exact") setenv("AI_MTP_MODE", "exact", /*overwrite=*/ 0);
+            else                        setenv("AI_MTP_MODE", "fast", /*overwrite=*/ 0);
+            fprintf(stderr, "[auto] decode mode: %s%s\n", mode_s.c_str(),
+                    mode_s == "fast" ? " (not token-identical to plain greedy; --decode-mode exact or plain for that)" : "");
+        }
         const char * sm = getenv("ALPHA_SPEED_MODE");
         if (sm && atoi(sm) != 0) {
             setenv("AI_MTP_MODE", "fast", /*overwrite=*/ 0);
@@ -1562,6 +1589,14 @@ int main(int argc, char ** argv) {
                         drafter.c_str());
             } else {
                 if (!drafter.empty()) fprintf(stderr, "[auto] ALPHA_SPEED_MODE: DFlash2 needs 1 stream (-np %d given) -- using fast MTP\n", n_slots);
+                else if (air->speed_drafter) {   // the row's best speed needs a drafter file the user may not have: say so
+                    const char * file = strrchr(air->speed_drafter, '/');
+                    fprintf(stderr, "[auto] ALPHA_SPEED_MODE: the speed drafter %s was not found (looked beside the model and in the "
+                                    "sibling directory %s) -- serving fast MTP, without parallel drafting. Download it and put "
+                                    "it there, or set ALPHA_AI_DRAFTER=<path>; /health reports speed_drafter: \"missing\"\n",
+                            file ? file + 1 : air->speed_drafter, air->speed_drafter);
+                    g_speed_drafter_missing = true;
+                }
                 unsetenv("AI_DFLASH2");   // an inherited one would make the library refuse create at n_streams != 1
                 if (air->fast_k > 0) setenv("ALPHA_AI_MTP_K", std::to_string(air->fast_k).c_str(), /*overwrite=*/ 0);
                 fprintf(stderr, "[auto] ALPHA_SPEED_MODE: best-speed MTP (%s, k=%s) -- output is NOT token-identical to plain greedy\n",
@@ -1592,6 +1627,13 @@ int main(int argc, char ** argv) {
     }
     else if (!(explicit_backend && mode != MODE_ALPHAINFER) && alpha_auto_qwen4exp(model_path)) {
         mode = MODE_ALPHAINFER;
+        {   // decode mode (see the validated rows above): Flash-Next's MTP is fast verify only; plain turns it off
+            const char * dm = getenv("ALPHA_DECODE_MODE");
+            if (dm && strcmp(dm, "plain") == 0) setenv("ALPHA_AI_MTP_K", "0", /*overwrite=*/ 0);
+            else if (dm && strcmp(dm, "exact") == 0)
+                fprintf(stderr, "[auto] decode mode exact: not available for this model (its MTP verify is fast only); "
+                                "serving fast -- use --decode-mode plain for plain greedy\n");
+        }
         if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
         if (!ctx_explicit) n_ctx   = 32768;
         // The engine workspace defaults to 640 MiB, sized for 32K cells: on an RTX 5090 a ~100K-token prompt at
@@ -3183,6 +3225,7 @@ int main(int argc, char ** argv) {
             body["mtp_mode"]      = ai->mtp_mode_str();   // "exact" | "fast" | "plain": fast is not token-identical
             body["mtp_k"]         = ai->mtp_k();
             if (getenv("AI_DFLASH2")) body["drafter"] = "dflash2";   // DFlash2 speculation (fast verify), not the model's MTP head
+            if (g_speed_drafter_missing) body["speed_drafter"] = "missing";   // speed mode asked, drafter file not found
             if (ai->calibration_state() >= 0) {   // newer libalphainfer: the calibration signal for launchers
                 body["ai_calibration_state"] = ai->calibration_state();
                 body["ai_ctx_cells"]         = ai->ctx_cells();

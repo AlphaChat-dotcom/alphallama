@@ -57,6 +57,8 @@ public:
     int32_t prefill_feed(const int32_t * tokens, int n, bool is_last);
     int32_t decode_plain(int32_t pending);                      // one token
     void    decode_spec(int32_t pending, std::vector<int32_t> & out);   // 1 .. mtp_k() + 1 tokens, the last pending
+    // [round cap] rounds emit at most n tokens per stream while set (n >= 1; 0 = no cap): the caller's limit
+    void    set_round_cap(int n);
     void    reset();
     // [sampling] temperature <= 0 = greedy (the default); top_k 0 / top_p 1 / min_p 0 = off. Tokens are drawn on the
     // device (ops sample_into, Philox(seed, position)); drafts stay argmax and are accepted only when equal to the draw,

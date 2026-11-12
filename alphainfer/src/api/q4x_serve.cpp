@@ -92,6 +92,7 @@ struct Q4xServe::Impl {
     int64_t                      ctx = 0, V = 0;
     bool                         mtp = false;
     int                          mtp_k = 0, copy_min = 0, copy_k = 15;
+    int                          round_cap = 0;        // [round cap] tokens a round may emit per stream (0 = no cap)
     bool                         agree = true;
     std::vector<uint8_t>         vocab_cls;   // per-token script classes for the draft rows (empty = first rows)
     std::vector<std::string>     vocab_txt;   // [AI_Q4X_DRAFT_ROWS_EN] every piece's bytes (English-share test)
@@ -597,6 +598,8 @@ int32_t Q4xServe::decode_plain(int32_t pending) {
     return tok;
 }
 
+void Q4xServe::set_round_cap(int n) { p_->round_cap = n; }
+
 void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     Impl & m = *p_;
     out.clear();
@@ -611,15 +614,17 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     // depth 2: chat +8%, short code +2.5%, rewrites level, a 16K-token context -8%)
     static const int64_t long_ctx = env_int("AI_Q4X_MTP_LONG_CTX", 8192);
     static const int     k_long   = env_int("AI_Q4X_MTP_K_LONG", 2);
-    const int            depth    = (int64_t) m.hist.size() > long_ctx ? std::min(m.mtp_k, k_long) : m.mtp_k;
+    // [round cap] the window is the pending token + at most cap - 1 drafts or copied tokens
+    const int            depth    = std::min((int64_t) m.hist.size() > long_ctx ? std::min(m.mtp_k, k_long) : m.mtp_k,
+                                             m.round_cap > 0 ? m.round_cap - 1 : 1 << 20);
     // [AI_Q4X_VERIFY_EARLY] no copy: the verify goes out right behind the draft chain, before the drafts reach the
     // host (Qwen4ExpRun::draft_verify_early), so the GPU does not idle through the read-back and the graph launch
     Tensor lg_early;
     bool   early = false;
-    if (!copied && m.ctx - 1 - m.run->position() >= depth + 1)
+    if (!copied && depth > 0 && m.ctx - 1 - m.run->position() >= depth + 1)
         early = m.run->draft_verify_early(pending, depth, d, lg_early);
     std::vector<float> dprob;   // [AI_Q4X_ACC_LOG] the drafter's top-1 probability per depth
-    if (!early && (!copied || m.agree)) d = m.run->mtp_draft(pending, depth, 0.0f, acc_log() ? &dprob : nullptr);
+    if (!early && depth > 0 && (!copied || m.agree)) d = m.run->mtp_draft(pending, depth, 0.0f, acc_log() ? &dprob : nullptr);
     if (copied && m.agree) {   // keep the copy only where the MTP agrees on its first token
         if (d.empty() || d[0] != toks[1]) { toks.resize(1); copied = false; }
     }
@@ -636,6 +641,7 @@ void Q4xServe::decode_spec(int32_t pending, std::vector<int32_t> & out) {
     const int64_t room = m.ctx - 1 - m.run->position();
     if (room < 1) throw std::runtime_error("q4x decode: context full");
     if ((int64_t) toks.size() > room) toks.resize((size_t) room);
+    if (m.round_cap > 0 && (int64_t) toks.size() > m.round_cap) toks.resize((size_t) m.round_cap);   // [round cap]
     const int64_t T  = (int64_t) toks.size();
     const Tensor  lg = early ? lg_early : m.run->verify(toks.data(), T);
     // verify put the T rows in the history: column c picks the token at position (position() - T) + 1 + c

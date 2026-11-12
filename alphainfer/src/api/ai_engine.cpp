@@ -28,6 +28,7 @@ struct ai_engine_s {
     std::string last_error;
     int         n_streams    = 1;
     int         mtp_k        = 0;      // after the policy's clamp (exact verify: K <= 3 on the default build)
+    int         round_cap    = 0;      // ai_engine_set_round_cap: the next MTP round's tokens per stream (0 = none)
     bool        host_embd    = false;
     bool        mtp_exact    = false;
     std::vector<uint8_t> vocab_cls;    // MTP: per-token script classes for the draft vocabulary (empty = off)
@@ -623,12 +624,20 @@ int ai_engine_mtp_info(const ai_engine * e, int * out_mtp_k, int * out_exact) {
     return AI_ENGINE_OK;
 }
 
+int ai_engine_set_round_cap(ai_engine * e, int max_tokens) {
+    if (!e || max_tokens < 0) { return AI_ENGINE_EINVAL; }
+    e->round_cap = max_tokens;
+    return AI_ENGINE_OK;
+}
+
 int ai_engine_decode_mtp(ai_engine * e,
                          const int32_t * tokens, const int32_t * positions,
                          const int32_t * seq_ids, int n_tokens,
                          int32_t * out_tokens, int32_t * out_seq_ids, int out_capacity, int * out_n) {
     if (out_n) { *out_n = 0; }
     if (!e) { return AI_ENGINE_EINVAL; }
+    const int round_cap = e->round_cap;   // one round only, whatever this call returns
+    e->round_cap = 0;
     if (!tokens || !positions || !seq_ids || !out_tokens || !out_seq_ids || !out_n || n_tokens < 1) {
         e->last_error = "ai_engine_decode_mtp: tokens/positions/seq_ids/out_tokens/out_seq_ids/out_n must be "
                         "non-null and n_tokens >= 1";
@@ -667,6 +676,8 @@ int ai_engine_decode_mtp(ai_engine * e,
         }
         try {
             std::vector<int32_t> out;
+            struct CapGuard { ai::Q4xServe * q; ~CapGuard() { q->set_round_cap(0); } } cap_guard{ e->q4x.get() };
+            e->q4x->set_round_cap(round_cap);
             if (e->q4x->has_mtp()) e->q4x->decode_spec(tokens[0], out);
             else out.push_back(e->q4x->decode_plain(tokens[0]));
             if ((int) out.size() > out_capacity) {   // cannot happen if the bound above holds; checked, not assumed
@@ -709,6 +720,7 @@ int ai_engine_decode_mtp(ai_engine * e,
             in.push_back(ai::Engine::DecodeIn{ sid, (int64_t) positions[i], tokens[i] });
         }
         std::vector<std::pair<int, int32_t>> out;
+        e->engine.set_round_cap(round_cap);
         e->engine.decode_step(in, out, e->timing);
         if ((int) out.size() > out_capacity) {   // cannot happen if the bound above holds; checked, not assumed
             e->last_error = "ai_engine_decode_mtp: the round emitted more tokens than its bound; nothing written";

@@ -200,6 +200,12 @@ void Device::init_workspace(size_t bytes) {
 
 void * Device::ws_alloc_raw(size_t bytes, int * buf_out) {
     size_t off = (ws_off_ + alignment_ - 1) / alignment_ * alignment_;
+    if (ws_measure_) {   // round-fit probe: count, never abort; past the capacity the pointer aliases the start
+        ws_off_  = off + bytes;
+        ws_need_ = std::max(ws_need_, ws_off_);
+        *buf_out = ws_buf_;
+        return (char *) buffer_base(ws_buf_) + ws_base_off_ + (ws_off_ <= ws_cap_ ? off : 0);
+    }
     if (off + bytes > ws_cap_) {
         fprintf(stderr, "[ai] FATAL: workspace overflow: need %zu bytes at offset %zu MiB, capacity %zu MiB, phase \"%s\" "
                         "(peak so far %zu MiB in \"%s\")\n",
