@@ -215,6 +215,27 @@ void scheduler::process_gpu_results() {
         return;
     }
 
+    // An engine that hands back an id outside the vocabulary (seen: the backend argmax at -np 8) must end that request
+    // with an error, not reach the detokenizer, whose std::out_of_range kills the whole server.
+    const int n_vocab = llama_vocab_n_tokens(vocab_);
+    auto bad_token = [&](serve_slot & slot, llama_token t) {
+        if (t >= 0 && t < n_vocab) return false;
+        fprintf(stderr, "[alphaserve] slot %d: engine returned token id %d outside the vocabulary (%d) -- finishing request %d\n",
+                slot.id, (int) t, n_vocab, slot.request_id);
+        TokenEvent event;
+        event.slot_id = slot.id;
+        event.request_id = slot.request_id;
+        event.token = LLAMA_TOKEN_NULL;
+        event.text = "";
+        event.is_stop = true;
+        event.is_eos = false;
+        event.is_error = true;
+        event.n_generated = slot.n_generated;
+        to_output_->try_push(std::move(event));
+        slot.reset();
+        return true;
+    };
+
     for (int i = 0; i < result.n_slots; i++) {
         int slot_id = result.slot_ids[i];
         if (slot_id < 0 || slot_id >= (int)slots_.size()) continue;
@@ -227,6 +248,7 @@ void scheduler::process_gpu_results() {
                 // More chunks to send: intermediate chunk, no token sampled
                 continue;
             }
+            if (bad_token(slot, tok)) continue;
 
             // All prompt tokens processed: transition to GENERATING
             slot.state = SlotState::GENERATING;
@@ -269,6 +291,7 @@ void scheduler::process_gpu_results() {
         }
 
         if (slot.state != SlotState::GENERATING) continue;
+        if (bad_token(slot, tok)) continue;
 
         // Window patch-correction decode: the window's extra (exact) tokens follow `tok`. An engine that emits several
         // tokens for several slots in one batch (AlphaInfer MTP rounds) fills slot_extra[i] instead, parallel to

@@ -32,7 +32,7 @@ else()
 endif()
 
 # Release name and semantic version, shown by --version, the build-info line and the server banners.
-set(ALPHALLAMA_VERSION      "2.0.9")
+set(ALPHALLAMA_VERSION      "2.0.10")
 set(ALPHALLAMA_VERSION_NAME "AlphaLlama v2")
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
@@ -266,7 +266,13 @@ if (ALPHA_ALPHAINFER)
     if (NOT GGML_CUDA)
         message(FATAL_ERROR "ALPHA_ALPHAINFER=ON needs GGML_CUDA=ON")
     endif()
-    add_subdirectory(alphainfer)
+    if (MSVC)
+        # Windows: the engine library (aicore) builds because alphallama-serve links it; the developer tools and
+        # benchmarks in alphainfer/ are Linux-only and stay out of the default build
+        add_subdirectory(alphainfer EXCLUDE_FROM_ALL)
+    else()
+        add_subdirectory(alphainfer)
+    endif()
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)

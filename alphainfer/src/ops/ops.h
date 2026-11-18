@@ -14,6 +14,8 @@
 #include "core/tensor.h"
 
 #include <functional>
+#include <utility>
+#include <vector>
 #include <memory>
 
 namespace ai::adapter { class Recorder; }
@@ -194,6 +196,20 @@ struct Accept {
     Tensor colmask;   // f32 [B*L]
 };
 Accept mtp_accept(Device & d, const Tensor & g, const Tensor & ids, int64_t L, int64_t B);
+// Fork / join of backend stream `stream_no`, recorded in sequence: the Calls and native launches (those that resolve
+// their stream when they run) between fork_begin() and fork_end() go to that stream; fork_join() makes the main
+// stream wait for them. A stream capture records the pair as a parallel branch of the round's graph.
+struct StreamFork {
+    void * ev_join = nullptr;
+    void * st_main = nullptr;
+    void * st_side = nullptr;
+    int    no      = 0;
+};
+StreamFork fork_begin(Device & d, int stream_no);
+void       fork_end(Device & d, const StreamFork & f);
+void       fork_join(Device & d, const StreamFork & f);
+// Contiguous f32 copies src -> dst as copy_spans launches (<= 8 spans each); anything else as a ggml copy.
+void copy_spans_into(Device & d, const std::vector<std::pair<Tensor, Tensor>> & pairs, const char * who);
 // Row m[b] of each stream: i32 [B*L] -> [B], or f32 [E, B*L] -> [E, B].
 Tensor select_rows(Device & d, const Tensor & src, int64_t L, int64_t B, const Tensor & m);
 // Fill head-step inputs (pos4 [4B], cells [B], mask [n_kv*B]) at base[b] + m[b] + offset, on the device.

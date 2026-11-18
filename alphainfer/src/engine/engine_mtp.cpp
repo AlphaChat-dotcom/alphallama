@@ -28,6 +28,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ai {
 
@@ -241,12 +242,19 @@ Engine::StepOut Engine::build_mtp(const Qwen35Hybrid::Inputs & vin, const Qwen35
     }
     op::Accept acc = op::mtp_accept(dev_, out.g, vin.ids, L, B);
     out.m = acc.m;
+    // AI_FOLD_SIDE=<stream> (opt-in): the masked fold on its own backend stream, beside what follows in the round (the MTP
+    // head fill + chain, or the device drafter), none of which reads the recurrent state; joined at the round's end.
+    static const int k_fold_side = getenv("AI_FOLD_SIDE") ? atoi(getenv("AI_FOLD_SIDE")) : 0;
+    op::StreamFork ff;
+    if (k_fold_side > 0) ff = op::fork_begin(dev_, k_fold_side);
     prog_.fold_masked(dev_, vin, rec, acc.colmask, acc.m);
+    if (k_fold_side > 0) op::fork_end(dev_, ff);
     auto first = prog_.mtp(dev_, out.g, hidden, hin, Qwen35Hybrid::HeadRows::Accepted, acc.m);
     // chain step s at p + m + 1 + s (p = the verify's first position = main ingress base)
     chain(out.drafts, first, main_in_.base_view(B), acc.m, 1, k_out, B, hin.n_kv, vin.first_region,
           main_in_.delta_view(B));
     out.confs = chain_confs_;
+    if (k_fold_side > 0) op::fork_join(dev_, ff);
     return out;
 }
 
@@ -302,6 +310,15 @@ Engine::StepOut Engine::profile_mtp(const Qwen35Hybrid::Inputs & vin, const Qwen
     tm.mtp_phase_ms[2] += ms(t2, t3);   // head fill (L rows through the MTP block) + draft 1
     tm.mtp_phase_ms[3] += ms(t3, t4);   // the k-1 chained draft steps
     tm.mtp_prof_steps++;
+    {   // the server never prints Timing: a running split on stderr every 200 profiled steps
+        static double acc[4] = { 0, 0, 0, 0 };
+        static long   n = 0;
+        acc[0] += ms(t0, t1); acc[1] += ms(t1, t2); acc[2] += ms(t2, t3); acc[3] += ms(t3, t4);
+        if (++n % 200 == 0) {
+            fprintf(stderr, "[mtp-prof] %ld steps (L %lld): verify %.3f | accept+fold %.3f | head fill %.3f | chain %.3f | total %.3f ms/step\n",
+                    n, (long long) L, acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n, (acc[0] + acc[1] + acc[2] + acc[3]) / n);
+        }
+    }
     return out;
 }
 
@@ -429,7 +446,12 @@ Engine::StepOut Engine::build_df2(const Qwen35Hybrid::Inputs & vin) {
     }
     op::Accept acc = op::mtp_accept(dev_, out.g, vin.ids, L, B);
     out.m = acc.m;
+    static const int k_fold_side2 = getenv("AI_FOLD_SIDE") ? atoi(getenv("AI_FOLD_SIDE")) : 0;   // see build_mtp
+    const bool       fold_fork    = k_fold_side2 > 0 && !df2_host_mode();
+    op::StreamFork   ff2;
+    if (fold_fork) ff2 = op::fork_begin(dev_, k_fold_side2);
     prog_.fold_masked(dev_, vin, rec, acc.colmask, acc.m);
+    if (fold_fork) op::fork_end(dev_, ff2);
     if (df2_host_mode()) {
         return out;
     }
@@ -444,7 +466,20 @@ Engine::StepOut Engine::build_df2(const Qwen35Hybrid::Inputs & vin) {
     for (int64_t j = 0; j < L - 1; ++j) {
         out.drafts.push_back(dr.view(1, 1, 1, 1, 4, 4, 4, (size_t) j * 4));
     }
+    if (fold_fork) op::fork_join(dev_, ff2);
     return out;
+}
+
+// AI_DF2_TRACE=<file> (default off): one text line per host-side DFlash2 draft (AI_DF2_HOST=1 and the prefill's first
+// block): "<anchor_pos> <anchor> <ctx_rows> d1 .. d7", where anchor_pos is the anchor token's absolute position and
+// ctx_rows the drafter's context length after this round's append. "S" marks a new request's prefill draft.
+static void df2_trace(bool start, int64_t anchor_pos, int32_t anchor, int64_t ctx_rows, const std::vector<int32_t> & d) {
+    static FILE * f = getenv("AI_DF2_TRACE") ? fopen(getenv("AI_DF2_TRACE"), "a") : nullptr;
+    if (f == nullptr) return;
+    fprintf(f, "%s%lld %d %lld", start ? "S " : "", (long long) anchor_pos, anchor, (long long) ctx_rows);
+    for (int32_t t : d) fprintf(f, " %d", t);
+    fputc('\n', f);
+    fflush(f);
 }
 
 void Engine::df2_advance(Stream & st, int64_t rows, int64_t pos0, int32_t anchor, int64_t anchor_pos) {
@@ -461,6 +496,7 @@ void Engine::df2_advance(Stream & st, int64_t rows, int64_t pos0, int32_t anchor
     df2_->ctx_append(dev_, tp.view(tp.ne[0], rows, 1, 1, tp.nb[1], tp.nb[1] * rows, tp.nb[1] * rows, 0), pos0);
     auto d = df2_->draft(dev_, anchor, anchor_pos, prog_.tok_embd(), hw, false, hm);
     dev_.ws_reset(mark);
+    df2_trace(false, anchor_pos, anchor, df2_->ctx_rows(), d.tokens);
     st.drafts = d.tokens;
 }
 
@@ -494,6 +530,33 @@ void Engine::prefill_df2(int stream, const std::vector<int32_t> & prompt, Stream
         // this chunk's taps -> the drafter's context (same stream, after the chunk's round)
         const Tensor & tp = prog_.taps();
         df2_->ctx_append(dev_, tp.view(tp.ne[0], T, 1, 1, tp.nb[1], tp.nb[1] * T, tp.nb[1] * T, 0), off);
+        // AI_DF2_DUMP=<file> (default off): append this chunk's tokens and the drafter's input taps (DFlash2 training data).
+        // Record: int64 {0x54324644 'DF2T', pos0, T, width, dtype (0 f32, 1 bf16 = AI_DF2_DUMP_BF16=1)}, int32 tokens[T],
+        // then T rows of `width` values (the target_layer_ids bands in order, n_embd each). pos0 == 0 starts a sequence.
+        static const char * dump_df2 = getenv("AI_DF2_DUMP");
+        if (dump_df2) {
+            static const bool  bf16 = getenv("AI_DF2_DUMP_BF16") && atoi(getenv("AI_DF2_DUMP_BF16")) != 0;
+            const int64_t      W    = tp.ne[0];
+            std::vector<float> h((size_t) (W * T));
+            dev_.download(tp, h.data(), 0, h.size() * 4);
+            if (FILE * f = fopen(dump_df2, "ab")) {
+                const int64_t hd[5] = { 0x54324644, off, T, W, bf16 ? 1 : 0 };
+                fwrite(hd, sizeof(hd), 1, f);
+                fwrite(prompt.data() + off, sizeof(int32_t), (size_t) T, f);
+                if (bf16) {   // round to nearest even
+                    std::vector<uint16_t> b(h.size());
+                    for (size_t i = 0; i < h.size(); ++i) {
+                        uint32_t u;
+                        memcpy(&u, &h[i], 4);
+                        b[i] = (uint16_t) ((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+                    }
+                    fwrite(b.data(), 2, b.size(), f);
+                } else {
+                    fwrite(h.data(), 4, h.size(), f);
+                }
+                fclose(f);
+            }
+        }
         if (last) {
             dev_.download_async(am, h_out_, 0, 4);
             dev_.synchronize();
@@ -504,6 +567,7 @@ void Engine::prefill_df2(int stream, const std::vector<int32_t> & prompt, Stream
     const Tensor * hm = nullptr;
     const Tensor & hw = df2_head(prog_, hm);
     auto d = df2_->draft(dev_, tok, n, prog_.tok_embd(), hw, false, hm);
+    df2_trace(true, n, tok, df2_->ctx_rows(), d.tokens);
     st.drafts = d.tokens;
 }
 

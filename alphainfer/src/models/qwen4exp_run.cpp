@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "models/qwen4exp_run.h"
+#include "core/compat.h"
 #include "core/host_mem.h"
 #include "offload/cpu_topo.h"
 
@@ -12,8 +13,10 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#endif
 #include <fstream>
 
 #include <algorithm>
@@ -532,9 +535,7 @@ void Qwen4ExpRun::ple_warm() {
     const size_t bytes = (size_t) tbl.nb[1] * (size_t) tbl.ne[1];
     long long avail_kb = 0;
     {
-        std::ifstream mi("/proc/meminfo");
-        std::string key;
-        while (mi >> key) { if (key == "MemAvailable:") { mi >> avail_kb; break; } mi.ignore(1 << 10, '\n'); }
+        avail_kb = ai::mem_kb(/*available=*/ true);
     }
     const long long margin = 16ll << 30;
     if (mode < 0 && avail_kb * 1024 < (long long) bytes + margin) {
@@ -549,12 +550,7 @@ void Qwen4ExpRun::ple_warm() {
     // table queues the kernel's readahead: ~1 GB/s from one blocking reader, several GB/s this way
     static const int n_rd = getenv("AI_Q4X_PLE_WARM_THREADS") ? std::max(1, atoi(getenv("AI_Q4X_PLE_WARM_THREADS"))) : 4;
     std::thread warm([src, bytes, ws, cpus]() {
-        if (!cpus.empty()) {   // the host cpus, never the pool's
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            for (int c : cpus) CPU_SET(c, &set);
-            pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-        }
+        if (!cpus.empty()) offload::pin_this_thread(cpus);   // the host cpus, never the pool's
         const auto   t0    = std::chrono::steady_clock::now();
         const size_t chunk = 8u << 20;
         ws->host_prefetch(src, bytes);
@@ -562,12 +558,7 @@ void Qwen4ExpRun::ple_warm() {
         std::vector<std::thread> rd;
         for (int t = 0; t < n_rd; ++t) {
             rd.emplace_back([&, t]() {
-                if (!cpus.empty()) {
-                    cpu_set_t set;
-                    CPU_ZERO(&set);
-                    for (int c : cpus) CPU_SET(c, &set);
-                    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-                }
+                if (!cpus.empty()) offload::pin_this_thread(cpus);
                 std::vector<char> buf(chunk);
                 for (size_t off = (size_t) t * chunk; off < bytes; off += (size_t) n_rd * chunk) {
                     const size_t n = std::min(chunk, bytes - off);
@@ -959,10 +950,7 @@ void Qwen4ExpRun::init_doorbell(int slots) {
     if (const char * tg = getenv("AI_Q4X_RAM_TIER_GB")) {
         size_t budget = 0;
         if (strcmp(tg, "auto") == 0) {
-            long long mem_kb = 0;
-            std::ifstream mi("/proc/meminfo");
-            std::string key;
-            while (mi >> key) { if (key == "MemTotal:") { mi >> mem_kb; break; } mi.ignore(1 << 10, '\n'); }
+            const long long mem_kb = ai::mem_kb(/*available=*/ false);
             const long long b = mem_kb * 1024 - (20ll << 30);
             budget = b > 0 ? (size_t) b : 0;
         } else {

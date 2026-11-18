@@ -304,6 +304,11 @@ static inline int setenv(const char * k, const char * v, int overwrite) {
     if (!overwrite && getenv(k)) return 0;
     return _putenv_s(k, v);
 }
+// unsetenv(): _putenv_s with an empty value removes the variable
+static inline int unsetenv(const char * k) { return _putenv_s(k, ""); }
+// mkdir(path, mode): the CRT's _mkdir has no mode argument
+#  include <direct.h>
+static inline int mkdir(const char * path, int /*mode*/) { return _mkdir(path); }
 #endif
 
 static inline int alpha_setenv(const char * k, const char * v) {
@@ -341,6 +346,13 @@ static void alpha_segv_handler(int sig) {
 #include <string>
 #include <atomic>
 #include <chrono>
+
+// MSVC's struct stat holds a 32-bit st_size, so stat() fails (EOVERFLOW) on every file over 2 GB: the model size and
+// the validated-row lookup saw no file, and no AlphaInfer row ever matched on Windows. Map stat to the 64-bit variant,
+// after every system header so their own declarations are untouched.
+#if defined(_WIN32)
+#  define stat _stat64
+#endif
 
 static int s_n_expert_peek = 0;   // expert_count from the startup GGUF peek (0 = dense / unknown)
 
@@ -853,14 +865,21 @@ struct alpha_ai_validated { const char * sha256; long long size; int sm_major, s
                             // library env this row always serves with, "K=V K=V ..." (setenv without overwrite), e.g. the
                             // fit settings of a model that misses the card by a little; nullptr = none
                             const char * env;
-                            const char * what; };
+                            const char * what;
+                            // the row applies only below this much card memory (GiB, 0 = any): the 16 GB offload rows must
+                            // not catch a 24 GB card of the same compute capability (RTX 4090, L4 are sm_89 like the 4080)
+                            int vram_below_gib;
+                            // ...and only from this much card memory up (GiB, 0 = any): the 24 GB / 32 GB rows must not catch
+                            // a smaller card of the same compute capability (RTX A4500 20 GB, RTX 3060 12 GB are sm_86 like the
+                            // 3090; RTX 5080 16 GB is sm_120 like the 5090), whose engine would refuse to start at the row's shape
+                            int vram_min_gib; };
 static const alpha_ai_validated k_ai_validated[] = {
     // speed mode: fast MTP k64 + n-gram lookup K64, 1 stream at 32768 cells (1 x 98304 with K64 verify widths runs out
     // of memory on 24 GB once the workspace is calibrated)
     { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 8, 6, 2, 98304, "exact", 64, nullptr,
       "AI_LOOKUP=1 AI_LOOKUP_ARM=32 AI_LOOKUP_NMIN=4 AI_MTP_CHAIN=3 AI_GRAPH_MAX=32 ALPHA_AI_CTX=32768", 1,
       // pin q4_0 so MTP on and off give identical text (auto would choose q4_0 with MTP, f16 without)
-      "q4_0", nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 3090)" },
+      "q4_0", nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 3090)", 0, 22 },
     // Exact MTP (token-identical to plain greedy). Identity at depth needs libalphainfer 583c749+ on cc < 12: older
     // libraries sized the q4_0/q8_0 decode-attention split (AI_FA_Q) from the round's KV envelope, so exact and plain
     // split differently where the envelope grows; newer ones size it from the stream's KV region (constant per engine).
@@ -873,12 +892,16 @@ static const alpha_ai_validated k_ai_validated[] = {
       // pin q4_0 as the 35B row does: auto picks the KV type from the VRAM left after MTP, so plain (MTP off) took a
       // finer type than exact -- exact == plain 4/8 at a 32K context (8/8 pinned), and at the row's own context the
       // plain engine left 48 MiB free and refused to start (RTX 3090, 2026-11-11)
-      "q4_0", nullptr, nullptr, "Qwen3.8-27B-UD-Q4_K_M (RTX 3090)" },
+      "q4_0", nullptr, nullptr, "Qwen3.8-27B-UD-Q4_K_M (RTX 3090)", 0, 22 },
     // RTX 5090 (sm_120, libalphainfer built for sm_120a).
     { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 12, 0, 2, 98304, "exact", 3, nullptr,
-      nullptr, 0, nullptr, nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 5090)" },
-    // 27B on sm_120 is not added: exact == plain through the server fails there, likely the plain path's unpinned FA
-    // split on sm_12x (dense models get no plain pins). Re-gate before adding.
+      nullptr, 0, nullptr, nullptr, nullptr, "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 5090)", 0, 30 },
+    // 27B on sm_120: the 3090 row's shape and pinned q4_0 KV. Gate (2.0.9 package, A/V/R 25 prompts x 512
+    // tokens through the server): exact == plain 25/25, plain repeat 25/25. f16 KV does not fit 2 x 131072 on 32 GB
+    // (engine init refuses), which is what the auto KV type would try; the earlier exact != plain was not reproduced
+    // with the type pinned. Speed mode: fast MTP at the row's depth (DFlash2 not yet gated on sm_120).
+    { "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482", 16464440224LL, 12, 0, 2, 262144, "exact", 3,
+      nullptr, nullptr, 0, "q4_0", nullptr, nullptr, "Qwen3.8-27B-UD-Q4_K_M (RTX 5090)", 0, 30 },
     // RTX 4080 (sm_89, 16 GB): the models do not fit; both rows need libalphainfer built with AI_DOORBELL=ON.
     // 35B: routed experts in host memory, the doorbell offload sized from the VRAM left (expert_slots "auto"). Fast:
     // the CPU computes the missed experts (MTP is fast verify under offload).
@@ -886,7 +909,7 @@ static const alpha_ai_validated k_ai_validated[] = {
     // a lookup verify round is 33 rows, so the doorbell's captured-round width AI_DOOR_TMAX must cover it.
     { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 8, 9, 1, 32768, nullptr, 3, nullptr,
       nullptr, 0, "q4_0", "auto", "ALPHA_AI_MTP_K=32 AI_MTP_CHAIN=3 AI_LOOKUP=1 AI_LOOKUP_NMIN=4 AI_DOOR_TMAX=33",
-      "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 4080, doorbell offload, FAST)" },
+      "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (RTX 4080, doorbell offload, FAST)", 20, 0 },
     // 27B: original weights; 4 dense FFN layers in host memory computed by the CPU (AI_FFN_CPU), token_embd in mapped
     // host memory, the draft head on the shared output rows, 128-row prefill chunks and a 640 MiB workspace. A
     // load-time requant would be faster but fails the per-language NLL gate, so the weights stay as shipped. Fast MTP
@@ -900,7 +923,31 @@ static const alpha_ai_validated k_ai_validated[] = {
       nullptr, 0, "q4_0", nullptr,
       "AI_HOST_EMBD=1 AI_FFN_CPU=4 AI_MTP_DRAFT_Q=off AI_KV_MARGIN_MB=128 AI_CHUNK=128 ALPHA_AI_WS_MIB=640 ALPHA_AI_MTP_K=16 "
       "AI_MTP_CHAIN=5 AI_LOOKUP=1 AI_LOOKUP_NMIN=4 AI_WIDE_EXACT=0",
-      "Qwen3.8-27B-UD-Q4_K_M (RTX 4080, 4 FFN layers on the CPU, FAST)" },
+      "Qwen3.8-27B-UD-Q4_K_M (RTX 4080, 4 FFN layers on the CPU, FAST)", 20, 0 },
+    // 20 GB sm_86 cards (RTX A4500; 18..22 GiB). The built-in engine they fell back to decodes the 35B at 12-15 tok/s
+    // with 5-8 s prefill per short prompt, and the 27B at 27.5 tok/s.
+    // 35B: the 4080 doorbell row (~170 of 256 expert slots resident on 20 GB). Explicit exact runs plain decode
+    // (no exact verify under offload).
+    { "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b", 22663387424LL, 8, 6, 1, 32768, nullptr, 3, nullptr,
+      nullptr, 0, "q4_0", "auto", "ALPHA_AI_MTP_K=32 AI_MTP_CHAIN=3 AI_LOOKUP=1 AI_LOOKUP_NMIN=4 AI_DOOR_TMAX=33",
+      "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M (20 GB sm_86, doorbell offload, FAST)", 22, 18 },
+    // 27B resident at 1 x 16384 with q4_0 KV, fast MTP 5 deep plus prompt-lookup drafts up to 16 wide (shadow-armed at
+    // 8 matched tokens), as the 4080 27B row. RTX A4500 with ECC on (19190 MiB), 3090 R set, 512 tokens: 145-166 tok/s
+    // on most copy-heavy prompts vs 58-67 with MTP 3 alone. Fit, all measured there:
+    // - 32768 cells: after one 23K-token prompt the calibrated workspace grew and the next start had 114 MiB free,
+    //   below the 256 MiB floor (refused). 16384 starts with ~820 MiB free.
+    // - lookup 32 wide: the verify workspace does not fit after the weights (engine init refuses).
+    // - the workspace pinned at 900 MiB: sized from its first-start calibration, it overflowed in a lookup round
+    //   (FATAL, 3.5 MB short of 782 MiB).
+    // - no lower-bit draft-head copy (AI_MTP_DRAFT_Q=off, 360 MiB): with it the first-start workspace bootstrap is
+    //   clamped to 1024 cells and engine init throws.
+    // - narrow exact kernels (AI_WIDE_EXACT=0) as on the 4080: the wide-exact path needs more workspace.
+    // Before lookup (1 x 32768, ECC off): exact == plain 8/8, plain 29 tok/s.
+    { "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482", 16464440224LL, 8, 6, 1, 16384, "exact", 3,
+      nullptr, nullptr, 0, "q4_0", nullptr,
+      "AI_MTP_DRAFT_Q=off AI_CHUNK=256 ALPHA_AI_WS_MIB=900 ALPHA_AI_MTP_K=16 AI_MTP_CHAIN=5 AI_LOOKUP=1 AI_LOOKUP_NMIN=4 "
+      "AI_WIDE_EXACT=0",
+      "Qwen3.8-27B-UD-Q4_K_M (20 GB sm_86, prompt lookup)", 22, 18 },
 };
 
 // The row's speed drafter "<dir>/<file>": ALPHA_AI_DRAFTER, else <file> beside the model, else exactly <parent>/<dir>/<file>
@@ -1022,6 +1069,8 @@ static const alpha_ai_validated * alpha_auto_alphainfer_row(const char * model_p
     if (stat(model_path, &st) != 0) return nullptr;
     for (const auto & r : k_ai_validated) {
         if (r.sm_major != prop.major || r.sm_minor != prop.minor || r.size != (long long) st.st_size) continue;   // cheap filters
+        if (r.vram_below_gib > 0 && prop.totalGlobalMem >= ((size_t) r.vram_below_gib << 30)) continue;
+        if (r.vram_min_gib   > 0 && prop.totalGlobalMem <  ((size_t) r.vram_min_gib   << 30)) continue;
         const std::string h = alpha_model_sha256_cached(model_path, /*lookup_only=*/true);
         if (!h.empty()) {
             if (h == r.sha256) return &r;
@@ -1536,11 +1585,13 @@ int main(int argc, char ** argv) {
         }
     }
 
+    bool decode_mode_applied = false;   // a validated AlphaInfer row or the Flash-Next route read --decode-mode / ALPHA_SPEED_MODE
 #ifdef ALPHA_HAS_ALPHAINFER
     // An explicit `--backend alphainfer` still takes the validated row's mode / speed mode / shape; otherwise an
     // "exact" row would get the library's dense default (fast). Any other explicit backend skips the row.
     if (const alpha_ai_validated * air = (explicit_backend && mode != MODE_ALPHAINFER) ? nullptr : alpha_auto_alphainfer_row(model_path)) {
         mode = MODE_ALPHAINFER;
+        decode_mode_applied = true;
         if (!np_explicit)  n_slots = air->n_streams;   // the validated shape for this model
         if (!ctx_explicit) n_ctx   = air->ctx_total;
         // Decode mode (--decode-mode / ALPHA_DECODE_MODE): fast (the default since 2.0.9: multi-token prediction with fast
@@ -1627,6 +1678,7 @@ int main(int argc, char ** argv) {
     }
     else if (!(explicit_backend && mode != MODE_ALPHAINFER) && alpha_auto_qwen4exp(model_path)) {
         mode = MODE_ALPHAINFER;
+        decode_mode_applied = true;
         {   // decode mode (see the validated rows above): Flash-Next's MTP is fast verify only; plain turns it off
             const char * dm = getenv("ALPHA_DECODE_MODE");
             if (dm && strcmp(dm, "plain") == 0) setenv("ALPHA_AI_MTP_K", "0", /*overwrite=*/ 0);
@@ -1679,6 +1731,18 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[auto] (--backend local or ALPHA_AUTO=0 keeps the built-in engine)\n");
     }
 #endif
+    // Only the validated rows and the Flash-Next route read the decode / speed mode; anywhere else (a model or GPU with no
+    // row, e.g. the 27B on an RTX 5090, or an explicit other backend) they did nothing, silently.
+    if (!decode_mode_applied) {
+        const char * dm = getenv("ALPHA_DECODE_MODE");
+        const char * sm = getenv("ALPHA_SPEED_MODE");
+        if ((dm && *dm) || (sm && atoi(sm) != 0)) {
+            fprintf(stderr, "[serve] WARNING: %s%s%s not applied: no AlphaInfer-validated row for this model on this GPU "
+                            "(or another backend was chosen); the engine runs its own defaults\n",
+                    dm && *dm ? "--decode-mode " : "", dm && *dm ? dm : "",
+                    sm && atoi(sm) != 0 ? (dm && *dm ? " and ALPHA_SPEED_MODE" : "ALPHA_SPEED_MODE") : "");
+        }
+    }
     // `--backend auto` with no remote URL resolves to the smart local/FI selection below.
     bool want_auto_route = (!explicit_backend) || (mode == MODE_AUTO && !have_remote_url);
     if (mode == MODE_AUTO && !have_remote_url) mode = MODE_LOCAL;
@@ -3901,11 +3965,25 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        std::string prompt = body.value("prompt", "");
+        // "prompt" may also be token ids (an array of integers), prefilled as given; "return_tokens": true adds the
+        // prompt and generated token ids to the reply (choices[0].tokens, prompt_token_ids)
+        const bool prompt_is_ids = body.contains("prompt") && body["prompt"].is_array();
+        std::string prompt = prompt_is_ids ? std::string() : body.value("prompt", "");
         int req_id = next_request_id.fetch_add(1);
         bool stream = body.value("stream", false);
+        const bool return_tokens = body.value("return_tokens", false);
 
-        auto tokens = common_tokenize(vocab, prompt, true, true);
+        std::vector<llama_token> tokens;
+        if (prompt_is_ids) {
+            try { tokens = body["prompt"].get<std::vector<llama_token>>(); } catch (...) {
+                res.status = 400;
+                res.set_content("{\"error\":\"prompt: a string or an array of token ids\"}", "application/json");
+                return;
+            }
+        } else {
+            tokens = common_tokenize(vocab, prompt, true, true);
+        }
+        const std::vector<llama_token> prompt_ids_copy = return_tokens ? tokens : std::vector<llama_token>();
 
         // Context overflow: clear error instead of a silent empty completion (see above).
         if (alphaserve::g_serve_ctx_per_slot > 0 &&
@@ -3995,6 +4073,10 @@ int main(int argc, char ** argv) {
             }
             auto resp = make_completion_response(req_id, pr->text, pr->n_tokens, model_name, pr->error ? "error" : pr->length ? "length" : "stop",
                                                  n_prompt_c, pr->n_cached);
+            if (return_tokens) {
+                resp["choices"][0]["tokens"] = pr->ids;
+                resp["prompt_token_ids"]     = prompt_ids_copy;
+            }
             res.set_content(resp.dump(-1, ' ', false, json::error_handler_t::replace)   /* generated text may end mid-UTF-8: never throw */, "application/json");
         } else {
             res.set_header("Cache-Control", "no-cache");

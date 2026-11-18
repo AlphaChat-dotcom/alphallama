@@ -14,6 +14,8 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "core/compat.h"
 extern char ** environ;
 #include <stdexcept>
 
@@ -35,6 +37,15 @@ static int chain_cap(int K) {
 
 // Prompt-lookup drafting (AI_LOOKUP) counters; the core (config, buckets, n-gram index, proposal) is in engine/lookup.h
 static long long g_lk_rounds = 0, g_lk_drafted = 0, g_lk_acc = 0, g_lk_all_rounds = 0;
+// Drafter rounds (not lookup), by source [0] DFlash2 [1] MTP head; printed at exit as [draft-acc]
+static long long g_dr_rounds[2] = {}, g_dr_drafted[2] = {}, g_dr_acc[2] = {};
+// AI_LOOKUP_MULTI=W (default 0 = off): lookup drafts at 2+ live streams too, fast verify only. A round is batch-rigid,
+// so it takes the widest stream's lookup width (capped at W) and the other streams pad their drafts (a padded draft is
+// rejected). Off, lookup drafts only at batch 1 as before.
+static int lk_multi_cap() {
+    static const int w = getenv("AI_LOOKUP_MULTI") ? std::max(0, atoi(getenv("AI_LOOKUP_MULTI"))) : 0;
+    return w;
+}
 // AI_MTP_GATE report counters: process-wide, printed by an atexit handler after the engine is gone.
 static long long g_cold_rounds = 0;
 static double    g_cold_ms     = 0.0;
@@ -408,6 +419,9 @@ bool Engine::plan_kv() {
 static std::string ws_cache_path() {
     if (const char * p = getenv("AI_WS_CACHE")) return p;
     const char * home = getenv("HOME");
+#if defined(_WIN32)
+    if (!home) home = getenv("LOCALAPPDATA");   // Windows sets no HOME by default
+#endif
     return std::string(home ? home : "/tmp") + "/.cache/alphainfer/ws_peaks.tsv";
 }
 
@@ -440,9 +454,7 @@ static std::string ws_env_hash() {   // every switch that can change which code 
 void Engine::ws_auto_lookup() {
     const char * a = getenv("AI_WS_AUTO");
     if (cfg_.ws_bytes != 0 || (a && atoi(a) == 0)) return;
-    char exe[4096] = { 0 };
-    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n > 0) exe[n] = 0;
+    const std::string exe = exe_path();
     cudaDeviceProp pr {};
     cudaGetDeviceProperties(&pr, cfg_.device);
     // key version: bump when the calibration procedure changes so old peaks are not reused
@@ -520,9 +532,17 @@ void Engine::ws_auto_calibrate() {
     ws_calibrating_ = true;
     generate_batch(prompts, n_cal, [](int, int32_t) { return true; }, &tm);
     ws_calibrating_ = false;
-    // (2) build one round at every envelope F up to the region, with the round's real width (k_in = k_out = K)
-    {
-        const int64_t B = active_batch_, L = K + 1, T = L * B;
+    // (2) build one round at every envelope F up to the region, with the round's real width (k_in = k_out = K).
+    // With AI_LOOKUP and several streams, only a batch-1 round verifies lookup drafts wider than the MTP chain
+    // (decode_round proposes them at B == 1 only), so the multi-stream rounds are swept at the chain's width and the
+    // full width K at batch 1. A multi-stream record round wider than the unscoped budget is not supported (forward
+    // throws), and no real round takes one.
+    // AI_LOOKUP_MULTI: multi-stream rounds take lookup widths up to its cap, so they are swept that wide.
+    const int64_t Kc = !df2_ && K > 0 && lookup_cfg().on && active_batch_ > 1
+                           ? std::min<int64_t>(K, std::max(chain_cap((int) K), cfg_.exact_verify ? 0 : lk_multi_cap()))
+                           : K;
+    auto sweep = [&](const int64_t B, const int64_t Kr) {
+        const int64_t L = Kr + 1, T = L * B;
         const bool    mtp = K > 0;
         const int64_t R = prog_.kv().region_cells();
         std::vector<int32_t> zeros((size_t) L, 0);
@@ -548,7 +568,7 @@ void Engine::ws_auto_calibrate() {
                 op::Round r(dev_);
                 r.begin();
                 if (df2_) build_df2(vin);
-                else if (mtp) build_mtp(vin, hin, (int) K);
+                else if (mtp) build_mtp(vin, hin, (int) Kr);
                 else build_plain(vin);
                 r.end();
                 r.launch();
@@ -558,7 +578,9 @@ void Engine::ws_auto_calibrate() {
             if (f >= R) break;
         }
         dev_.synchronize();
-    }
+    };
+    sweep(active_batch_, Kc);
+    if (Kc < K) sweep(1, K);
     // (3) Prefill chunks at the deepest position the region allows, launched (ggml's prefill attention takes part
     // of its scratch at launch). A chunk attends over visible_cells(off, T), so its workspace grows with depth, and
     // (1) only prefills the first four chunks. The last chunk of a prompt can be any width 1..chunk (prompt length
@@ -867,7 +889,10 @@ bool Engine::init(const EngineConfig & cfg) {
     kv_alloc_before_ = dev_.total_allocated();
     prog_.alloc_state(dev_, cfg_.max_ctx, (int) B, cfg_.kv_type);
     // the MTP chain's widest round stays unscoped; wider (lookup) rounds run scoped with a record arena
-    prog_.set_unscoped_rows(B * (std::min<int64_t>(K, chain_cap((int) K)) + 1));
+    // AI_LOOKUP_MULTI: a multi-stream lookup round must stay unscoped (scoped record rounds are batch-1 only)
+    const int64_t w_unscoped = std::max<int64_t>(std::min<int64_t>(K, chain_cap((int) K)),
+                                                 B > 1 && !cfg_.exact_verify && lookup_cfg().on ? std::min<int64_t>(K, lk_multi_cap()) : 0);
+    prog_.set_unscoped_rows(B * (w_unscoped + 1));
     if (cfg_.expert_slots > 0) {
         int slots = cfg_.expert_slots;
         if (cfg_.expert_slots_auto) {
@@ -1170,7 +1195,8 @@ int64_t Engine::pfx_resume(int stream, const int32_t * p, int64_t n, int64_t lim
     const PfxCache & c = pfx_[(size_t) stream];
     int64_t m = 0;
     while (m < n && m < (int64_t) c.toks.size() && p[m] == c.toks[(size_t) m]) ++m;
-    limit = std::min(limit, m);
+    // a resume at `at` keeps the MTP head's KV cell `at`, which read prompt[at]: the new prompt must match through `at`
+    limit = std::min(limit, m - 1);
     int64_t at = 0;
     for (const PfxSnap & s : c.snaps) if (s.at <= limit) at = std::max(at, s.at);
     return at;
@@ -1338,6 +1364,14 @@ int32_t Engine::prefill_feed(int stream, const int32_t * tokens, int64_t n, bool
     s.pos  = (int64_t) s.pf.size();
     s.done = false;
     lk_begin(s, s.pf);
+    if (FILE * dt = draft_trace_file(); dt != nullptr && !ws_calibrating_) {   // the same Q / F lines as prefill_stream
+        fprintf(dt, "Q %d %zu", stream, s.pf.size());
+        for (int32_t t : s.pf) fprintf(dt, " %d", t);
+        fprintf(dt, "\nF %d %lld %d |", stream, (long long) s.pos, s.pend);
+        for (int32_t d : s.drafts) fprintf(dt, " %d", d);
+        fprintf(dt, "\n");
+        fflush(dt);
+    }
     live_streams_ = 0;
     for (const auto & x : streams_) live_streams_ += x.done ? 0 : 1;
     tm.prompt_n += s.pos;
@@ -1615,6 +1649,7 @@ void Engine::lk_begin(Stream & s, const std::vector<int32_t> & prompt) {
     s.lk_k = 0;
     if (lookup_cfg().on && cfg_.mtp_k > 0) {
         s.lk_armed = lookup_cfg().start >= 2 || (lookup_cfg().start == 1 && df2_on());   // AI_LOOKUP_START
+        s.lk_prev_full = false;
         s.hist = prompt;
         s.hist.push_back(s.pend);
         s.lk.clear();
@@ -2217,6 +2252,26 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
                 fprintf(cf, "M %d %d\n", m, k_in);
             }
             acc_now.push_back(m);
+            if (s.lk_k == 0 && !ws_calibrating_) {   // a drafter's own round (lookup rounds are counted apart)
+                const int d = df2_on() ? 0 : 1;
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    atexit([]() {
+                        for (int i = 0; i < 2; ++i) {
+                            if (g_dr_rounds[i] == 0) continue;
+                            fprintf(stderr, "[draft-acc] %s: %lld rounds, drafted %lld, accepted %lld = %.3f per round "
+                                            "(%.3f tokens per round with the bonus token)\n",
+                                    i == 0 ? "dflash2" : "mtp-head", g_dr_rounds[i], g_dr_drafted[i], g_dr_acc[i],
+                                    (double) g_dr_acc[i] / (double) g_dr_rounds[i],
+                                    1.0 + (double) g_dr_acc[i] / (double) g_dr_rounds[i]);
+                        }
+                    });
+                }
+                g_dr_rounds[d]++;
+                g_dr_drafted[d] += k_in;
+                g_dr_acc[d] += m;
+            }
             tm.mtp_drafted  += k_in;
             tm.mtp_accepted += m;
             for (int j = 0; j < k_in && j < (int) tm.mtp_verified_by_pos.size(); ++j) {
@@ -2245,7 +2300,8 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
                     s.drafts[(size_t) j] = h_drafts_[j * B + b];
                 }
             }
-            if (const LookupCfg & lc = lookup_cfg(); lc.on && B == 1 && !ws_calibrating_ && !s.hist.empty()) {
+            if (const LookupCfg & lc = lookup_cfg();
+                lc.on && (B == 1 || (lk_multi_cap() > 0 && !cfg_.exact_verify)) && !ws_calibrating_ && !s.hist.empty()) {
                 const int l0 = std::max(1, lc.l0);
                 if (s.lk_len <= 0) s.lk_len = l0;
                 if (s.lk_k > 0) {   // this round verified lookup drafts: slow start grows on a full accept, resets on a miss
@@ -2254,12 +2310,17 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
                     g_lk_acc += m;
                     // lk_full: consecutive fully accepted rounds at the current length (reset whenever the length moves)
                     s.lk_full = m >= s.lk_n ? s.lk_full + 1 : 0;
-                    if (m < s.lk_n) { s.lk_len = l0; s.lk_full = 0; }
+                    if (m < s.lk_n) {   // AI_LOOKUP_MISS: 0 back to L0, 1 halve, 2 keep the length, 3 halve after a full round
+                        const bool halve = lc.miss == 1 || (lc.miss == 3 && s.lk_prev_full);
+                        s.lk_len  = lc.miss == 2 ? s.lk_len : halve ? std::max(l0, s.lk_len / 2) : l0;
+                        s.lk_full = 0;
+                    }
                     else if (2 * s.lk_len <= lc.top || s.lk_full >= lc.hold) {
                         const int nl = std::min(K, 2 * s.lk_len);
                         if (nl != s.lk_len) s.lk_full = 0;
                         s.lk_len = nl;
                     }
+                    s.lk_prev_full = m >= s.lk_n;
                     // disarm after AI_LOOKUP_DISARM (2) rounds that accepted under a quarter of their real lookup drafts
                     if (m >= s.lk_n) s.lk_miss = 0;
                     else if (m < s.lk_n / 4 && ++s.lk_miss >= lc.disarm) { s.lk_armed = false; s.lk_run = 0; s.lk_miss = 0; }
@@ -2287,7 +2348,8 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
                 // exact verify holds to 4 columns: lookup drafts stay within K (<= 3 there). AI_EXACT_ANY_K=1 (a
                 // batch-invariant ggml build, MMVQ pinned to 1..8 columns) lifts that to K, the widest exact verify.
                 static const bool exact_any_k = getenv("AI_EXACT_ANY_K") && atoi(getenv("AI_EXACT_ANY_K")) != 0;
-                const int cap = cfg_.exact_verify ? std::min(K, exact_any_k ? K : 3) : std::min(K, s.lk_len);
+                const int cap = cfg_.exact_verify ? std::min(K, exact_any_k ? K : 3)
+                                                  : std::min({ K, s.lk_len, B > 1 ? lk_multi_cap() : K });
                 s.lk_k = 0;
                 if (armed && lk_propose(s, lc.nmin, lc.nmax, cap, pr) > 0 && (int) pr.size() >= lc.minlen &&
                     [&]() {   // AI_LOOKUP_AGREE=N: the first N lookup tokens must equal the drafter's (0 = off)
@@ -2295,7 +2357,8 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
                         return lc.agree <= 0 || (n > 0 && std::equal(pr.begin(), pr.begin() + n, s.drafts.begin()));
                     }()) {
                     // bucket the width (few captured profiles); pad with the last proposal (a padded draft is rejected)
-                    const int w = cfg_.exact_verify ? std::max((int) pr.size(), k_out) : lk_bucket((int) pr.size(), k_out, K);
+                    const int w = cfg_.exact_verify ? std::max((int) pr.size(), k_out)
+                                                    : lk_bucket((int) pr.size(), k_out, B > 1 ? std::min(K, lk_multi_cap()) : K);
                     s.lk_n = (int) pr.size();
                     while ((int) pr.size() < w) pr.push_back(pr.back());
                     s.drafts.assign(pr.begin(), pr.begin() + w);
@@ -2367,8 +2430,21 @@ int Engine::decode_round(const std::function<bool(int, int32_t)> & sink, Timing 
             }
         }
         // AI_LOOKUP: a lookup proposal replaces MTP's drafts for the next round: verify all of them (no gate)
-        if (mtp && B == 1 && st[0].lk_k > 0) {
-            k_in = st[0].lk_k;
+        int lk_w = 0;
+        if (mtp && B == 1) lk_w = st[0].lk_k;
+        else if (mtp && lk_multi_cap() > 0 && !cfg_.exact_verify) {
+            for (int b = 0; b < B; ++b) if (!st[(size_t) b].done) lk_w = std::max(lk_w, st[(size_t) b].lk_k);
+            if (lk_w > k_in) {   // the round goes this wide: every other stream pads its drafts with its last one
+                for (int b = 0; b < B; ++b) {
+                    Stream & s = st[(size_t) b];
+                    if (s.done) continue;
+                    const int32_t pad = s.drafts.empty() ? s.pend : s.drafts.back();
+                    if ((int) s.drafts.size() < lk_w) s.drafts.resize((size_t) lk_w, pad);
+                }
+            }
+        }
+        if (lk_w > 0) {
+            k_in = std::max(B == 1 ? 0 : k_in, lk_w);
             static bool armed = false;
             if (!armed) {
                 armed = true;

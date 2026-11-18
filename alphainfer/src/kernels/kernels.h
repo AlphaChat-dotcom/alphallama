@@ -502,6 +502,11 @@ void df2_round_inputs(void * stream, const int32_t * base, const int32_t * m, co
                       int64_t n_full = 0, int64_t * ctx_lin = nullptr, int64_t * blk_lin = nullptr,
                       uint16_t * mask_full = nullptr);
 void copy_i32(void * stream, const int32_t * src, int32_t * dst, int64_t n);
+// DFlash2 two-tap grouped dynamic conv, one phase, fused (ops/dflash2.cpp conv_phase):
+//   out[h,i] = res[h,i] + (base[k0*E+h] + dyn[k0*G+g, i]) * y[h,i] + (base[k1*E+h] + dyn[k1*G+g, i]) * y[h,i-1]
+// k_tap = ph*2 + tap, g = h / gs, y[h,-1] = 0; res may be null. Column strides in floats.
+void df2_conv(void * stream, const float * y, int64_t ld_y, const float * dyn, int64_t ld_dyn, const float * base,
+              const float * res, int64_t ld_res, int ph, int gs, int64_t E, int64_t T, float * out, int64_t ld_out);
 // Greedy coherent selector over top-k candidates (ids/logits [k, nd]), hidden projection hh [rank, nd] and BF16
 // codebooks [rank, V]; the first predecessor is anchor_src[anchor_idx]. drafts i32 [nd].
 bool df2_select(void * stream, const int32_t * cand, const float * unary, const float * hh, const void * pred_cb,

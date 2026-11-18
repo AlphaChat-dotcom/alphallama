@@ -32,6 +32,10 @@ static void moe_dump(Device & d, const char * name, const Tensor & t) {
     if (!dir || g_dump_layer < 0 || recording() || !t.valid()) {
         return;
     }
+    const char * only = getenv("AI_DUMP_ONLY");   // qwen35_hybrid.cpp: one name-layer only
+    if (only && *only && std::string(name) + "-" + std::to_string(g_dump_layer) != only) {
+        return;
+    }
     const int64_t cols = t.ne[0], rows = t.numel() / t.ne[0];
     const size_t  esz  = 4;   // F32 and I32 alike
     std::vector<char> host((size_t) t.numel() * esz);
@@ -117,6 +121,59 @@ static void side_end(Device & d, const SideFork & f) {
 }
 static void side_join(Device & d, const SideFork & f) {
     adapter::native(d, [=]() { kern::stream_wait_event(f.st_main, f.ev_join); });
+}
+
+StreamFork fork_begin(Device & d, int stream_no) {
+    StreamFork f;
+    void * ev_fork    = side_event();
+    f.ev_join         = side_event();
+    f.st_main         = adapter::stream(d);
+    f.st_side         = kern::backend_stream_no(d.backend(), stream_no);
+    f.no              = stream_no;
+    ggml_backend * bk = d.backend();
+    const StreamFork ff = f;
+    adapter::native(d, [=]() {
+        kern::event_record(ev_fork, ff.st_main);
+        kern::stream_wait_event(ff.st_side, ev_fork);
+        kern::backend_set_stream_no(bk, ff.no);
+    });
+    return f;
+}
+void fork_end(Device & d, const StreamFork & f) {
+    ggml_backend * bk = d.backend();
+    adapter::native(d, [=]() {
+        kern::backend_set_stream_no(bk, 0);
+        kern::event_record(f.ev_join, f.st_side);
+    });
+}
+void fork_join(Device & d, const StreamFork & f) {
+    adapter::native(d, [=]() { kern::stream_wait_event(f.st_main, f.ev_join); });
+}
+
+void copy_spans_into(Device & d, const std::vector<std::pair<Tensor, Tensor>> & pairs, const char * who) {
+    kern::CopySpans cs{};
+    Device *        dv = &d;
+    const auto flush = [&]() {
+        if (cs.count == 0) return;
+        const kern::CopySpans c = cs;
+        adapter::native(d, [=]() { kern::copy_spans(adapter::stream(*dv), c); });
+        cs = kern::CopySpans{};
+    };
+    for (const auto & pr : pairs) {
+        const Tensor & s = pr.first;
+        const Tensor & t = pr.second;
+        const int64_t  n = s.ne[0] * s.ne[1] * s.ne[2] * s.ne[3];
+        if (s.type != F32 || t.type != F32 || !s.contiguous() || !t.contiguous() ||
+            n != t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) {
+            copy_into(d, s, t, who);
+            continue;
+        }
+        cs.src[cs.count] = (const float *) s.data;
+        cs.dst[cs.count] = (float *) t.data;
+        cs.n[cs.count]   = n;
+        if (++cs.count == 8) flush();
+    }
+    flush();
 }
 
 // Returns an invalid Tensor when not applicable; the caller keeps the ggml GEMV.
@@ -1484,7 +1541,7 @@ void gdn_fold_masked(Device & d, const GdnWeights & w, const GdnParams & p, cons
     if (prep) {
         gtm_t = d.ws_alloc(F32, Hv, L * B);
         btm_t = d.ws_alloc(F32, Hv, L * B);
-        void *          st  = adapter::stream(d);
+        Device *        dvp = &d;   // the stream is resolved when the launch runs: it follows a fork (AI_FOLD_SIDE)
         const float *   pgh = (const float *) rec.gh.data, *pbh = (const float *) rec.bh.data;
         const float *   pcm = (const float *) colmask.data;
         float *         pgt = (float *) gtm_t.data, *pbt = (float *) btm_t.data;
@@ -1492,7 +1549,7 @@ void gdn_fold_masked(Device & d, const GdnWeights & w, const GdnParams & p, cons
         float *         cdst = (float *) s.conv.data;
         const int32_t * pm   = (const int32_t *) m.data;
         const int64_t   Ci = C, K1i = K1, Hvi = Hv, Li = L, Bi = B;
-        adapter::native(d, [=]() { kern::gdn_fold_prep(st, pgh, pbh, pcm, pgt, pbt, Hvi, Li, Bi, csrc, K1i, Ci, pm, cdst); });
+        adapter::native(d, [=]() { kern::gdn_fold_prep(adapter::stream(*dvp), pgh, pbh, pcm, pgt, pbt, Hvi, Li, Bi, csrc, K1i, Ci, pm, cdst); });
     }
     {
         Call c(d);
@@ -1556,11 +1613,11 @@ void gdn_fold_masked(Device & d, const GdnWeights & w, const GdnParams & p, cons
     if (prep) {
         return;   // the conv gather ran in the prep launch
     }
-    void * st = adapter::stream(d);
+    Device * dvg = &d;
     const float *   src = (const float *) rec.conv_input.data;
     float *         dst = (float *) s.conv.data;
     const int32_t * pm  = (const int32_t *) m.data;
-    adapter::native(d, [=]() { kern::conv_gather(st, src, K1, L, C, B, pm, dst); });
+    adapter::native(d, [=]() { kern::conv_gather(adapter::stream(*dvg), src, K1, L, C, B, pm, dst); });
 }
 
 Accept mtp_accept(Device & d, const Tensor & g, const Tensor & ids, int64_t L, int64_t B) {

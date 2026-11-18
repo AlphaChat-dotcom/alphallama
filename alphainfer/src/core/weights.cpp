@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/weights.h"
+#include "core/compat.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -30,7 +31,7 @@ WeightSet::~WeightSet() {
         if (host_registered_) {
             ggml_backend_cuda_unregister_host_buffer(host_block_);
         }
-        free(host_block_);
+        ai_aligned_free(host_block_);
     }
     for (auto & m : maps_) {
         munmap(m.first, m.second);
@@ -290,7 +291,7 @@ bool WeightSet::load(Device & dev, size_t max_buffer_bytes, bool verbose, const 
         if (host_off[i] != SIZE_MAX) {
             e.t.buf  = -1;
             e.t.data = host_block_ + host_off[i];
-            if (fseeko(f, (off_t) e.file_offset, SEEK_SET) != 0 ||
+            if (fseeko(f, (int64_t) e.file_offset, SEEK_SET) != 0 ||
                 fread(e.t.data, 1, e.nbytes, f) != e.nbytes) {
                 throw std::runtime_error("host read failed for " + e.name);
             }
@@ -312,7 +313,7 @@ bool WeightSet::load(Device & dev, size_t max_buffer_bytes, bool verbose, const 
         }
         e.t.data = addr;
 
-        if (fseeko(f, (off_t) e.file_offset, SEEK_SET) != 0) {
+        if (fseeko(f, (int64_t) e.file_offset, SEEK_SET) != 0) {
             throw std::runtime_error("seek failed for " + e.name);
         }
         if (e.src_type >= 0) {   // ConvertFilter: stored as src_type in the file, held as t.type
@@ -518,7 +519,7 @@ bool WeightSet::copy_from_mapping(const void * src, void * dst, size_t n, int th
                 const size_t a0 = fo & ~(pg - 1), a1 = (fo + len + pg - 1) & ~(pg - 1);
                 size_t got = 0;
                 while (got < a1 - a0) {
-                    const ssize_t r = pread(fd_d, bounce + got, a1 - a0 - got, (off_t) (a0 + got));
+                    const ssize_t r = pread(fd_d, bounce + got, a1 - a0 - got, (int64_t) (a0 + got));
                     if (r <= 0) break;
                     got += (size_t) r;
                 }
@@ -528,7 +529,7 @@ bool WeightSet::copy_from_mapping(const void * src, void * dst, size_t n, int th
                 if (fd_b < 0) fd_b = ::open(paths_[(size_t) map].c_str(), O_RDONLY);
                 size_t got = 0;
                 while (fd_b >= 0 && got < len) {
-                    const ssize_t r = pread(fd_b, (char *) dst + o0 + got, len - got, (off_t) (fo + got));
+                    const ssize_t r = pread(fd_b, (char *) dst + o0 + got, len - got, (int64_t) (fo + got));
                     if (r <= 0) break;
                     got += (size_t) r;
                 }
@@ -536,7 +537,7 @@ bool WeightSet::copy_from_mapping(const void * src, void * dst, size_t n, int th
                 buffered++;
             }
         }
-        free(bounce);
+        ai_aligned_free(bounce);
         if (fd_d >= 0) ::close(fd_d);
         if (fd_b >= 0) ::close(fd_b);
     };
@@ -590,7 +591,7 @@ bool WeightSet::read_into(const std::vector<ReadJob> & jobs, int threads, bool *
             bool   ok  = false;
             if (fd >= 0) {
                 while (got < a1 - a0) {
-                    const ssize_t r = pread(fd, t0 + got, a1 - a0 - got, (off_t) (a0 + got));
+                    const ssize_t r = pread(fd, t0 + got, a1 - a0 - got, (int64_t) (a0 + got));
                     if (r <= 0) break;
                     got += (size_t) r;
                 }
@@ -601,7 +602,7 @@ bool WeightSet::read_into(const std::vector<ReadJob> & jobs, int threads, bool *
                 if (fb == -2) fb = ::open(paths_[(size_t) k.map].c_str(), O_RDONLY);
                 size_t g2 = 0;
                 while (fb >= 0 && g2 < k.len) {
-                    const ssize_t r = pread(fb, k.dst + g2, k.len - g2, (off_t) (k.fo + g2));
+                    const ssize_t r = pread(fb, k.dst + g2, k.len - g2, (int64_t) (k.fo + g2));
                     if (r <= 0) break;
                     g2 += (size_t) r;
                 }
@@ -626,7 +627,7 @@ bool WeightSet::host_pread(const void * p, void * dst, size_t n) const {
         if (a < mb || a + n > mb + maps_[i].second) continue;
         size_t done = 0;
         while (done < n) {
-            const ssize_t r = pread(fds_[i], (char *) dst + done, n - done, (off_t) (a - mb + done));
+            const ssize_t r = pread(fds_[i], (char *) dst + done, n - done, (int64_t) (a - mb + done));
             if (r <= 0) return false;
             done += (size_t) r;
         }
@@ -653,7 +654,7 @@ bool WeightSet::host_pread_direct(const void * p, void * dst, size_t n) const {
         thread_local void * blk = nullptr;
         thread_local size_t cap = 0;
         if (cap < len) {
-            free(blk);
+            ai_aligned_free(blk);
             blk = nullptr;
             cap = 0;
             if (posix_memalign(&blk, 4096, len) != 0) return false;
@@ -661,7 +662,7 @@ bool WeightSet::host_pread_direct(const void * p, void * dst, size_t n) const {
         }
         size_t done = 0;
         while (done < len) {
-            const ssize_t r = pread(fd, (char *) blk + done, len - done, (off_t) (b0 + done));
+            const ssize_t r = pread(fd, (char *) blk + done, len - done, (int64_t) (b0 + done));
             if (r <= 0) break;   // EOF (the last block of the file) or an error
             done += (size_t) r;
         }
@@ -679,7 +680,7 @@ int WeightSet::host_pread_nowait(const void * p, void * dst, size_t n) const {
         const uintptr_t mb = (uintptr_t) maps_[i].first;
         if (a < mb || a + n > mb + maps_[i].second) continue;
         struct iovec iov = { dst, n };
-        const ssize_t r = preadv2(fds_[i], &iov, 1, (off_t) (a - mb), RWF_NOWAIT);
+        const ssize_t r = preadv2(fds_[i], &iov, 1, (int64_t) (a - mb), RWF_NOWAIT);
         if (r == (ssize_t) n) return 1;
         if (r >= 0 || errno == EAGAIN) return 0;   // short: part of the range is not cached
         return -1;
@@ -696,7 +697,7 @@ bool WeightSet::host_prefetch(const void * p, size_t n) const {
     for (size_t i = 0; i < maps_.size() && i < fds_.size(); ++i) {
         const uintptr_t mb = (uintptr_t) maps_[i].first;
         if (a < mb || a + n > mb + maps_[i].second) continue;
-        return posix_fadvise(fds_[i], (off_t) (a - mb), (off_t) n, POSIX_FADV_WILLNEED) == 0;
+        return posix_fadvise(fds_[i], (int64_t) (a - mb), (int64_t) n, POSIX_FADV_WILLNEED) == 0;
     }
 #else
     (void) p; (void) n;

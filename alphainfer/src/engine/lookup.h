@@ -34,9 +34,14 @@ namespace ai {
 //                    without staying armed on non-copy output.
 //   AI_LOOKUP_HOLD=N (default 1 = plain doubling), AI_LOOKUP_TOP=W (64): growing the proposal length past W needs N
 //                    consecutive fully accepted lookup rounds, since a partially accepted wide round is expensive.
+//   AI_LOOKUP_MISS=N (default 0): the proposal length after a partially accepted lookup round. 0 = back to
+//                    AI_LOOKUP_L0 (slow start again), 1 = half the length (not below L0), 2 = unchanged, 3 = half when
+//                    the previous lookup round was fully accepted, else L0. A copy broken by a short edit resumes near
+//                    full length instead of re-growing from L0 over ~4 rounds; 3 still drops to L0 on repeated misses
+//                    (1 kept every retry wide on log triage: -9%).
 // Widths are bucketed {chain, 8, 16, 32, 64, 128} (<= K) so few graph profiles are captured.
 struct LookupCfg {
-    int on, nmin, nmax, minlen, agree, l0, arm, arm_df2, disarm, start, top, hold;
+    int on, nmin, nmax, minlen, agree, l0, arm, arm_df2, disarm, start, top, hold, miss;
 };
 inline const LookupCfg & lookup_cfg() {
     static const LookupCfg c = []() {
@@ -45,7 +50,7 @@ inline const LookupCfg & lookup_cfg() {
                           iv("AI_LOOKUP_AGREE", 3), iv("AI_LOOKUP_L0", 8),
                           iv("AI_LOOKUP_ARM", 8), iv("AI_LOOKUP_ARM_DF2", -1),
                           iv("AI_LOOKUP_DISARM", 2), iv("AI_LOOKUP_START", 0),
-                          iv("AI_LOOKUP_TOP", 64), iv("AI_LOOKUP_HOLD", 1) };
+                          iv("AI_LOOKUP_TOP", 64), iv("AI_LOOKUP_HOLD", 1), iv("AI_LOOKUP_MISS", 0) };
     }();
     return c;
 }

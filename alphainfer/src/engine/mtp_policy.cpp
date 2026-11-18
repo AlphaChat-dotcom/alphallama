@@ -79,6 +79,14 @@ bool apply_mtp_policy(EngineConfig & cfg, int mode) {
         fprintf(stderr, "[ai] lookup: shadow-armed at %s matched tokens (%s model)\n", getenv("AI_LOOKUP_ARM"),
                 gguf_is_dense(cfg.model_path) ? "dense" : "MoE");
     }
+    // An explicit exact request (AI_MTP_MODE=exact, serve --decode-mode exact) promises output token-identical to plain
+    // decode, which the fast verify does not keep (35B doorbell: 0-2 of 8 prompts repeat). Serve plain decode instead.
+    if (mtp_exact && cfg.mtp_k > 0 && cfg.expert_slots > 0) {
+        fprintf(stderr, "[ai] MTP: exact verify is not available with expert offload (no pool-direct split path); "
+                        "exact was requested, so this runs plain decode (token-identical, no MTP)\n");
+        cfg.mtp_k    = 0;
+        mtp_exact_on = false;
+    }
     if (mtp_exact_on && cfg.expert_slots > 0) {
         fprintf(stderr, "[ai] MTP: exact verify is not available with expert offload (no pool-direct split path); "
                         "running the fast verify\n");
@@ -292,6 +300,13 @@ bool apply_mtp_policy(EngineConfig & cfg, int mode) {
                         getenv("AI_MTP_GATE"));
             }
         }
+    }
+    // A plain engine never drafts: no lower-bit draft-head copy, as serve's --decode-mode plain already sets. Under
+    // expert offload its VRAM would otherwise cost resident slots (35B on 20 GB: 190 instead of 192 per layer), and
+    // the slot count changes which experts the CPU computes, so the exact-requested plain decode differed from a plain
+    // server on 6 of 8 prompts. An explicit value wins.
+    if (cfg.mtp_k == 0 && cfg.dflash2_path.empty()) {
+        setenv("AI_MTP_DRAFT_Q", "off", 0);
     }
     return mtp_exact_on;
 }

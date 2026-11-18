@@ -29,8 +29,9 @@ struct PendingResponse {
 
     // Accumulated output
     std::string text;
+    std::vector<int32_t> ids;   // generated token ids (/v1/completions "return_tokens")
     int n_tokens = 0;
-    int n_cached = 0;     // prompt tokens served from the prefix / KV cache (usage.prompt_tokens_details.cached_tokens)
+    int n_cached = 0;    // prompt tokens served from the prefix / KV cache (usage.prompt_tokens_details.cached_tokens)
     bool done = false;
     bool error = false;   // finished by a decode error (truncated) -> finish_reason "error", not "stop"
     bool length = false;  // finished by max_tokens / the context (truncated by a limit) -> finish_reason "length"
@@ -168,6 +169,7 @@ public:
 
         std::lock_guard<std::mutex> lock(pr->mtx);
         pr->text += event.text;
+        if (event.token != LLAMA_TOKEN_NULL) pr->ids.push_back(event.token);
         pr->n_tokens = event.n_generated;
         if (event.n_cached >= 0) pr->n_cached = event.n_cached;
         if (pr->stream) {

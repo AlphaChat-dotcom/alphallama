@@ -38,7 +38,12 @@ struct EvenSigns {
 static const EvenSigns k_even_signs;
 
 // fp16 -> fp32 inline (F16C), as ggml-cpu's GGML_CPU_FP16_TO_FP32; ggml_fp16_to_fp32 is an out-of-line call
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC has no _cvtsh_ss: the same F16C conversion through the 128-bit form
+static inline float gsq_h2f(ggml_half h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
+#else
 static inline float gsq_h2f(ggml_half h) { return _cvtsh_ss(h); }
+#endif
 
 static inline float hsum8(__m256 v) {
     __m128 r = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));

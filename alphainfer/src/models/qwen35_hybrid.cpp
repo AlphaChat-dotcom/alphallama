@@ -45,15 +45,29 @@ static const char * dump_dir() {
     return d;
 }
 
+// AI_DUMP_ONLY=<name>-<layer> (e.g. l_out-63): dump only that tensor, and append each call as a record
+// (int64 cols, int64 rows, f32 rows) to <name>-<layer>.bin instead of overwriting it -- a long run's per-position stream.
+static const char * dump_only() {
+    static const char * o = getenv("AI_DUMP_ONLY");
+    return o && *o ? o : nullptr;
+}
+
 static void dump(Device & dev, const char * name, int il, const Tensor & t) {
     if (!dump_dir() || t.type != F32 || op::recording()) {
+        return;
+    }
+    const std::string key = std::string(name) + "-" + std::to_string(il);
+    if (dump_only() && key != dump_only()) {
         return;
     }
     const int64_t cols = t.ne[0], rows = t.numel() / t.ne[0];
     std::vector<float> host((size_t) t.numel());
     dev.download(t, host.data(), 0, host.size() * 4);
-    std::string path = std::string(dump_dir()) + "/" + name + "-" + std::to_string(il) + ".bin";
-    FILE * f = fopen(path.c_str(), "wb");
+    std::string path = std::string(dump_dir()) + "/" + key + ".bin";
+    FILE * f = fopen(path.c_str(), dump_only() ? "ab" : "wb");
+    if (!f) {
+        return;
+    }
     int64_t hdr[2] = {cols, rows};
     fwrite(hdr, 8, 2, f);
     fwrite(host.data(), 4, host.size(), f);
@@ -1785,6 +1799,9 @@ Tensor Qwen35Hybrid::forward(Device & dev, const Inputs & in, bool all_logits, G
         const size_t bytes = rec_arena_bytes(T);
         rec_arena = dev.ws_alloc(I8, (int64_t) bytes);
     }
+    // AI_REC_SPANS (opt-in): a scoped round's record copies as copy_spans launches instead of one ggml copy each
+    static const bool k_rec_spans = getenv("AI_REC_SPANS") && atoi(getenv("AI_REC_SPANS")) != 0;
+    std::vector<std::pair<Tensor, Tensor>> rec_pend;
     const auto persist = [&](Tensor & t) {
         if (!t.valid()) return;
         Tensor d;
@@ -1798,7 +1815,11 @@ Tensor Qwen35Hybrid::forward(Device & dev, const Inputs & in, bool all_logits, G
         d.data = (char *) rec_arena.data + rec_off;
         d.buf  = rec_arena.buf;
         rec_off += nb;
-        op::copy_into(dev, t, d, "gdn record -> arena");
+        if (k_rec_spans) {
+            rec_pend.emplace_back(t, d);   // flushed per layer as copy_spans launches (AI_REC_SPANS)
+        } else {
+            op::copy_into(dev, t, d, "gdn record -> arena");
+        }
         t = d;
     };
     Tensor pre_normed;   // the previous layer's merge kernel may have produced this layer's norm
@@ -1826,6 +1847,10 @@ Tensor Qwen35Hybrid::forward(Device & dev, const Inputs & in, bool all_logits, G
                 op::GdnRecord & R = rec->layers[(size_t) g];
                 for (Tensor * t : { &R.conv_input, &R.conv_out, &R.ba, &R.beta, &R.alpha, &R.qh, &R.kh, &R.gh, &R.bh }) {
                     persist(*t);
+                }
+                if (!rec_pend.empty()) {
+                    op::copy_spans_into(dev, rec_pend, "gdn record -> arena");
+                    rec_pend.clear();
                 }
             }
             dump(dev, "linear_attn_out", il, mix);

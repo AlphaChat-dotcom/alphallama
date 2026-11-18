@@ -487,11 +487,21 @@ void gpu_engine::backend_sampler_sync(const BatchRequest & req) {
     // which the grow ladder's budget does not include and which can OOM the first request. The
     // sampler can be installed at ubatch 512 before a later long prompt grows the batch, so the gate
     // uses the largest possible micro-batch, not the current one.
-    static const bool on = []() {
+    if (!ctx_) return;   // before the static below: it reads the context's sequence count once
+    //
+    // Not default-on with more than one sequence: at -np 8 with MTP off it returned out-of-vocab ids (1023793664 of
+    // 248320) under 8 concurrent requests on an RTX 5090 (2.0.9), and the detokenizer threw std::out_of_range, killing
+    // the server. Single-slot serving is where the 4 bytes pay anyway.
+    static const bool on = [this]() {
         const char * e = getenv("ALPHA_BACKEND_ARGMAX");
         if (e) return atoi(e) != 0;
         const char * m = getenv("ALPHA_MTP");
         if (m && atoi(m) != 0) return false;
+        if (llama_n_seq_max(ctx_) > 1) {
+            fprintf(stderr, "[serve] backend argmax OFF by default with %u sequences (ALPHA_BACKEND_ARGMAX=1 forces it)\n",
+                    llama_n_seq_max(ctx_));
+            return false;
+        }
         const int max_ub = std::max(g_serve_prompt_chunk, g_serve_ubatch_prefill);
         if (max_ub > 512) {
             fprintf(stderr, "[serve] backend argmax OFF by default: prefill micro-batch can reach %d, and its "

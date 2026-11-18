@@ -71,6 +71,94 @@ void df2_ctx_append(Device & d, const Df2Weights & w, const Df2Params & p, const
 }
 
 // One layer per Call: a Call graph holds at most 512 nodes and a layer is ~150 (the conv phases dominate).
+// [AI_DF2_CONV_NATIVE, default 1] the conv phases as one fused kernel each (kern::df2_conv) between four small Calls
+// per layer, instead of ~11 ggml nodes per phase inside one Call (df4p: the 5-layer block was 2.16 ms per draft for
+// ~290 MiB of weights). out = conv(y) [+ res]
+static Tensor conv_native(Device & d, const Tensor & y, const Tensor & dyn, const Tensor & base, int ph, int gs,
+                          const Tensor * res) {
+    const int64_t E = y.ne[0], T = y.ne[1];
+    if (y.type != F32 || dyn.type != F32 || base.type != F32 || y.nb[0] != 4 || dyn.nb[0] != 4 ||
+        (res && (res->type != F32 || res->nb[0] != 4))) {
+        throw std::runtime_error("df2 conv_native: f32 row-contiguous inputs expected");
+    }
+    Tensor        out = d.ws_alloc(F32, E, T);
+    void *        st  = adapter::stream(d);
+    const float * py = (const float *) y.data, *pd = (const float *) dyn.data, *pb = (const float *) base.data;
+    const float * pr = res ? (const float *) res->data : nullptr;
+    const int64_t ly = (int64_t) y.nb[1] / 4, ld = (int64_t) dyn.nb[1] / 4, lr = res ? (int64_t) res->nb[1] / 4 : 0;
+    float *       po = (float *) out.data;
+    adapter::native(d, [=]() { kern::df2_conv(st, py, ly, pd, ld, pb, pr, lr, ph, gs, E, T, po, E); });
+    return out;
+}
+
+static Tensor df2_layer_native(Device & d, const Df2Layer & L, const Df2Params & p, const Tensor & kcache,
+                               const Tensor & vcache, const Tensor & x, const Tensor & pos, const Tensor & block_cells,
+                               const Tensor & mask, int64_t n_kv, const Tensor * final_norm) {
+    const int64_t T = x.ne[1], D = p.head_dim, Hq = p.n_head, Hkv = p.n_head_kv;
+    const int     gs = p.group_size;
+    // 1: n = norm(x), dA = aconv_proj n
+    Tensor n, dA;
+    {
+        Call          c(d);
+        ggml_context * g  = c.ctx();
+        ggml_tensor *  nn = ggml_mul(g, ggml_rms_norm(g, c.in(x, "df2_x"), p.eps), c.in(L.attn_norm));
+        c.effect(nn);
+        dA = c.run(ggml_mul_mat(g, c.in(L.aconv_proj), nn));
+        n  = c.to_public(nn);
+    }
+    const Tensor a = conv_native(d, n, dA, L.aconv_base, 0, gs, nullptr);
+    // 2: attention -> o
+    Tensor o;
+    {
+        Call          c(d);
+        ggml_context * g  = c.ctx();
+        ggml_tensor *  ga = c.in(a, "df2_a");
+        ggml_tensor *  gp = c.in(pos, "df2_pos");
+        ggml_tensor *  q  = ggml_reshape_3d(g, ggml_mul_mat(g, c.in(L.q), ga), D, Hq, T);
+        ggml_tensor *  k  = ggml_reshape_3d(g, ggml_mul_mat(g, c.in(L.k), ga), D, Hkv, T);
+        ggml_tensor *  v  = ggml_mul_mat(g, c.in(L.v), ga);
+        q = rope_neox(g, ggml_mul(g, ggml_rms_norm(g, q, p.eps), c.in(L.q_norm)), gp, p);
+        k = rope_neox(g, ggml_mul(g, ggml_rms_norm(g, k, p.eps), c.in(L.k_norm)), gp, p);
+        ggml_tensor * gc  = c.in(block_cells, "df2_cells");
+        ggml_tensor * kc  = ggml_set_rows(g, c.in(kcache), ggml_reshape_2d(g, k, D * Hkv, T), gc);
+        ggml_tensor * vc  = ggml_set_rows(g, c.in(vcache), v, gc);
+        const size_t  rD  = ggml_row_size(kc->type, D);
+        const size_t  rDH = ggml_row_size(kc->type, D * Hkv);
+        ggml_tensor * kp  = ggml_permute(g, ggml_view_3d(g, kc, D, Hkv, n_kv, rD, rDH, 0), 0, 2, 1, 3);
+        ggml_tensor * vp  = ggml_permute(g, ggml_view_3d(g, vc, D, Hkv, n_kv, rD, rDH, 0), 0, 2, 1, 3);
+        ggml_tensor * qp  = ggml_permute(g, q, 0, 2, 1, 3);
+        ggml_tensor * fa  = ggml_flash_attn_ext(g, qp, kp, vp, c.in(mask, "df2_mask"), 1.0f / sqrtf((float) D), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        o = c.run(ggml_mul_mat(g, c.in(L.o), ggml_reshape_2d(g, fa, D * Hq, T)));
+    }
+    const Tensor h1 = conv_native(d, o, dA, L.aconv_base, 1, gs, &x);   // h = x + conv1(o)
+    // 3: n2 = norm(h1), dM = fconv_proj n2
+    Tensor n2, dM;
+    {
+        Call          c(d);
+        ggml_context * g  = c.ctx();
+        ggml_tensor *  nn = ggml_mul(g, ggml_rms_norm(g, c.in(h1, "df2_h1"), p.eps), c.in(L.ffn_norm));
+        c.effect(nn);
+        dM = c.run(ggml_mul_mat(g, c.in(L.fconv_proj), nn));
+        n2 = c.to_public(nn);
+    }
+    const Tensor m = conv_native(d, n2, dM, L.fconv_base, 0, gs, nullptr);
+    // 4: MLP -> dn
+    Tensor dn;
+    {
+        Call          c(d);
+        ggml_context * g  = c.ctx();
+        ggml_tensor *  gm = c.in(m, "df2_m");
+        ggml_tensor *  u  = ggml_mul(g, ggml_silu(g, ggml_mul_mat(g, c.in(L.gate), gm)), ggml_mul_mat(g, c.in(L.up), gm));
+        dn = c.run(ggml_mul_mat(g, c.in(L.down), u));
+    }
+    const Tensor h2 = conv_native(d, dn, dM, L.fconv_base, 1, gs, &h1);   // h = h1 + conv1(dn)
+    if (!final_norm) return h2;
+    Call          c(d);
+    ggml_context * g = c.ctx();
+    return c.run(ggml_mul(g, ggml_rms_norm(g, c.in(h2, "df2_h2"), p.eps), c.in(*final_norm)));
+}
+
 static Tensor df2_layer(Device & d, const Df2Layer & L, const Df2Params & p, const Tensor & kcache,
                         const Tensor & vcache, const Tensor & x, const Tensor & pos, const Tensor & block_cells,
                         const Tensor & mask, int64_t n_kv, const Tensor * final_norm) {
@@ -135,8 +223,13 @@ Tensor df2_block(Device & d, const Df2Weights & w, const Df2Params & p, const Df
         if (!sl && (!block_lin.valid() || !mask_full.valid() || mask_full.ne[0] != n_full)) {
             throw std::runtime_error("df2_block: a full-attention layer needs linear block cells and mask_full");
         }
-        h = df2_layer(d, w.layers[il], p, kv.k[il], kv.v[il], h, pos, sl ? block_cells : block_lin,
-                      sl ? mask : mask_full, sl ? n_kv : n_full, last ? &w.out_norm : nullptr);
+        static const bool native = !getenv("AI_DF2_CONV_NATIVE") || atoi(getenv("AI_DF2_CONV_NATIVE")) != 0;
+        const Df2Layer &  Lw     = w.layers[il];
+        h = native && Lw.aconv_proj.valid()
+                ? df2_layer_native(d, Lw, p, kv.k[il], kv.v[il], h, pos, sl ? block_cells : block_lin,
+                                   sl ? mask : mask_full, sl ? n_kv : n_full, last ? &w.out_norm : nullptr)
+                : df2_layer(d, Lw, p, kv.k[il], kv.v[il], h, pos, sl ? block_cells : block_lin,
+                            sl ? mask : mask_full, sl ? n_kv : n_full, last ? &w.out_norm : nullptr);
         static const bool trace = getenv("DF2_TRACE") != nullptr && !recording();
         if (trace) {
             d.synchronize();

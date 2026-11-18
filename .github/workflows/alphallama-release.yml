@@ -13,8 +13,8 @@
 #   win-arm64-cpu        Windows on ARM (Snapdragon X and similar)
 #   macos-arm64          Apple Silicon, Metal; macOS 12 or newer
 #   macos-x64            Intel Mac, CPU only; macOS 12 or newer
-# The Windows and macOS packages do not include the AlphaInfer engine (Linux only); alphallama-serve uses its built-in
-# engine there.
+# The Linux and Windows CUDA packages include the AlphaInfer engine; the other Windows packages and macOS do not, and
+# alphallama-serve uses its built-in engine there.
 
 name: AlphaLlama release
 
@@ -128,6 +128,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" ^
+            -DALPHA_ALPHAINFER=ON -DBUILD_SHARED_LIBS=OFF ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DALPHA_FLASHINFER=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF || exit /b 1
           cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
@@ -144,13 +145,14 @@ jobs:
           Copy-Item LICENSE, NOTICE, README.md $r
           Copy-Item licenses\* "$r\licenses" -Recurse
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
+          Copy-Item alphainfer\LICENSE "$r\licenses\LICENSE-alphainfer"
           if (Test-Path "$env:CUDA_PATH\LICENSE") { Copy-Item "$env:CUDA_PATH\LICENSE" "$r\licenses\NVIDIA-CUDA-LICENSE.txt" }
           @(
             "AlphaLlama v2, $n"
             "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
             "toolkit: CUDA ${{ matrix.cuda }}, MSVC $($redist.Name)"
             "cuda architectures: ${{ matrix.archs }}"
-            "build options: GGML_CUDA=ON GGML_NATIVE=OFF ALPHA_FLASHINFER=OFF (no AlphaInfer on Windows)"
+            "build options: GGML_CUDA=ON ALPHA_ALPHAINFER=ON BUILD_SHARED_LIBS=OFF GGML_NATIVE=OFF ALPHA_FLASHINFER=OFF"
             "cpu baseline: x86-64 with AVX2, FMA, F16C"
             "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA), Visual C++ runtime and OpenMP"
             "needs: NVIDIA driver ${{ matrix.driver }}, Windows 10 or 11 x64"

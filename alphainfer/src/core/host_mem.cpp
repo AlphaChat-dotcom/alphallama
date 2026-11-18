@@ -11,11 +11,17 @@
 #include <string>
 #include <sys/mman.h>
 
+#include "core/compat.h"
+
 namespace ai {
 
 static constexpr size_t kHuge = 2ull << 20;
 
 double thp_fraction(const void * p, size_t n) {
+#if defined(_WIN32)
+    (void) p; (void) n;
+    return 0;   // no transparent huge pages on Windows
+#endif
     std::ifstream f("/proc/self/smaps");
     if (!f) return 0;
     const uintptr_t a = (uintptr_t) p, b = a + n;
@@ -55,12 +61,18 @@ PinnedHost pinned_host_reserve(size_t bytes, bool thp_hint) {
     PinnedHost m;
     if (bytes == 0) return m;
     const size_t span = (bytes + kHuge - 1) / kHuge * kHuge;
+#if defined(_WIN32)
+    // Windows cannot release part of an allocation, and has no transparent huge pages: map the span as is
+    char * p = (char *) mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == (char *) MAP_FAILED) return m;
+#else
     char * raw = (char *) mmap(nullptr, span + kHuge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) return m;
     char * p = (char *) (((uintptr_t) raw + kHuge - 1) & ~(uintptr_t) (kHuge - 1));
     if (p > raw) munmap(raw, (size_t) (p - raw));
     char * end = raw + span + kHuge;
     if (end > p + span) munmap(p + span, (size_t) (end - (p + span)));
+#endif
     static const bool env_thp = getenv("AI_PINNED_THP") && atoi(getenv("AI_PINNED_THP")) != 0;
     if (thp_hint && env_thp) madvise(p, span, MADV_HUGEPAGE);
     m.ptr   = p;
@@ -74,12 +86,18 @@ PinnedHost pinned_host_alloc(size_t bytes, bool register_cuda, bool thp_hint) {
     if (bytes == 0) return m;
     const size_t span = (bytes + kHuge - 1) / kHuge * kHuge;
     // over-map by one huge page, then trim to a 2 MiB-aligned span: THP needs aligned 2 MiB ranges inside the VMA
+#if defined(_WIN32)
+    // Windows cannot release part of an allocation, and has no transparent huge pages: map the span as is
+    char * p = (char *) mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == (char *) MAP_FAILED) return m;
+#else
     char * raw = (char *) mmap(nullptr, span + kHuge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) return m;
     char * p = (char *) (((uintptr_t) raw + kHuge - 1) & ~(uintptr_t) (kHuge - 1));
     if (p > raw) munmap(raw, (size_t) (p - raw));
     char * end = raw + span + kHuge;
     if (end > p + span) munmap(p + span, (size_t) (end - (p + span)));
+#endif
     static const bool env_thp = getenv("AI_PINNED_THP") && atoi(getenv("AI_PINNED_THP")) != 0;   // opt-in (see host_mem.h)
     if (thp_hint && env_thp) madvise(p, span, MADV_HUGEPAGE);
     for (size_t o = 0; o < span; o += 4096) p[o] = 0;   // fault in now (a huge page per 2 MiB where the kernel can)

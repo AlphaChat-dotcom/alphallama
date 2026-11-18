@@ -26,6 +26,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -303,6 +304,7 @@ private:
         std::vector<int32_t>                               lk_sh;
         int                                                lk_shi = 0, lk_run = 0, lk_miss = 0, lk_full = 0;
         bool                                               lk_armed = false;
+        bool                                               lk_prev_full = false;   // last lookup round fully accepted
         // [AI_PREFIX_REUSE] chunked prefill: the tokens fed so far are still the stream's cached prompt, nothing run yet
         bool                                               probe    = false;
     };
@@ -381,8 +383,12 @@ private:
     const StepOut & step_round(const ProfileKey & key, const std::function<StepOut()> & build, Timing & tm,
                                bool * warm);
 
-    // prefill/score chunks (AI_FFN_CPU: its prefill stages weights through VRAM with host copies, so eager too)
-    bool chunk_eager() const { return cfg_.eager || cfg_.expert_slots > 0 || prog_.cpu_ffn_tmax() > 0; }
+    // prefill/score chunks (AI_FFN_CPU: its prefill stages weights through VRAM with host copies, so eager too).
+    // AI_PREFILL_EAGER=1 (debug): eager through the server too, so the AI_DUMP_DIR taps (inert while recording) fire.
+    bool chunk_eager() const {
+        static const bool env = getenv("AI_PREFILL_EAGER") && atoi(getenv("AI_PREFILL_EAGER")) != 0;
+        return env || cfg_.eager || cfg_.expert_slots > 0 || prog_.cpu_ffn_tmax() > 0;
+    }
     static bool head_mask_dev();   // AI_HEAD_MASK_DEV: the MTP head's prefill mask is built on device (default on)
     int  choose_k(int k_in) const;
     void observe(const std::vector<int> & accepted, int k_in, int k_out, double step_ms);

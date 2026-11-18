@@ -7,11 +7,17 @@
 #include <map>
 #include <set>
 #include <string>
+#include <cstdlib>
 #if defined(__linux__)
 #include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
-#include <cstdlib>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 namespace ai::offload {
@@ -45,10 +51,37 @@ void pin_this_thread(const std::vector<int> & cpus) {
     CPU_ZERO(&cs);
     for (int c : cpus) CPU_SET(c, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#elif defined(_WIN32)
+    // processor group 0 only (plan_cpus plans within it): up to 64 logical cpus
+    DWORD_PTR m = 0;
+    for (int c : cpus) if (c >= 0 && c < 64) m |= (DWORD_PTR) 1 << c;
+    if (m) SetThreadAffinityMask(GetCurrentThread(), m);
 #else
     (void) cpus;
 #endif
 }
+
+#if defined(_WIN32)
+// every thread of this process onto `m` (Toolhelp snapshot); returns the threads moved
+static int win_confine(DWORD_PTR m) {
+    if (!m) return 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    const DWORD   pid = GetCurrentProcessId();
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    int n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE t = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SetThreadAffinityMask(t, m)) ++n;
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    return n;
+}
+#endif
 
 int confine_threads_off(const std::vector<int> & pool) {
 #if defined(__linux__)
@@ -67,6 +100,12 @@ int confine_threads_off(const std::vector<int> & pool) {
         closedir(d);
     }
     return n;
+#elif defined(_WIN32)
+    if (pool.empty()) return 0;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    for (int c : pool) if (c >= 0 && c < 64) proc &= ~((DWORD_PTR) 1 << c);
+    return win_confine(proc);
 #else
     (void) pool;
     return 0;
@@ -88,6 +127,10 @@ int confine_threads_onto(const std::vector<int> & onto) {
         closedir(d);
     }
     return n;
+#elif defined(_WIN32)
+    DWORD_PTR m = 0;
+    for (int c : onto) if (c >= 0 && c < 64) m |= (DWORD_PTR) 1 << c;
+    return win_confine(m);
 #else
     (void) onto;
     return 0;
@@ -96,13 +139,14 @@ int confine_threads_onto(const std::vector<int> & onto) {
 
 CpuPlan plan_cpus(int cap) {
     CpuPlan plan;
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     if (cap <= 0) cap = 32;
+    struct Cpu { int id, core, l3, sib; };
+    std::vector<Cpu> cpus;
+#if defined(__linux__)
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) { plan.why = "sched_getaffinity failed"; return plan; }
-    struct Cpu { int id, core, l3, sib; };
-    std::vector<Cpu> cpus;
     for (int c = 0; c < CPU_SETSIZE; ++c) {
         if (!CPU_ISSET(c, &allowed)) continue;
         const std::string b = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/";
@@ -112,6 +156,42 @@ CpuPlan plan_cpus(int cap) {
         const int l3 = read_int(b + "cache/index3/id", -1);
         cpus.push_back({ c, pkg * 100000 + core, l3 < 0 ? pkg : pkg * 100000 + l3, 0 });
     }
+#else
+    // Windows: physical cores and L3 caches from GetLogicalProcessorInformationEx, processor group 0 (<= 64 cpus),
+    // restricted to the process affinity mask
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) { plan.why = "GetProcessAffinityMask failed"; return plan; }
+    std::vector<int> core_of(64, -1), l3_of(64, 0);
+    for (LOGICAL_PROCESSOR_RELATIONSHIP rel : { RelationProcessorCore, RelationCache }) {
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(rel, nullptr, &len);
+        if (len == 0) { plan.why = "GetLogicalProcessorInformationEx failed"; return plan; }
+        std::vector<char> buf(len);
+        if (!GetLogicalProcessorInformationEx(rel, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+            plan.why = "GetLogicalProcessorInformationEx failed";
+            return plan;
+        }
+        int idx = 0;
+        for (DWORD off = 0; off < len;) {
+            auto * e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+            if (rel == RelationProcessorCore && e->Relationship == RelationProcessorCore) {
+                const GROUP_AFFINITY & g = e->Processor.GroupMask[0];
+                if (g.Group == 0) for (int c = 0; c < 64; ++c) if (g.Mask & ((KAFFINITY) 1 << c)) core_of[(size_t) c] = idx;
+                ++idx;
+            } else if (rel == RelationCache && e->Relationship == RelationCache && e->Cache.Level == 3) {
+                const GROUP_AFFINITY & g = e->Cache.GroupMask;
+                if (g.Group == 0) for (int c = 0; c < 64; ++c) if (g.Mask & ((KAFFINITY) 1 << c)) l3_of[(size_t) c] = idx;
+                ++idx;
+            }
+            off += e->Size;
+        }
+    }
+    for (int c = 0; c < 64; ++c) {
+        if (!(proc & ((DWORD_PTR) 1 << c))) continue;
+        if (core_of[(size_t) c] < 0) { plan.why = "no core topology"; return plan; }
+        cpus.push_back({ c, core_of[(size_t) c], l3_of[(size_t) c], 0 });
+    }
+#endif
     if (cpus.size() < 2) { plan.why = "fewer than 2 allowed cpus"; return plan; }
     // SMT sibling rank inside each physical core (0 = first thread of the core)
     std::map<int, int> seen;
@@ -169,7 +249,7 @@ CpuPlan plan_cpus(int cap) {
     plan.why = buf;
 #else
     (void) cap;
-    plan.why = "not Linux";
+    plan.why = "not Linux or Windows";
 #endif
     return plan;
 }

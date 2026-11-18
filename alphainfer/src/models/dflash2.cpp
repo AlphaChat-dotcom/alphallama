@@ -34,6 +34,11 @@ bool DFlash2::load(Device & dev, const std::string & path, bool verbose) {
     p_.rope_base  = (float) w_.get_float(a + "rope.freq_base");
     block_   = (int) w_.get_int(a + "block_size");
     window_  = (int) w_.get_int(a + "attention.sliding_window");
+    // AI_DF2_WINDOW: attend over another context span than the trained one (positions are absolute RoPE)
+    if (const char * e = getenv("AI_DF2_WINDOW"); e != nullptr && atoi(e) > 0) {
+        fprintf(stderr, "[df2] AI_DF2_WINDOW: window %d (trained %d)\n", atoi(e), window_);
+        window_ = atoi(e);
+    }
     top_k_   = variant_ == 2 ? (int) w_.get_int(a + "selector_top_k") : 1;
     rank_    = variant_ == 2 ? (int) w_.get_int(a + "selector_rank") : 0;
     mask_id_ = (int32_t) w_.get_int(a + "mask_token_id");

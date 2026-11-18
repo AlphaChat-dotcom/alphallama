@@ -45,6 +45,7 @@ set(AI_VENDOR_INCLUDES
     "${AI_VENDOR_SRC}/ggml/src")
 
 add_library(aicore STATIC
+    src/core/compat.cpp
     src/core/tensor.cpp
     src/core/device.cpp
     src/core/weights.cpp
@@ -101,7 +102,14 @@ add_library(aicore STATIC
 target_include_directories(aicore
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src> $<INSTALL_INTERFACE:include>
     PRIVATE ${AI_VENDOR_INCLUDES})
-target_compile_options(aicore PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
+target_compile_options(aicore PRIVATE $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall -Wextra -Wno-unused-parameter>)
+# MSVC: the POSIX calls the engine uses come from src/core/compat.h, force-included into every C++ source, and the
+# stand-in headers in win/ (<unistd.h>, <sys/mman.h>, <dirent.h>, ...) so the sources keep their includes
+if (MSVC)
+    target_include_directories(aicore PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/win>)
+    target_compile_options(aicore PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/FIcore/compat.h /utf-8>)
+    target_compile_definitions(aicore PUBLIC _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE NOMINMAX)
+endif()
 # Turn on only when the linked ggml is built with -DALPHA_BATCH_INVARIANT_MMVQ=1 (MMVQ pinned to the 1-row shape at
 # 1..8 columns): enables the dense exact default with K = 7 + lookup (engine/mtp_policy.cpp).
 option(AI_BI_FORK "ggml is built with the MMVQ batch-invariance pin (ALPHA_BATCH_INVARIANT_MMVQ=1)" OFF)
@@ -191,7 +199,7 @@ if (AI_Q4X_FORWARD)
     set_source_files_properties(src/kernels/q4x_hc.cu src/kernels/q4x_gdn_conv.cu src/kernels/q4x_gdn_scan.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
     # q4x_fold.cu reproduces the fork's gdn_prep_kernel + gated_delta_net_cuda (built -use_fast_math) bit for bit
     set_source_files_properties(src/kernels/q4x_fold.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
-    set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2;-mfma;-mf16c>")
     target_link_libraries(aicore PUBLIC ${AI_GGML_CPU})
     add_executable(ai-q4x-run tools/q4x_run.cpp)
     target_include_directories(ai-q4x-run PRIVATE ${AI_VENDOR_INCLUDES})
@@ -229,7 +237,7 @@ if (AI_DOORBELL)
     target_sources(aicore PRIVATE src/offload/doorbell_moe.cpp src/offload/cpu_ffn.cpp src/kernels/doorbell.cu)
     if (NOT AI_Q4X_FORWARD)
         target_sources(aicore PRIVATE src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/cpu_topo.cpp)
-        set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+        set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2;-mfma;-mf16c>")
         target_link_libraries(aicore PUBLIC ${AI_GGML_CPU})
     endif()
 endif()

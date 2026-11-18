@@ -303,4 +303,25 @@ bool topk_rows(void * stream, const float * x, int64_t V, int64_t row_stride, in
     return true;
 }
 
+__global__ static void df2_conv_k(const float * y, long long ld_y, const float * dyn, long long ld_dyn,
+                                  const float * base, const float * res, long long ld_res, int ph, int gs, long long E,
+                                  long long T, float * out, long long ld_out) {
+    const long long h = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    const long long i = blockIdx.y;
+    if (h >= E || i >= T) return;
+    const long long G = E / gs, g = h / gs, k0 = ph * 2, k1 = ph * 2 + 1;
+    const float * dc = dyn + i * ld_dyn;
+    float v = (base[k0 * E + h] + dc[k0 * G + g]) * y[i * ld_y + h];
+    if (i > 0) v += (base[k1 * E + h] + dc[k1 * G + g]) * y[(i - 1) * ld_y + h];
+    if (res) v += res[i * ld_res + h];
+    out[i * ld_out + h] = v;
+}
+void df2_conv(void * stream, const float * y, int64_t ld_y, const float * dyn, int64_t ld_dyn, const float * base,
+              const float * res, int64_t ld_res, int ph, int gs, int64_t E, int64_t T, float * out, int64_t ld_out) {
+    const dim3 grid((unsigned) ((E + 255) / 256), (unsigned) T);
+    df2_conv_k<<<grid, 256, 0, (cudaStream_t) stream>>>(y, (long long) ld_y, dyn, (long long) ld_dyn, base, res,
+                                                       (long long) ld_res, ph, gs, (long long) E, (long long) T, out,
+                                                       (long long) ld_out);
+}
+
 }  // namespace ai::kern
