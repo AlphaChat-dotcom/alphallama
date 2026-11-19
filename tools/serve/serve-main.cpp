@@ -1593,7 +1593,12 @@ int main(int argc, char ** argv) {
         mode = MODE_ALPHAINFER;
         decode_mode_applied = true;
         if (!np_explicit)  n_slots = air->n_streams;   // the validated shape for this model
-        if (!ctx_explicit) n_ctx   = air->ctx_total;
+        // fewer streams than the row (-np 1 on a 2-stream row) keep the row's per-stream context, not its total: one
+        // stream at the whole total grows every per-stream buffer with it (27B, RTX 3090: -np 1 took 262144 cells and
+        // ran out of memory at start in plain mode, refused to serve in exact mode)
+        if (!ctx_explicit) n_ctx   = np_explicit && n_slots < air->n_streams
+                                         ? air->ctx_total / std::max(1, air->n_streams) * std::max(1, n_slots)
+                                         : air->ctx_total;
         // Decode mode (--decode-mode / ALPHA_DECODE_MODE): fast (the default since 2.0.9: multi-token prediction with fast
         // verify at the row's own MTP depth and shape -- not token-identical to plain greedy), exact (MTP whose output
         // is token-identical to plain greedy; the default of the exact rows before 2.0.9) or plain (no MTP). An explicit
