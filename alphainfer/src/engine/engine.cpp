@@ -483,6 +483,7 @@ void Engine::ws_auto_lookup() {
                                                          cfg_.max_ctx > 0 ? cfg_.max_ctx * cfg_.max_batch : 0,
                                                          cfg_.max_batch) * (K > 0 ? 2 : 1);
         cfg_.ws_bytes = ws;
+        ws_measured_  = true;
         if (cfg_.verbose) {
             fprintf(stderr, "[ai] ws auto: measured peak %.1f MiB for this configuration -> workspace %.0f MiB "
                             "(peak x1.25 + 32 MiB%s; derived estimate %.0f MiB)\n",
@@ -901,9 +902,13 @@ bool Engine::init(const EngineConfig & cfg) {
             // and a margin for CUDA graphs, cuBLAS and fragmentation (AI_DOOR_MARGIN_MIB, default 768)
             const int64_t Ra      = prog_.kv().region_cells();
             const int64_t Ta      = std::max(cfg_.chunk, B * (K + 1));
-            const size_t  ws_est  = cfg_.ws_bytes ? cfg_.ws_bytes
-                                                  : prog_.workspace_bytes(cfg_.chunk, std::max<int64_t>(16, B * (K + 1))) *
-                                                        (K > 0 ? 2 : 1);
+            // Plain and exact decode: the CPU rounds missed experts differently from the GPU, so the text depends on
+            // the slot count. A measured workspace (ws auto) is smaller than the derived one the calibrating first
+            // start used, so it would give later starts more slots and different text: budget at least the derived
+            // size there, the same on every start.
+            const size_t  derived = prog_.workspace_bytes(cfg_.chunk, std::max<int64_t>(16, B * (K + 1))) * (K > 0 ? 2 : 1);
+            const bool    ident   = K == 0 || cfg_.exact_verify;
+            const size_t  ws_est  = !cfg_.ws_bytes ? derived : ws_measured_ && ident ? std::max(cfg_.ws_bytes, derived) : cfg_.ws_bytes;
             const size_t  ingress = ((size_t) (2 * Ta * Ra) + (size_t) Ta * 64) * (K > 0 ? 2 : 1);
             const size_t  margin  = (size_t) (getenv("AI_DOOR_MARGIN_MIB") ? atoi(getenv("AI_DOOR_MARGIN_MIB")) : 768) << 20;
             size_t freeb = 0, totb = 0;

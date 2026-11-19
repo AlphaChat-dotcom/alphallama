@@ -224,6 +224,7 @@ private:
     bool        ws_bootstrap_   = false;   // derived workspace did not fit: running on the remainder to calibrate
     bool        ws_calibrated_now_ = false;   // this create ran the calibration (a bootstrap or a recalibration)
     int64_t     ws_cal_region_  = 0;       // envelope (cells per stream) the cached peak was measured up to
+    bool        ws_measured_    = false;   // cfg_.ws_bytes came from a cached peak (not --ws-mib)
     // Round fit on a fixed workspace (--ws-mib / ALPHA_AI_WS_MIB, which skip the calibration): the widest verify
     // width k_in whose round fits at each envelope F, measured at init by recording rounds without launching them.
     // decode_round narrows a round to it. Empty = no limit (calibrated workspace, or every width fits).
