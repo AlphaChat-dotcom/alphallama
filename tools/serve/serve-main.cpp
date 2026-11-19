@@ -1654,11 +1654,16 @@ int main(int argc, char ** argv) {
                 setenv("AI_MTP_HEAD", head.c_str(), /*overwrite=*/ 0);
                 const char * smode = getenv("ALPHA_SPEED_MODE");
                 const bool   speed = smode && atoi(smode) != 0;
-                if (hr && mode_s == "fast" && !speed && hr->fast_k > 0 && !getenv("ALPHA_AI_MTP_K")) {
+                // rows that tune their own drafting (ALPHA_AI_MTP_K in the row env: the 4080 and 20 GB rows) keep it; the
+                // head's depth and context were measured on the default-depth rows
+                const bool row_tuned = air->env && strstr(air->env, "ALPHA_AI_MTP_K") != nullptr;
+                if (hr && mode_s == "fast" && !speed && !row_tuned && hr->fast_k > 0 && !getenv("ALPHA_AI_MTP_K")) {
                     setenv("ALPHA_AI_MTP_K", std::to_string(hr->fast_k).c_str(), /*overwrite=*/ 0);
-                    if (hr->ctx_total > 0 && !ctx_explicit)   // the context this depth was measured at (fewer streams keep its per-stream context)
-                        n_ctx = n_slots < air->n_streams ? hr->ctx_total / std::max(1, air->n_streams) * std::max(1, n_slots)
-                                                         : hr->ctx_total;
+                    if (hr->ctx_total > 0 && !ctx_explicit) {   // the context this depth was measured at, never above the row's
+                        const int hc = n_slots < air->n_streams ? hr->ctx_total / std::max(1, air->n_streams) * std::max(1, n_slots)
+                                                                : hr->ctx_total;
+                        n_ctx = std::min(n_ctx, hc);
+                    }
                 }
                 fprintf(stderr, "[auto] MTP head: %s %s%s\n", hr ? hr->what : "sidecar", head.c_str(),
                         getenv("ALPHA_AI_MTP_K") ? (std::string(", depth ") + getenv("ALPHA_AI_MTP_K")).c_str() : "");
@@ -1751,6 +1756,7 @@ int main(int argc, char ** argv) {
             const long ws_mb = 640 + (long) ((n_ctx - 32768 + 1023) / 1024) * 10;
             setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
             fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
+        }
         }
         // Thinking effort when the request names none: the template's own default (xhigh), as Strata 0.2.8 does; the
         // answer room keeps a long think from eating the whole max_tokens. 2.0.4 set "low" here (first answer token
