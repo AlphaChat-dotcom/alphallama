@@ -5,6 +5,7 @@
 #include <array>
 #include <bitset>
 #include <cassert>
+#include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -150,6 +151,7 @@ struct llama_hparams {
 
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
+    float    kda_gate_lower_bound = -INFINITY; // glm5-next: bounded decay gate (lb * sigmoid) instead of softplus
 
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
@@ -209,12 +211,16 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0;    // glm5-next: pool size of the k-pool indexer (0 = no k-pool)
+    bool     indexer_kpool_select_tail = true;
 
     // qwen4exp
     // HyperConnections: the residual stream carries hc_count parallel copies of
     // n_embd, so the wide state is hc_count * n_embd (n_embd_out_impl).
     uint32_t hc_count    = 0;   // qwen4exp.hyper_connection.count
     uint32_t hc_low_rank = 0;   // 0 = full rank (DeepSeek-V4)
+    uint32_t hc_sinkhorn_iters = 0;     // glm5-next mHC
+    float    hc_eps            = 0.0f;  // glm5-next mHC
 
     // per-layer attention compression ratio; 0 = dense attention on that layer
     std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios = {};

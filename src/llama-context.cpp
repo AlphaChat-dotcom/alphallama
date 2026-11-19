@@ -3784,6 +3784,11 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_GLM5_NEXT) {
+        const uint32_t n_expert  = model.hparams.n_expert;
+        const uint32_t moe_nodes = (uint32_t)((2u * n_expert + 100u) * model.hparams.n_layer * 1.3f) + 4096u;
+        return std::max<uint32_t>(moe_nodes, std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors()));
+    }
     // MoE models: during warmup, the build_moe_ffn aggregation loop creates n_expert views +
     // (n_expert-1) adds per MoE layer (256 experts x 40 layers = 20K+ extra tensors). Scale
     // max_nodes to accommodate.

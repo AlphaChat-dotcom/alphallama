@@ -1219,6 +1219,16 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+    return layers[map_layer_ids.at(il)].k;
+}
+
+uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return seq_to_stream[seq_id];
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

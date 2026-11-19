@@ -106,6 +106,10 @@ public:
     void    qsa_pkc_invalidate(uint32_t ratio = 0) const { if (ratio) pkc_sig.erase(ratio); else pkc_sig.clear(); }
     bool    qsa_pkc_ok() const { return pkc_ok; }
 
+    // glm5-next: pool size of the k-pool indexer (0 for every other architecture). With a k-pool the
+    // indexer cache row of a token holds key | gate (2 * indexer_head_size), see llm_build_glm5_next.
+    uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+
 private:
     // a modified copy of the model's hparams (MQA, one key head of indexer_head_size, rope NONE).
     // must be declared before mem_idx: the cache holds a reference to it.
@@ -161,12 +165,48 @@ public:
 
     // ALPHA_QSA_PKC: see llama_memory_hybrid_idx
     int32_t qsa_pkc_plan(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
+
+    //
+    // glm5-next k-pool indexer (ported from upstream llama.cpp 649dcb103, simplified: the pool layout is
+    // rebuilt from the cells on every ubatch and every pool is re-pooled, there is no pooled-key cache)
+    //
+    // A pool is `kpool` consecutive positions of one sequence, counted from the sequence's first position.
+    // Only complete pools are scored; the incomplete tail of a token's own pool is always selected.
+
+    // padded pool count of the current ubatch (the last padded pool is always unused);
+    // for the full (reserve) context: the capacity
+    uint32_t get_n_kpool() const;
+
+    // the indexer cache's whole K tensor of layer il: [2*indexer_head_size, kv_size, n_stream]
+    ggml_tensor * get_kpool_storage(int32_t il) const;
+
+    //   pool_gcells [kpool, n_pool]       I32  member cells as rows of the storage (stream*kv_size + cell), for the gather
+    //   pool_idxs   [kpool, n_pool]       I32  member cells as stream-local mask rows; n_kv for the padded pools
+    //   pool_mask   [n_pool, n_tokens]    F32  0 where the pool belongs to the token's sequence and ends at or before it
+    //   tail_idxs   [kpool - 1, n_tokens] I32  cells of the token's incomplete pool; n_kv where there is none
+    void set_input_kpool(ggml_tensor * pool_gcells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask,
+                         ggml_tensor * tail_idxs, const llama_ubatch * ubatch) const;
     void    set_input_qsa_pkc(int mode, ggml_tensor * pk_map, ggml_tensor * pk_upd, ggml_tensor * pk_upd_cells,
                               ggml_tensor * pk_upd_pos, const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
     bool is_update = false;
+    bool is_full   = false;
+
+    // glm5-next k-pool layout of the sequences in the current ubatch, built in apply()
+    struct kpool_seq {
+        llama_seq_id id      = 0;
+        uint32_t     strm    = 0; // stream holding this sequence's cells
+        llama_pos    pos_min = 0;
+        std::vector<std::pair<llama_pos, uint32_t>> cells; // (position, stream-local cell), sorted by position
+        std::vector<uint32_t> pools;                       // index into cells of each complete pool's first member
+    };
+    std::vector<kpool_seq> kpool_seqs;
+    uint32_t kpool_n_real = 0;
+    bool     kpool_valid  = false;
+
+    void kpool_build(const llama_ubatch & ubatch);
 
 private:
     const llama_memory_context_ptr ctx_idx;

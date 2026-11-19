@@ -390,6 +390,68 @@ struct llm_build_jamba : public llm_build_mamba_base {
     llm_build_jamba(const llama_model & model, const llm_graph_params & params);
 };
 
+// GLM-5.3-Flash (GLM5-Next). Ported from upstream llama.cpp 649dcb103 (PR #27773).
+struct llm_build_glm5_next : public llm_build_delta_net_base {
+    llm_build_glm5_next(const llama_model & model, const llm_graph_params & params);
+
+    // k-pool indexer inputs on top of the generic hybrid input
+    class llm_graph_input_kpool;
+
+private:
+    // mHC: collapse the hc streams to one block input; fills the post / comb weights
+    ggml_tensor * build_hc_pre(
+                ggml_tensor *  x,
+                ggml_tensor *  hc_fn,
+                ggml_tensor *  hc_scale,
+                ggml_tensor *  hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                        int    il) const;
+
+    // mHC: scatter a block's output back across the streams
+    ggml_tensor * build_hc_post(
+                ggml_tensor * x,
+                ggml_tensor * residual,
+                ggml_tensor * post,
+                ggml_tensor * comb,
+                        int   il) const;
+
+    ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb) const;
+
+    // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+
+    llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+
+    ggml_tensor * build_kda_layer(
+                ggml_tensor * cur,
+          const llama_layer & layer,
+         llm_graph_input_rs * inp_rs,
+                    int64_t   n_seq_tokens,
+                    int64_t   n_seqs,
+                        int   il);
+
+    // returns the additive attention mask [n_kv, n_tokens/n_stream, 1, n_stream] of the indexer selection
+    ggml_tensor * build_kpool_select(
+                ggml_tensor * cur,
+                ggml_tensor * qr,
+          const llama_layer & layer,
+    const llama_memory_hybrid_idx_context * mctx_hyb,
+     llm_graph_input_attn_k * inp_attn,
+      llm_graph_input_kpool * inp_kpool,
+                        int   il);
+
+    ggml_tensor * build_dsa_layer(
+                ggml_tensor * cur,
+          const llama_layer & layer,
+    const llama_memory_hybrid_idx_context * mctx_hyb,
+     llm_graph_input_attn_k * inp_attn,
+      llm_graph_input_kpool * inp_kpool,
+                        int   il);
+
+    const llama_model & model;
+};
+
 struct llm_build_kimi_linear : public llm_build_delta_net_base {
     llm_build_kimi_linear(const llama_model & model, const llm_graph_params & params);
 

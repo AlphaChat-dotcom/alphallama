@@ -139,6 +139,7 @@ enum llm_type {
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_744B_A40B, // GLM-5
+    LLM_TYPE_320B_A18B, // GLM-5.3-Flash
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -538,6 +539,10 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+
+    // glm5-next k-pool indexer
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
 
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;

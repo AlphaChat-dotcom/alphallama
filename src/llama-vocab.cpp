@@ -2051,9 +2051,13 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 clean_spaces = false;
             } else if (
                 tokenizer_pre == "glm4" ||
+                tokenizer_pre == "glm5" ||
                 tokenizer_pre == "chatglm-bpe") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_CHATGLM4;
                 special_bos_id = LLAMA_TOKEN_NULL;
+                if (tokenizer_pre != "chatglm-bpe" && (tokenizer_pre == "glm5" || ml.get_arch() == LLM_ARCH_GLM5_NEXT)) {
+                    ignore_merges = true;
+                }
             } else if (
                 tokenizer_pre == "viking") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_VIKING;

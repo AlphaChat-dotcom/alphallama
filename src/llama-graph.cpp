@@ -743,7 +743,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {   // unconsumed -> unallocated (identity fast path), as in llm_graph_input_mem_hybrid
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1385,6 +1385,15 @@ ggml_tensor * llm_graph_context::build_ffn(
                     }
                 }
 
+                // glm5-next: per-layer clamp, same form as upstream's ggml_swiglu_clamp
+                if (arch == LLM_ARCH_GLM5_NEXT && il >= 0) {
+                    const float limit = hparams.swiglu_clamp_shexp[il];
+                    if (limit > 1e-6f) {
+                        cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                        tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                    }
+                }
+
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
                 type_gate = LLM_FFN_SEQ;
@@ -1901,7 +1910,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
                 // DeepSeek V4: per-layer SwiGLU clamp (reference Expert.forward):
                 // gate = clamp(gate, max=limit) BEFORE silu; up = clamp(up, -limit, limit).
-                if (arch == LLM_ARCH_DEEPSEEK4 && il >= 0) {
+                if ((arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT) && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     if (limit > 1e-6f) {
                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
