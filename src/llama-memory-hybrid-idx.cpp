@@ -59,7 +59,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, key dim = %u\n",
-                       __func__, kv_size, model.hparams.indexer_head_size);
+                       __func__, kv_size, hparams_idx.n_embd_head_k_full);
 
         return new llama_kv_cache(
             model, hparams_idx, type_idx, GGML_TYPE_F32, /* v_trans */ false, offload, unified,
