@@ -118,6 +118,59 @@ bool WeightSet::open(const std::string & path) {
             ggml_free(m2);
         }
     }
+    // AI_MTP_HEAD=<gguf>: a draft-head sidecar. Every tensor in it replaces the model's tensor of the same name (the
+    // retrained MTP block of a model, shipped beside the unchanged model file); a name the model does not have is an
+    // error. The sidecar's metadata is not read.
+    if (const char * hp = getenv("AI_MTP_HEAD")) {
+        if (*hp) {
+            ggml_context * m3 = nullptr;
+            gguf_init_params p3 = { /*no_alloc=*/ true, &m3 };
+            gguf_context * g3 = gguf_init_from_file(hp, p3);
+            if (!g3) {
+                fprintf(stderr, "[ai] cannot open the MTP head sidecar %s\n", hp);
+                return false;
+            }
+            // only the file that holds the head: other GGUFs this process opens (a DFlash2 drafter) have none of its
+            // tensors and are left alone; holding some but not all of them is an error below
+            int64_t hits = 0;
+            for (int64_t i = 0; i < gguf_get_n_tensors(g3); ++i) {
+                const char * name = gguf_get_tensor_name(g3, i);
+                for (const auto & x : entries_) if (x.name == name) { ++hits; break; }
+            }
+            if (hits == 0) {
+                ggml_free(m3);
+                gguf_free(g3);
+                return true;
+            }
+            extra_gguf_.push_back(g3);
+            paths_.push_back(hp);
+            const int     file = (int) paths_.size() - 1;
+            const size_t  d3   = gguf_get_data_offset(g3);
+            size_t        n_rep = 0, bytes = 0;
+            for (int64_t i = 0; i < gguf_get_n_tensors(g3); ++i) {
+                const char *  name = gguf_get_tensor_name(g3, i);
+                ggml_tensor * mt   = ggml_get_tensor(m3, name);
+                Entry * e = nullptr;
+                for (auto & x : entries_) if (x.name == name) { e = &x; break; }
+                if (!e) {
+                    fprintf(stderr, "[ai] MTP head sidecar %s: tensor %s is not in the model\n", hp, name);
+                    ggml_free(m3);
+                    return false;
+                }
+                e->t      = Tensor{};
+                e->t.type = mt->type;
+                for (int d = 0; d < 4; ++d) e->t.ne[d] = mt->ne[d];
+                set_contiguous_strides(e->t);
+                e->file_offset = d3 + gguf_get_tensor_offset(g3, i);
+                e->nbytes      = ggml_nbytes(mt);
+                e->file        = file;
+                ++n_rep;
+                bytes += e->nbytes;
+            }
+            ggml_free(m3);
+            fprintf(stderr, "[ai] MTP head sidecar %s: %zu tensors (%.1f MiB) replace the model's\n", hp, n_rep, bytes / 1048576.0);
+        }
+    }
     return true;
 }
 

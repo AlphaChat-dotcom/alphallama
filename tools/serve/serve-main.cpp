@@ -953,8 +953,12 @@ static const alpha_ai_validated k_ai_validated[] = {
 // The row's speed drafter "<dir>/<file>": ALPHA_AI_DRAFTER, else <file> beside the model, else exactly <parent>/<dir>/<file>
 // (/data/models/Qwen3.8-27B-GGUF/<model> -> /data/models/Qwen3.8-27B-DFlash2/dflash2-q5_K.gguf). No directory scan: a
 // generic drafter file name in another model's directory must never be picked. "" = none.
+static std::string alpha_ai_find_beside(const char * model_path, const char * rel);
 static std::string alpha_ai_find_drafter(const char * model_path, const char * rel) {
     if (const char * e = getenv("ALPHA_AI_DRAFTER")) return e;
+    return alpha_ai_find_beside(model_path, rel);
+}
+static std::string alpha_ai_find_beside(const char * model_path, const char * rel) {
     if (!rel || !model_path) return "";
     struct stat st;
     // resolve the model path first: from a relative -m ("model.gguf" in the model's own directory) the directory is
@@ -975,6 +979,32 @@ static std::string alpha_ai_find_drafter(const char * model_path, const char * r
         if (stat(cand.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return cand;
     }
     return "";
+}
+
+// Retrained MTP draft heads shipped as a sidecar beside an unchanged model file ("<dir>/<file>", found like a speed
+// drafter; ALPHA_AI_MTP_HEAD=<path> overrides, ALPHA_AI_MTP_HEAD="" turns it off). The engine loads it through
+// AI_MTP_HEAD (its tensors replace the model's of the same name); fast decode then defaults to fast_k, the depth
+// measured best for this head. Drafts are verified, so the head changes speed only.
+// ctx_total: the row's total context at that depth (0 = the row's): wider verify rounds need more workspace, and the
+// row's own context then does not fit once the workspace is calibrated (27B at depth 7, 2 x 131072 on 24 GB: out of
+// memory at the restart after calibration).
+struct alpha_ai_mtp_head { const char * sha256; const char * rel; int fast_k; int ctx_total; const char * what; };
+static const alpha_ai_mtp_head k_ai_mtp_heads[] = {
+    // Qwen3.8-27B-UD-Q4_K_M: AlphaDflash, the MTP block (blk.64) retrained on the model's own output. Quality gate
+    // (RTX 3090, 2026-11-17): gsm8k / MMLU / CMMLU paired vs plain within CI, HumanEval 158 vs 156. Fast decode:
+    // depth 7 +36% vs the shipped head at its default depth 3 (depth 8 regresses), at 2 x 98304.
+    { "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482", "Qwen3.8-27B-AlphaDflash/alphadflash-27b-head.gguf", 7,
+      196608, "AlphaDflash 27B MTP head" },
+};
+
+static const alpha_ai_mtp_head * alpha_ai_head_row(const char * sha256) {
+    for (const auto & h : k_ai_mtp_heads) if (sha256 && strcmp(h.sha256, sha256) == 0) return &h;
+    return nullptr;
+}
+
+static std::string alpha_ai_find_head(const char * model_path, const alpha_ai_mtp_head * h) {
+    if (const char * e = getenv("ALPHA_AI_MTP_HEAD")) return e;
+    return h ? alpha_ai_find_beside(model_path, h->rel) : "";
 }
 
 namespace {
@@ -1616,6 +1646,27 @@ int main(int argc, char ** argv) {
             else                        setenv("AI_MTP_MODE", "fast", /*overwrite=*/ 0);
             fprintf(stderr, "[auto] decode mode: %s%s\n", mode_s.c_str(),
                     mode_s == "fast" ? " (not token-identical to plain greedy; --decode-mode exact or plain for that)" : "");
+            // a retrained draft head beside the model: loaded in every mode (drafts are verified); fast decode, not
+            // speed mode (which has its own tuning), defaults to the depth measured for it
+            const alpha_ai_mtp_head * hr = alpha_ai_head_row(air->sha256);
+            const std::string head = alpha_ai_find_head(model_path, hr);
+            if (!head.empty() && mode_s != "plain") {
+                setenv("AI_MTP_HEAD", head.c_str(), /*overwrite=*/ 0);
+                const char * smode = getenv("ALPHA_SPEED_MODE");
+                const bool   speed = smode && atoi(smode) != 0;
+                if (hr && mode_s == "fast" && !speed && hr->fast_k > 0 && !getenv("ALPHA_AI_MTP_K")) {
+                    setenv("ALPHA_AI_MTP_K", std::to_string(hr->fast_k).c_str(), /*overwrite=*/ 0);
+                    if (hr->ctx_total > 0 && !ctx_explicit)   // the context this depth was measured at (fewer streams keep its per-stream context)
+                        n_ctx = n_slots < air->n_streams ? hr->ctx_total / std::max(1, air->n_streams) * std::max(1, n_slots)
+                                                         : hr->ctx_total;
+                }
+                fprintf(stderr, "[auto] MTP head: %s %s%s\n", hr ? hr->what : "sidecar", head.c_str(),
+                        getenv("ALPHA_AI_MTP_K") ? (std::string(", depth ") + getenv("ALPHA_AI_MTP_K")).c_str() : "");
+            } else if (hr && mode_s != "plain") {
+                const char * file = strrchr(hr->rel, '/');
+                fprintf(stderr, "[auto] MTP head: the %s (%s) was not found beside the model or in its sibling directory -- "
+                                "serving the model's own head\n", hr->what, file ? file + 1 : hr->rel);
+            }
         }
         const char * sm = getenv("ALPHA_SPEED_MODE");
         if (sm && atoi(sm) != 0) {
