@@ -131,14 +131,20 @@ jobs:
             -DALPHA_ALPHAINFER=ON -DBUILD_SHARED_LIBS=OFF ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DALPHA_FLASHINFER=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF || exit /b 1
-          cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          rem static ggml (the AlphaInfer engine calls ggml-cuda internals a DLL does not export): every executable carries
+          rem its own copy of the CUDA kernels (~330 MB), so only the core tools are built and shipped
+          cmake --build build -j %NUMBER_OF_PROCESSORS% --target alphallama-serve alphallama alphachat llama-cli llama-quantize llama-bench || exit /b 1
 
       - name: Package
         shell: pwsh
         run: |
           $n = "$env:PKG-win-x64-${{ matrix.tag }}"; $r = "dist\$n"
           New-Item -ItemType Directory -Force "$r\licenses" | Out-Null
-          Get-ChildItem build\bin -File -Include *.exe,*.dll -Recurse | Where-Object { $_.Name -notlike 'test-*' } | Copy-Item -Destination $r
+          foreach ($t in 'alphallama-serve', 'alphallama', 'alphachat', 'llama-cli', 'llama-quantize', 'llama-bench') {
+            $f = Get-ChildItem build\bin -File -Recurse -Filter "$t.exe" | Select-Object -First 1
+            if (-not $f) { throw "missing $t.exe" }
+            Copy-Item $f.FullName -Destination $r
+          }
           Get-ChildItem $env:CUDA_PATH -Recurse -Include cudart64_*.dll,cublas64_*.dll,cublasLt64_*.dll | Copy-Item -Destination $r
           $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC" -Directory | Where-Object { $_.Name -match '^\d' } | Sort-Object Name | Select-Object -Last 1
           Copy-Item "$($redist.FullName)\x64\Microsoft.VC143.CRT\*.dll", "$($redist.FullName)\x64\Microsoft.VC143.OpenMP\*.dll" $r
