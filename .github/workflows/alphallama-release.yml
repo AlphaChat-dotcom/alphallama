@@ -157,7 +157,7 @@ jobs:
             "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA), Visual C++ runtime and OpenMP"
             "needs: NVIDIA driver ${{ matrix.driver }}, Windows 10 or 11 x64"
           ) | Set-Content "$r\BUILD_INFO"
-          Compress-Archive -Path $r -DestinationPath "dist\$n.zip"
+          Push-Location dist; 7z a -tzip -mx=5 "$n.zip" $n | Out-Null; $c = $LASTEXITCODE; Pop-Location; if ($c) { throw "7z failed ($c)" }   # Compress-Archive ran out of memory on the CUDA 12.4 package
           "$((Get-FileHash "dist\$n.zip" -Algorithm SHA256).Hash.ToLower())  $n.zip" | Set-Content "dist\$n.zip.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -238,7 +238,7 @@ jobs:
             "bundled: Visual C++ runtime and OpenMP"
             "needs: Windows 10 or 11, ${{ matrix.arch }}"
           ) | Set-Content "$r\BUILD_INFO"
-          Compress-Archive -Path $r -DestinationPath "dist\$n.zip"
+          Push-Location dist; 7z a -tzip -mx=5 "$n.zip" $n | Out-Null; $c = $LASTEXITCODE; Pop-Location; if ($c) { throw "7z failed ($c)" }   # Compress-Archive ran out of memory on the CUDA 12.4 package
           "$((Get-FileHash "dist\$n.zip" -Algorithm SHA256).Hash.ToLower())  $n.zip" | Set-Content "dist\$n.zip.sha256"
 
       - uses: actions/upload-artifact@v4
