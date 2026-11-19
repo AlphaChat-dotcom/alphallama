@@ -126,9 +126,28 @@ static Tensor carve(int buf, char * base, size_t & off, int type, int64_t n0, in
     return t;
 }
 
-Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int expert_slots)
+Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int expert_slots, size_t ws_full_bytes)
     : prog_(prog), dev_(dev), max_ctx_(max_ctx) {
     const Qwen4ExpSpec & s = prog.spec();
+    // [AI_Q4X_CTX_LEND=1, default 0] (qwen4exp_run.h). Needs the doorbell engine with slot lending, a power-of-two
+    // base below max_ctx, and no filler slots.
+    ctx_cells_ = max_ctx;
+    if (getenv("AI_Q4X_CTX_LEND") && atoi(getenv("AI_Q4X_CTX_LEND")) != 0) {
+        const int64_t cb   = getenv("AI_Q4X_CTX_BASE") ? atoll(getenv("AI_Q4X_CTX_BASE")) : 32768;
+        const bool    db   = getenv("AI_Q4X_DOORBELL") && atoi(getenv("AI_Q4X_DOORBELL")) != 0;
+        const bool    lend = getenv("AI_Q4X_LEND") && atoi(getenv("AI_Q4X_LEND")) != 0;
+        const bool    fill = getenv("AI_Q4X_FILLERS") && atoi(getenv("AI_Q4X_FILLERS")) != 0;
+        if (db && lend && !fill && cb >= 4096 && (cb & (cb - 1)) == 0 && cb < max_ctx) {
+            ctx_base_    = cb;
+            ctx_cells_   = cb;
+            ctx_ws_full_ = ws_full_bytes;
+            // [AI_Q4X_CTX_LEND_WS_CELLS, default 32768] the short-context workspace serves rounds up to this envelope
+            ctx_ws_cells_ = std::max<int64_t>(cb, getenv("AI_Q4X_CTX_LEND_WS_CELLS") ? atoll(getenv("AI_Q4X_CTX_LEND_WS_CELLS")) : 32768);
+        } else {
+            fprintf(stderr, "[q4x] AI_Q4X_CTX_LEND ignored (needs AI_Q4X_DOORBELL=1, AI_Q4X_LEND=1, no fillers, a power-of-two "
+                            "AI_Q4X_CTX_BASE >= 4096 below the context)%c", 10);
+        }
+    }
     if (expert_slots < s.n_expert_used) {
         throw std::runtime_error("Qwen4ExpRun: expert_slots must be >= n_expert_used");
     }
@@ -177,8 +196,10 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
     size_t bytes = 0;
     for (const auto & L : layers) {
         if (L.attn) {
-            bytes += 2 * (size_t) (kvw * max_ctx * 2) + 1024;
-            bytes += (size_t) (s.idx_head_dim * max_ctx * kes) + 512;
+            if (ctx_base_ == 0) {   // [AI_Q4X_CTX_LEND] else: carved inside the slot buffer (init_doorbell)
+                bytes += 2 * (size_t) (kvw * max_ctx * 2) + 1024;
+                bytes += (size_t) (s.idx_head_dim * max_ctx * kes) + 512;
+            }
             if (L.qsa_p.ratio > 0) bytes += (size_t) (s.idx_head_dim * (max_ctx / L.qsa_p.ratio + 2) * 4) + 512;
         } else {
             bytes += (size_t) ((s.conv_k - 1) * gp_.channels * 4) + 512;
@@ -197,9 +218,11 @@ Qwen4ExpRun::Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int exp
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto & L = layers[il];
         if (L.attn) {
-            kv_[il].k = carve(state_buf_, base, off, F16, kvw, max_ctx);
-            kv_[il].v = carve(state_buf_, base, off, F16, kvw, max_ctx);
-            qsa_[il].keys = carve(state_buf_, base, off, kt, s.idx_head_dim, max_ctx);
+            if (ctx_base_ == 0) {
+                kv_[il].k = carve(state_buf_, base, off, F16, kvw, max_ctx);
+                kv_[il].v = carve(state_buf_, base, off, F16, kvw, max_ctx);
+                qsa_[il].keys = carve(state_buf_, base, off, kt, s.idx_head_dim, max_ctx);
+            }
             if (L.qsa_p.ratio > 0) {
                 // f32: the pooled block keys as the graph computes them (attn_qsa_block's cache: complete blocks are
                 // pooled once; the last row is the dump for the fixed-size dirty set's unused entries)
@@ -229,6 +252,7 @@ void Qwen4ExpRun::reset() {
     ple_gate_idle();
     hist_.clear();
     cks_.clear();
+    if (ctx_base_ > 0 && ctx_cells_ > ctx_base_ && !banks_.empty()) ctx_set(ctx_base_);   // [AI_Q4X_CTX_LEND]
     if (mtp_on_) {   // no pending fill, no carried H (the head's K/V is masked by position)
         mtp_fill_m_ = 0;
         cudaMemset(mtp_H_.data, 0, (size_t) mtp_H_.nbytes());
@@ -353,6 +377,8 @@ bool Qwen4ExpRun::conv_restore(const Conversation & c) {
     dev_.synchronize();
     const auto ts = conv_tensors(len);
     if (ts.size() != c.rows.size()) return false;
+    ctx_need(len + 512);   // [AI_Q4X_CTX_LEND] before the rows land
+    dev_.synchronize();
     for (size_t i = 0; i < ts.size(); ++i) {
         if (c.rows[i].size() != ts[i].second) return false;
         dev_.upload(*ts[i].first, c.rows[i].data(), 0, ts[i].second);
@@ -392,6 +418,12 @@ bool Qwen4ExpRun::restore_checkpoint(int64_t max_len) {
     hist_.resize((size_t) c.len);
     cks_.resize(k + 1);   // the later ones were states of the history just cut off
     bells_live_ = false;   // the bells hold rounds past the checkpoint
+    if (ctx_base_ > 0 && ctx_cells_ > ctx_base_) {   // [AI_Q4X_CTX_LEND] a rewind below a tier gives its cells back
+        int64_t t = ctx_base_;
+        while (t < (int64_t) hist_.size() + 512) t *= 2;
+        t = std::min(t, max_ctx_);
+        if (t < ctx_cells_) ctx_set(t);
+    }
     return true;
 }
 
@@ -871,6 +903,47 @@ void Qwen4ExpRun::init_doorbell(int slots) {
         total += (size_t) E * 4 + 4096;
         (il >= lend_from_ ? lend_total : total) += bank_bytes(il);
     }
+    // [AI_Q4X_CTX_LEND] the plan: which state tensor lies before which bank tensor, and the workspace layers
+    struct CtxSt { Tensor * t; int type; int64_t width; };
+    std::vector<CtxSt> ctx_st;              // the attention layers' K, V (largest per cell) then the indexer keys
+    std::vector<int>   ctx_ov_layer(L, -1);   // layer -> index of its first state tensor in ctx_st (3 each), or -1
+    std::vector<char>  ctx_is_ws(L, 0);
+    int                ctx_ws_first = -1, ctx_ws_last = -1;
+    const size_t       ctx_tab_al = ((size_t) E * 4 + 255) / 256 * 256;
+    if (ctx_base_ > 0) {
+        if (nl <= 0 || fillers_) throw std::runtime_error("q4x: AI_Q4X_CTX_LEND needs slot lending (AI_Q4X_LEND=1) and no fillers");
+        const bool    keys_f32 = getenv("AI_Q4X_QSA_KEYS_F32") && atoi(getenv("AI_Q4X_QSA_KEYS_F32")) != 0;
+        const int64_t kvw      = (int64_t) s.head_dim * s.n_head_kv;
+        for (int il = 0; il < L; ++il) if (layers[(size_t) il].attn) { ctx_st.push_back({ &kv_[(size_t) il].k, F16, kvw }); ctx_st.push_back({ &kv_[(size_t) il].v, F16, kvw }); }
+        for (int il = 0; il < L; ++il) if (layers[(size_t) il].attn) ctx_st.push_back({ &qsa_[(size_t) il].keys, keys_f32 ? F32 : F16, (int64_t) s.idx_head_dim });
+        // the workspace's upper part over the whole banks of the layers just below the lent ones
+        const size_t ws_low_mb = ctx_lend_ws_low_mb();
+        int n_ws = 0;
+        if (ctx_ws_full_ > (ws_low_mb << 20)) {
+            ctx_ws_low_ = ws_low_mb << 20;
+            size_t acc = 0;
+            while (acc < ctx_ws_full_ - ctx_ws_low_ && n_ws < lend_from_ - 1) acc += bank_bytes(lend_from_ - 1 - n_ws++) - 3 * 256;
+            ctx_ws_first = lend_from_ - n_ws;
+            ctx_ws_last  = lend_from_ - 1;
+            for (int il = ctx_ws_first; il <= ctx_ws_last; ++il) { ctx_is_ws[(size_t) il] = 1; ctx_ws_layers_.push_back(il); }
+            total += ctx_ws_low_ + (acc < ctx_ws_full_ - ctx_ws_low_ ? ctx_ws_full_ - ctx_ws_low_ - acc : 0) + 2 * 4096;
+        }
+        const int n_ov = (int) ctx_st.size() / 3, n_cand = lend_from_ - n_ws;
+        if (n_ov < 1 || n_cand < n_ov) throw std::runtime_error("q4x: AI_Q4X_CTX_LEND: too few layers outside the lent and workspace ones");
+        for (int j = 0; j < n_ov; ++j) ctx_ov_layer[(size_t) ((int64_t) j * n_cand / n_ov)] = 3 * j;
+        for (int il = 0; il < L; ++il) {
+            if (ctx_ov_layer[(size_t) il] < 0) continue;
+            const auto &   m = layers[(size_t) il].moe;
+            const Tensor * h[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+            for (int r = 0; r < 3; ++r) {
+                const CtxSt & c = ctx_st[(size_t) (ctx_ov_layer[(size_t) il] + r)];
+                const size_t  row = (size_t) c.width * (c.type == F32 ? 4 : 2);
+                const size_t  head = (size_t) ctx_base_ * row, all = (size_t) max_ctx_ * row, bank = h[r]->nb[2] * (size_t) nb;
+                total += std::max(all, head + bank) - bank + 512;
+            }
+        }
+        total += (size_t) L * ctx_tab_al + 4096;
+    }
     const int buf  = dev_.alloc_buffer(total, "q4x.slots");
     char *    base = (char *) dev_.buffer_base(buf);
     size_t    off  = 0, loff = 0;
@@ -893,23 +966,69 @@ void Qwen4ExpRun::init_doorbell(int slots) {
         o     += t.nbytes();
         return t;
     };
+    // [AI_Q4X_CTX_LEND] a bank tensor whose first slots are the state tensor's cells from ctx_base_ up: the state
+    // tensor is carved here (cells below ctx_base_ zeroed, as the constructor zeroes the state buffer)
+    auto bank_over = [&](const Tensor & h, const CtxSt & c) {
+        off = (off + 255) / 256 * 256;
+        Tensor & st = *c.t;
+        st       = Tensor();
+        st.buf   = buf;
+        st.type  = c.type;
+        st.ne[0] = c.width;
+        st.ne[1] = max_ctx_;
+        set_contiguous_strides(st);
+        st.data  = base + off;
+        const size_t head = (size_t) ctx_base_ * st.nb[1];
+        Tensor t = h;
+        t.buf    = buf;
+        t.ne[2]  = nb;
+        set_contiguous_strides(t);
+        t.data   = base + off + head;
+        cudaMemset(st.data, 0, head);
+        off = std::max(off + st.nbytes(), off + head + t.nbytes());
+        return t;
+    };
+    size_t ctx_tab_off = 0;
+    if (ctx_base_ > 0) {   // the tables first: a workspace layer's must not sit between its banks
+        ctx_tab_off = off;
+        off += (size_t) L * ctx_tab_al;
+        ctx_ws_buf_ = buf;
+    }
     std::vector<offload::ExpertBanks> host;
     std::vector<double> layer_cold;   // RAM tier: per layer: profile mass of its initially non-resident experts
     double resident = 0;
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto & m = layers[il].moe;
         SlotBank &   B = banks_[il];
-        B.gate    = bank(m.gate_exps, (int) il >= lend_from_);
-        B.up      = bank(m.up_exps, (int) il >= lend_from_);
-        B.down    = bank(m.down_exps, (int) il >= lend_from_);
+        if (ctx_base_ > 0 && (int) il == ctx_ws_first) {   // the workspace's short-context part, then these layers' banks
+            off         = (off + 4095) / 4096 * 4096;
+            ctx_ws_off_ = off;
+            off        += ctx_ws_low_;
+        }
+        if (ctx_base_ > 0 && ctx_ov_layer[il] >= 0) {
+            const int j = ctx_ov_layer[il];
+            B.gate = bank_over(m.gate_exps, ctx_st[(size_t) j]);
+            B.up   = bank_over(m.up_exps, ctx_st[(size_t) j + 1]);
+            B.down = bank_over(m.down_exps, ctx_st[(size_t) j + 2]);
+        } else {
+            B.gate = bank(m.gate_exps, (int) il >= lend_from_);
+            B.up   = bank(m.up_exps, (int) il >= lend_from_);
+            B.down = bank(m.down_exps, (int) il >= lend_from_);
+        }
+        if (ctx_base_ > 0 && (int) il == ctx_ws_last) off = std::max(off, ctx_ws_off_ + ctx_ws_full_);
         B.n_slots = slots;
-        off       = (off + 255) / 256 * 256;
         B.table.buf  = buf;
         B.table.type = I32;
         B.table.ne[0] = E;
         set_contiguous_strides(B.table);
-        B.table.data = base + off;
-        off += (size_t) E * 4;
+        if (ctx_base_ > 0) {
+            B.table.data = base + ctx_tab_off + il * ctx_tab_al;
+        } else {
+            off       = (off + 255) / 256 * 256;
+            B.table.data = base + off;
+            off += (size_t) E * 4;
+        }
+        if (off > total) throw std::runtime_error("q4x: slot buffer layout overflow");
         std::vector<int32_t> order((size_t) E);
         for (int e = 0; e < E; ++e) order[(size_t) e] = e;
         if (!prof[il].empty()) {
@@ -1045,6 +1164,26 @@ void Qwen4ExpRun::init_doorbell(int slots) {
             fprintf(stderr, "[q4x] dropped this process's page-table entries over the %.2f GiB model mapping\n", d / 1073741824.0);
         }
         ple_warm();   // [AI_Q4X_PLE_WARM] after the cache drop: re-read the PLE table when RAM allows
+    }
+    if (ctx_base_ > 0) {   // [AI_Q4X_CTX_LEND]
+        ctx_blocked_.assign(layers.size(), 0);
+        size_t tail = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (ctx_ov_layer[il] < 0) continue;
+            const Tensor * bk[3] = { &banks_[il].gate, &banks_[il].up, &banks_[il].down };
+            for (int r = 0; r < 3; ++r) {
+                const Tensor * st = ctx_st[(size_t) (ctx_ov_layer[il] + r)].t;
+                ctx_ov_.push_back({ (int) il, bk[r], st });
+                tail += (size_t) (max_ctx_ - ctx_base_) * st->nb[1];
+            }
+        }
+        std::string ovs, wss;
+        for (size_t il = 0; il < layers.size(); ++il) if (ctx_ov_layer[il] >= 0) ovs += (ovs.empty() ? "" : ",") + std::to_string(il) + ":" + std::to_string(ctx_blocked_at((int) il, max_ctx_));
+        for (int w : ctx_ws_layers_) wss += (wss.empty() ? "" : ",") + std::to_string(w);
+        fprintf(stderr, "[q4x] context lend: %lld of %lld cells held; the rest (%.0f MiB of KV and keys) and %.0f MiB of the workspace lie over "
+                        "expert slots. At the full context layers lose slots as layer:slots %s; workspace layers %s (all slots)%c",
+                (long long) ctx_base_, (long long) max_ctx_, tail / 1048576.0, ctx_ws_layers_.empty() ? 0.0 : (ctx_ws_full_ - ctx_ws_low_) / 1048576.0,
+                ovs.c_str(), wss.empty() ? "none" : wss.c_str(), 10);
     }
     const int wb = dev_.alloc_buffer(256, "q4x.winbase");
     win_base_.buf   = wb;
@@ -1547,6 +1686,7 @@ bool Qwen4ExpRun::draft_verify_early(int32_t pending, int n, std::vector<int32_t
     int64_t F = 256;
     while (F < pos0 + T) F *= 2;
     F = std::min(F, max_ctx_);
+    if (F > ctx_cells_) return no(4);   // [AI_Q4X_CTX_LEND] the round() path grows the tier
     const auto * e = rounds_.find((F << 6) | (T << 1) | 1);
     if (!e || e->launches < 2) return no(3);
     if (g_rt.on && (++n_ok & 1023) == 1) fprintf(stderr, "[q4x] verify early: taken x%lld\n", n_ok);
@@ -1760,6 +1900,7 @@ Tensor Qwen4ExpRun::chunk(const int32_t * tokens, int64_t T) {
     // to score the same.
     static const int64_t chunk_pad = std::max<int64_t>(1, getenv("AI_Q4X_CHUNK_PAD") ? atoll(getenv("AI_Q4X_CHUNK_PAD")) : 256);
     const int64_t n_kv = std::min<int64_t>(max_ctx_, (pos0 + T + chunk_pad - 1) / chunk_pad * chunk_pad);
+    ctx_need(n_kv + 256);   // [AI_Q4X_CTX_LEND]
 
     // host inputs
     std::vector<int32_t>  pos4((size_t) (4 * T));
@@ -2103,6 +2244,106 @@ void Qwen4ExpRun::admit_after_round() {
     }
 }
 
+// [AI_Q4X_CTX_LEND] slots [0, n) of layer il lie under context cells (or the workspace) when `cells` are held
+int Qwen4ExpRun::ctx_blocked_at(int il, int64_t cells) const {
+    if (ctx_base_ <= 0 || cells <= ctx_base_) return 0;
+    const int ns = banks_[(size_t) il].n_slots;
+    for (int w : ctx_ws_layers_) if (w == il) return cells > ctx_ws_cells_ ? ns : 0;
+    int n = 0;
+    for (const CtxOv & o : ctx_ov_) {
+        if (o.il != il) continue;
+        const size_t b = (size_t) (std::min(cells, max_ctx_) - ctx_base_) * o.st->nb[1];
+        n = std::max(n, (int) std::min<size_t>((size_t) ns, (b + o.bank->nb[2] - 1) / o.bank->nb[2]));
+    }
+    return n;
+}
+
+size_t Qwen4ExpRun::ctx_lend_ws_low_mb() {
+    static const size_t v = getenv("AI_Q4X_CTX_LEND_WS_MB") ? (size_t) std::max(64ll, atoll(getenv("AI_Q4X_CTX_LEND_WS_MB"))) : 640;
+    return v;
+}
+
+bool Qwen4ExpRun::ctx_lend_ws(int * buf, size_t * off, size_t * low) const {
+    if (ctx_base_ <= 0 || ctx_ws_layers_.empty()) return false;
+    *buf = ctx_ws_buf_;
+    *off = ctx_ws_off_;
+    *low = ctx_ws_low_;
+    return true;
+}
+
+void Qwen4ExpRun::ctx_grow(int64_t cells) {
+    int64_t t = ctx_cells_;
+    while (t < cells) t *= 2;
+    ctx_set(std::min(t, max_ctx_));
+}
+
+// Move the context tier to `cells`. Growing: the slots under the new cells lose their experts (the tables go to the
+// device in stream order, so no later kernel reads them), then the cells are zeroed (masked cells must hold no NaN) and
+// the workspace may use its upper part. Shrinking: the freed slots get experts again (the initial owner when it is not
+// resident elsewhere, else the best-scored non-resident one), copied in stream order before the next kernel.
+void Qwen4ExpRun::ctx_set(int64_t cells) {
+    if (ctx_base_ <= 0 || cells == ctx_cells_ || banks_.empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool grow = cells > ctx_cells_;
+    const int  E    = prog_.spec().n_expert;
+    fold_join(true);
+    admit_drain();          // no admission copy in flight: owners are final
+    dev_.synchronize();     // every kernel that read the slots (or the cells) has finished
+    void *       st     = adapter::stream(dev_);
+    const auto & layers = prog_.layers();
+    int          moved  = 0;
+    for (size_t il = 0; il < banks_.size(); ++il) {
+        const int b0 = ctx_blocked_[il], b1 = ctx_blocked_at((int) il, cells);
+        if (b0 == b1) continue;
+        SlotBank & B = banks_[il];
+        if (b1 > b0) {
+            for (int sl = b0; sl < b1; ++sl) {
+                const int32_t e = B.owner[(size_t) sl];
+                if (e >= 0) { B.table_h[(size_t) e] = -1; ++moved; }
+                B.owner[(size_t) sl] = -1;
+            }
+        } else {
+            const auto &   m = layers[il].moe;
+            const Tensor * src[3] = { &m.gate_exps, &m.up_exps, &m.down_exps };
+            const Tensor * dst[3] = { &B.gate, &B.up, &B.down };
+            for (int sl = b1; sl < b0; ++sl) {
+                int32_t e = il < init_owner_.size() && (size_t) sl < init_owner_[il].size() ? init_owner_[il][(size_t) sl] : -1;
+                if (e < 0 || B.table_h[(size_t) e] >= 0) {
+                    e = -1;
+                    float best = -1.0f;
+                    for (int x = 0; x < E; ++x)
+                        if (B.table_h[(size_t) x] < 0 && B.score[(size_t) x] > best) { best = B.score[(size_t) x]; e = x; }
+                }
+                if (e < 0) continue;
+                for (int r = 0; r < 3; ++r)
+                    cudaMemcpyAsync((char *) dst[r]->data + (size_t) sl * dst[r]->nb[2], (const char *) src[r]->data + (size_t) e * src[r]->nb[2],
+                                    src[r]->nb[2], cudaMemcpyHostToDevice, (cudaStream_t) st);
+                B.owner[(size_t) sl]  = e;
+                B.table_h[(size_t) e] = sl;
+                ++moved;
+            }
+        }
+        ctx_blocked_[il] = b1;
+        int32_t * pin = table_pin_ + il * (size_t) E;
+        memcpy(pin, B.table_h.data(), (size_t) E * 4);
+        cudaMemcpyAsync(B.table.data, pin, (size_t) E * 4, cudaMemcpyHostToDevice, (cudaStream_t) st);
+    }
+    if (grow) {
+        const int64_t c0 = ctx_cells_, c1 = std::min(cells, max_ctx_);
+        for (const CtxOv & o : ctx_ov_) {
+            if (c0 >= o.st->ne[1]) continue;
+            cudaMemsetAsync((char *) o.st->data + (size_t) c0 * o.st->nb[1], 0, (size_t) (std::min<int64_t>(c1, o.st->ne[1]) - c0) * o.st->nb[1],
+                            (cudaStream_t) st);
+        }
+    }
+    if (!ctx_ws_layers_.empty()) dev_.ws_set_capacity(cells > ctx_ws_cells_ ? ctx_ws_full_ : ctx_ws_low_);
+    dev_.synchronize();
+    const int64_t from = ctx_cells_;
+    ctx_cells_ = cells;
+    fprintf(stderr, "[q4x] context lend: %lld -> %lld cells, %d expert slots %s (%.1f ms)%c", (long long) from, (long long) cells, moved,
+            grow ? "vacated" : "refilled", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), 10);
+}
+
 int Qwen4ExpRun::reset_residency() {
     if (!doorbell_ || banks_.empty() || init_owner_.size() != banks_.size()) return 0;
     lend_publish(true);   // [AI_Q4X_LEND_ASYNC] owners final for the lent layers too
@@ -2121,6 +2362,7 @@ int Qwen4ExpRun::reset_residency() {
         bool dirty = false;
         for (size_t sl = 0; sl < want.size(); ++sl) {
             const int32_t e = want[sl], cur = B.owner[sl];
+            if (!ctx_blocked_.empty() && (int) sl < ctx_blocked_[il]) continue;   // [AI_Q4X_CTX_LEND] context cells now
             if (cur == e) continue;
             if (e >= 0)
                 for (int r = 0; r < 3; ++r)   // ordered on the compute stream, before the next request's first kernel
@@ -2254,6 +2496,7 @@ Tensor Qwen4ExpRun::round(const int32_t * tokens, int64_t T, bool early) {
     int64_t F = 256;
     while (F < pos0 + T) F *= 2;
     F = std::min(F, max_ctx_);
+    ctx_need(F);   // [AI_Q4X_CTX_LEND]
     constexpr int64_t Tm = kDoorbellT;
     if (!in_ids_.valid()) {
         const size_t o_pos = 256, o_cells = 512, o_ple = 1024, o_mask = o_ple + (size_t) (s.n_embd * Tm * 4 + 255) / 256 * 256;

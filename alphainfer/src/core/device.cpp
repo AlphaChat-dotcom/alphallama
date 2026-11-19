@@ -198,6 +198,20 @@ void Device::init_workspace(size_t bytes) {
     ws_off_ = 0;
 }
 
+void Device::init_workspace_at(int buf, size_t off, size_t cap) {
+    if (off % alignment_ != 0) throw std::runtime_error("init_workspace_at: range not aligned");
+    ws_trace_on_ = getenv("AI_WS_TRACE") != nullptr;
+    ws_buf_      = buf;
+    ws_base_off_ = off;
+    ws_cap_      = cap;
+    ws_off_      = 0;
+}
+
+void Device::ws_set_capacity(size_t cap) {
+    if (ws_redirected()) ws_saved_.cap = cap;
+    else                 ws_cap_ = cap;
+}
+
 void * Device::ws_alloc_raw(size_t bytes, int * buf_out) {
     size_t off = (ws_off_ + alignment_ - 1) / alignment_ * alignment_;
     if (ws_measure_) {   // round-fit probe: count, never abort; past the capacity the pointer aliases the start

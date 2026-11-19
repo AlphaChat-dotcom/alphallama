@@ -38,7 +38,17 @@ void q4x_rt_mark(int which, void * stream);
 class Qwen4ExpRun {
 public:
     // max_ctx cells of attention KV (one stream); expert_slots per MoE layer in the v1 pool (>= n_expert_used).
-    Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int expert_slots);
+    // ws_full_bytes: the workspace the caller would allocate for max_ctx ([AI_Q4X_CTX_LEND]: its part above the
+    // short-context size lies over expert banks; 0 = the workspace is not shared)
+    Qwen4ExpRun(Qwen4Exp & prog, Device & dev, int64_t max_ctx, int expert_slots, size_t ws_full_bytes = 0);
+    // [AI_Q4X_CTX_LEND] the cells a round or prefill is about to read or write (padding included); grows the context
+    // tier when they pass the cells held now
+    void   ctx_need(int64_t cells) { if (ctx_base_ > 0 && cells > ctx_cells_) ctx_grow(cells); }
+    // the workspace range inside the slot buffer (false: the caller allocates the workspace as usual)
+    bool   ctx_lend_ws(int * buf, size_t * off, size_t * low) const;
+    int64_t ctx_cells_now() const { return ctx_cells_; }
+    // [AI_Q4X_CTX_LEND_WS_MB, default 640] the workspace kept for short contexts (the slot auto-size reserves the same)
+    static size_t ctx_lend_ws_low_mb();
 
     // One prefill/decode chunk; tokens are appended to the history. Returns logits f32 [V, T] (workspace).
     Tensor chunk(const int32_t * tokens, int64_t T);
@@ -292,6 +302,24 @@ private:
     int                  pf_nb_ = 1;         // scratch buffers in the layer-stream ring (1, 2 or 3)
     int                  pf_b(int il) const { return pf_nb_ > 1 ? il % pf_nb_ : 0; }
     bool                 lent_ = false;
+    // [AI_Q4X_CTX_LEND=1] Context lend. The KV and indexer-key tensors are laid out so that their cells from
+    // ctx_base_ up lie over the first slots of some layers' expert banks, and the workspace's part above its short-
+    // context size over whole banks of ctx_ws_layers_. While the sequence stays below ctx_cells_ those slots hold
+    // experts like any other; ctx_grow() vacates them (table -1, owner -1: no admission takes them), zeroes the cells
+    // and raises the workspace capacity before a round or prefill reads past ctx_cells_; reset() and a rewind give
+    // them back. Tiers double from ctx_base_ (a round's cell envelope is a power of two). No tensor moves, so the
+    // captured rounds stay valid.
+    struct CtxOv { int il; const Tensor * bank; const Tensor * st; };   // bank tensor of layer il starts at cell ctx_base_ of st
+    std::vector<CtxOv>   ctx_ov_;
+    std::vector<int>     ctx_ws_layers_;
+    std::vector<int>     ctx_blocked_;   // per layer: slots [0, n) are not usable now
+    int64_t              ctx_base_ = 0, ctx_cells_ = 0;   // ctx_base_ 0 = off (ctx_cells_ = max_ctx_)
+    int64_t              ctx_ws_cells_ = 0;   // the workspace layers are vacated above this many cells (>= ctx_base_)
+    int                  ctx_ws_buf_ = -1;
+    size_t               ctx_ws_off_ = 0, ctx_ws_low_ = 0, ctx_ws_full_ = 0;
+    int                  ctx_blocked_at(int il, int64_t cells) const;
+    void                 ctx_set(int64_t cells);
+    void                 ctx_grow(int64_t cells);
     // [AI_Q4X_LEND_ASYNC] the give-back copies run on their own stream after the prefill returns (its first token is not
     // held for ~2 GB of copies); the lent layers stay non-resident (owners -1: no admission picks them) until
     // lend_publish sees the event and maps them again

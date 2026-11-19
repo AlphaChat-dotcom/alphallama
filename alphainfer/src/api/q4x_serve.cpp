@@ -338,8 +338,15 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
         // AI_Q4X_RESERVE_EXTRA_MB: with lending nothing else is left over for the captured verify widths a deeper MTP
         // chain adds (on a 16 GB card depth 3 and 4 ran out of VRAM at 114 slots); default 160 MiB per draft above 2
         const size_t extra = lend ? (size_t) env_int("AI_Q4X_RESERVE_EXTRA_MB", m.mtp ? 160 * std::max(0, m.mtp_k - 2) : 0) : 0;
+        // [AI_Q4X_CTX_LEND=1] (models/qwen4exp_run.h) the KV and indexer keys above AI_Q4X_CTX_BASE cells (~26 of the
+        // 30 KiB per cell) and the workspace above its short-context size lie over expert slots: not kept free
+        const int64_t cl_base = env_int("AI_Q4X_CTX_BASE", 32768);
+        const bool    cl      = lend && env_int("AI_Q4X_CTX_LEND", 0) != 0 && env_int("AI_Q4X_DOORBELL", 0) != 0 &&
+                                env_int("AI_Q4X_FILLERS", 0) == 0 && cl_base >= 4096 && (cl_base & (cl_base - 1)) == 0 && cl_base < m.ctx;
+        const size_t  cl_ws   = cl ? std::min(ws, Qwen4ExpRun::ctx_lend_ws_low_mb()) : ws;
+        const size_t  cl_ctx  = cl ? (size_t) ((cl_base * 30 + (m.ctx - cl_base) * 4) / 1024) : (size_t) (m.ctx * 30 / 1024);
         const size_t fixed = flat   ? (size_t) env_int("AI_Q4X_VRAM_RESERVE_MB", 0) << 20
-                           : lend   ? (ws + 830 + extra + (size_t) (m.ctx * 30 / 1024)) << 20
+                           : lend   ? (cl_ws + 830 + extra + cl_ctx) << 20
                                     : ((ws + 830 + (size_t) (m.ctx * 30 / 1024)) << 20) + pf_state + (size_t) E * per_expert_max;
         // slots s fit when fr - s * per_slot >= fixed - s * per_expert_max (the scratch is (E - s) experts)
         const size_t per = flat || lend ? per_slot : per_slot - per_expert_max;
@@ -351,7 +358,7 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
                 lend ? 0.0 : (double) (E - slots) * per_expert_max / 1048576.0, per_slot / 1048576.0, slots);
     }
     slots = std::clamp(slots, k, E);
-    m.run = std::make_unique<Qwen4ExpRun>(m.prog, m.dev, m.ctx, slots);
+    m.run = std::make_unique<Qwen4ExpRun>(m.prog, m.dev, m.ctx, slots, ws << 20);
     if (m.mtp) {
         m.run->mtp_enable();
         if (env_int("AI_DRAFT_VOCAB", 1) != 0) {
@@ -360,7 +367,12 @@ Q4xServe::Q4xServe(const Config & c) : p_(std::make_unique<Impl>()) {
             if (env_int("AI_Q4X_DRAFT_ROWS_EN", 106496) > 0) m.vocab_txt = gguf_token_texts(toks);
         }
     }
-    m.dev.init_workspace(ws << 20);
+    {   // [AI_Q4X_CTX_LEND] the workspace inside the slot buffer (its upper part over expert banks), else its own buffer
+        int    wb = -1;
+        size_t wo = 0, wl = 0;
+        if (m.run->ctx_lend_ws(&wb, &wo, &wl)) m.dev.init_workspace_at(wb, wo, wl);
+        else                                   m.dev.init_workspace(ws << 20);
+    }
     // [sampling] one kern::SampleParams on the device for this stream (AI_SAMPLING=0: none, greedy only); all-greedy
     if (env_int("AI_SAMPLING", 1) != 0) {
         m.samp_buf = m.dev.alloc_buffer(256, "q4x.sample");

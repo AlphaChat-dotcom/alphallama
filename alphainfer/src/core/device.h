@@ -44,6 +44,11 @@ public:
 
     // Workspace: one buffer, bump allocation, rollback by mark.
     void   init_workspace(size_t bytes);
+    // [AI_Q4X_CTX_LEND] the workspace over `cap` bytes of an existing device buffer from byte `off` (nothing is
+    // allocated: the caller owns the range); ws_set_capacity changes the normal workspace's capacity, also while a
+    // prefill has it redirected.
+    void   init_workspace_at(int buf, size_t off, size_t cap);
+    void   ws_set_capacity(size_t cap);
     Tensor ws_alloc(int type, int64_t n0, int64_t n1 = 1, int64_t n2 = 1, int64_t n3 = 1);
     void * ws_alloc_raw(size_t bytes, int * buf_out);
     size_t ws_mark() const { return ws_off_; }

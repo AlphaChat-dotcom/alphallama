@@ -275,7 +275,8 @@ size_t Qwen4ExpRun::pf_state_bytes(int64_t S, int64_t sub) const {
 
 int Qwen4ExpRun::pf_cap(int il) const {
     const SlotBank & B = banks_[(size_t) il];
-    return prog_.spec().n_expert - (lent_layer(il) ? 0 : B.n_slots);
+    // [AI_Q4X_CTX_LEND] slots under context cells hold no experts
+    return prog_.spec().n_expert - (lent_layer(il) ? 0 : B.n_slots - (ctx_blocked_.empty() ? 0 : ctx_blocked_[(size_t) il]));
 }
 
 // [AI_Q4X_LEND] Lend: every lent layer's experts become non-resident (table -1, owners kept in lend_owner_) before the
@@ -446,8 +447,9 @@ bool Qwen4ExpRun::prefill_alloc(int64_t S, int64_t sub) {
     for (size_t il = 0; il < banks_.size(); ++il) {
         const auto & m   = prog_.layers()[il].moe;
         const size_t per = (size_t) (m.gate_exps.nb[2] + m.up_exps.nb[2] + m.down_exps.nb[2]);
-        scr  = std::max(scr, (size_t) (s.n_expert - banks_[il].n_slots) * per + 3 * 256);
-        lscr = std::max(lscr, (size_t) ((int) il >= lend_from_ ? s.n_expert : s.n_expert - banks_[il].n_slots) * per + 3 * 256);
+        const int cb = ctx_blocked_at((int) il, max_ctx_);   // [AI_Q4X_CTX_LEND] its slots under context cells at the full context
+        scr  = std::max(scr, (size_t) (s.n_expert - banks_[il].n_slots + cb) * per + 3 * 256);
+        lscr = std::max(lscr, (size_t) ((int) il >= lend_from_ ? s.n_expert : s.n_expert - banks_[il].n_slots + cb) * per + 3 * 256);
     }
     const size_t soff = (bytes + 255) / 256 * 256;
     static const bool alloc_rows = !getenv("AI_Q4X_PF_ALLOC_ROWS") || atoi(getenv("AI_Q4X_PF_ALLOC_ROWS")) != 0;
@@ -1591,6 +1593,7 @@ Tensor Qwen4ExpRun::prefill(const int32_t * tokens, int64_t n, std::vector<float
         mtp_flush();
         const int64_t pos0 = (int64_t) hist_.size();
         if (pos0 + SC > max_ctx_) throw std::runtime_error("Qwen4ExpRun::prefill: context full");
+        ctx_need(pos0 + SC + 512);   // [AI_Q4X_CTX_LEND]
         hist_.insert(hist_.end(), tokens + s0, tokens + s0 + SC);
         dev_.synchronize();
         dev_.ws_reset(0);
