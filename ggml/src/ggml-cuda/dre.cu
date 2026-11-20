@@ -806,6 +806,10 @@ static __device__ __forceinline__ uint64_t dre_gtimer() {
 // ALPHA_DRE_FETCH_CPU: how many of n unique misses of one layer job stay on the CPU, for n = 0, 1, 2, ... (past the
 // list, one in two of the further misses).
 struct dre_fetched { int li, e, s; };
+struct dre_fetch_wait { cudaEvent_t ev; dre_answer * ans; uint32_t seq; };
+constexpr int DRE_FETCH_EVQ = 256;
+static dre_fetch_wait        g_fetch_evq[DRE_FETCH_EVQ];          // worker -> waiter
+static std::atomic<unsigned> g_fetch_evq_w{0}, g_fetch_evq_r{0};
 constexpr int DRE_FETCH_CLASSES = 8, DRE_FETCH_LIST = 8192;
 static std::vector<int>     g_fetch_land[DRE_FETCH_CLASSES];     // reserved free slots, by unit class
 static std::atomic<int>     g_fetch_taken[DRE_FETCH_CLASSES];    // how many of them this graph's jobs have used
@@ -813,12 +817,9 @@ static dre_fetched          g_fetch_list[DRE_FETCH_LIST];        // this graph's
 static std::atomic<int>     g_fetch_n{0};
 static cudaStream_t         g_fetch_st = nullptr;
 static unsigned long long * g_fetch_wait_ns_d = nullptr;
-constexpr int DRE_FETCH_RING = 4096, DRE_FETCH_EVQ = 256;
+constexpr int DRE_FETCH_RING = 4096;
 static int64_t *            g_fetch_ring = nullptr;              // pinned: table entries in flight
 static unsigned             g_fetch_ring_i = 0;
-struct dre_fetch_wait { cudaEvent_t ev; dre_answer * ans; uint32_t seq; };
-static dre_fetch_wait       g_fetch_evq[DRE_FETCH_EVQ];          // worker -> waiter
-static std::atomic<unsigned> g_fetch_evq_w{0}, g_fetch_evq_r{0};
 static int                  g_fetch_dev = 0;
 static long long            g_fetch_total = 0;
 bool dre_fetch_on() {
@@ -833,6 +834,7 @@ static void dre_fetch_init() {
     CUDA_CHECK(cudaMallocHost(&g_fetch_ring, DRE_FETCH_RING * sizeof(int64_t)));
     for (auto & q : g_fetch_evq) CUDA_CHECK(cudaEventCreateWithFlags(&q.ev, cudaEventDisableTiming));
     CUDA_CHECK(cudaGetDevice(&g_fetch_dev));
+    dre_fetch_debug_start();
     std::thread([] {
         CUDA_CHECK(cudaSetDevice(g_fetch_dev));
         int idle = 0;
@@ -844,12 +846,21 @@ static void dre_fetch_init() {
             }
             idle = 0;
             dre_fetch_wait & q = g_fetch_evq[r % DRE_FETCH_EVQ];
+            const auto tw0 = std::chrono::steady_clock::now();
+            bool warned = false;
             for (;;) {
                 const cudaError_t e = cudaEventQuery(q.ev);
                 if (e == cudaSuccess) break;
                 if (e != cudaErrorNotReady) { CUDA_CHECK(e); break; }
                 dre_pause();
+                if (!warned && std::chrono::steady_clock::now() - tw0 > std::chrono::seconds(2)) {
+                    warned = true;
+                    fprintf(stderr, "[dre-fetch] the copies of job seq %u are not done after 2 s (queue r %u w %u)\n",
+                            q.seq, r, g_fetch_evq_w.load());
+                }
             }
+            if (warned) fprintf(stderr, "[dre-fetch] ... done after %.1f s\n",
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count());
             q.ans->fetch_done = q.seq;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             g_fetch_evq_r.store(r + 1, std::memory_order_release);
@@ -857,6 +868,34 @@ static void dre_fetch_init() {
     }).detach();
     fprintf(stderr, "[dre] fetch lane ON: missed experts copied into the pool inside the token (reserve %d slots)\n",
             dre_env_int("ALPHA_DRE_FETCH_RESERVE", 96));
+}
+static std::atomic<int>       g_fetch_stage{0};      // decode thread: 1 fold, 2 reserve, 3 graph_begin body, 0 outside
+static std::atomic<long long> g_fetch_jobs{0};       // layer jobs handled by the worker
+static std::atomic<long long> g_fetch_graphs{0};     // graph_begin calls
+static void dre_fetch_debug_start() {
+    static bool started = false;
+    if (started || dre_env_int("ALPHA_DRE_FETCH_DEBUG", 0) == 0) return;
+    started = true;
+    std::thread([] {
+        long long last_jobs = -1, last_graphs = -1; int quiet = 0; bool reported = false;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const long long j = g_fetch_jobs.load(), gr = g_fetch_graphs.load();
+            if (j != last_jobs || gr != last_graphs) { last_jobs = j; last_graphs = gr; quiet = 0; reported = false; continue; }
+            bool pend = g_fetch_stage.load() != 0;
+            for (const auto & L : g_dre.layers) if (L.bell && (L.bell->seq != L.seen || L.ans->done != L.bell->seq)) pend = true;
+            if (!pend || reported || ++quiet < 6) continue;
+            reported = true;
+            fprintf(stderr, "[dre-fetch] STALL: stage %d, jobs %lld, graphs %lld, list %d, evq r %u w %u\n", g_fetch_stage.load(), j, gr,
+                    g_fetch_n.load(), g_fetch_evq_r.load(), g_fetch_evq_w.load());
+            for (const auto & L : g_dre.layers) {
+                if (!L.bell) continue;
+                fprintf(stderr, "[dre-fetch]   blk %d: bell %u seen %u | fetch %u (seq %u, issued %u) fetch_done %u | done %u | n_ids %d n_tok %d\n", L.blk,
+                        (unsigned) L.bell->seq, L.seen, (unsigned) L.ans->fetch, (unsigned) L.ans->fetch >> 1, (unsigned) L.ans->fetch & 1u,
+                        (unsigned) L.ans->fetch_done, (unsigned) L.ans->done, (int) L.bell->n_ids, (int) L.bell->n_tok);
+            }
+        }
+    }).detach();
 }
 // between graphs, decode thread: the fetched experts become ordinary residents; unused reserved slots go back
 static void dre_fetch_fold() {
@@ -946,7 +985,20 @@ static int dre_fetch_issue(dre_layer & L, const int * uq, int want, uint32_t seq
         g_fetch_n.store(nlist + 1, std::memory_order_release);
         n++;
     }
-    if (n > 0) {
+    static const bool fsync = dre_env_int("ALPHA_DRE_FETCH_SYNC", 0) != 0;
+    static int n_log = 0;
+    if (n > 0 && fsync) {
+        const auto ts0 = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaStreamSynchronize(g_fetch_st));
+        if (n_log < 8) {
+            n_log++;
+            fprintf(stderr, "[dre-fetch] blk %d seq %u: %d experts copied, stream sync %.3f ms\n", L.blk, seq, n,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count());
+        }
+        L.ans->fetch_done = seq;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    } else if (n > 0) {
+        if (n_log < 8) { n_log++; fprintf(stderr, "[dre-fetch] blk %d seq %u: %d experts issued\n", L.blk, seq, n); }
         const unsigned w = g_fetch_evq_w.load(std::memory_order_relaxed);
         while (w - g_fetch_evq_r.load(std::memory_order_acquire) >= (unsigned) DRE_FETCH_EVQ) dre_pause();
         dre_fetch_wait & q = g_fetch_evq[w % DRE_FETCH_EVQ];
@@ -1138,7 +1190,19 @@ void dre_cpu_layer_impl(dre_layer & L) {
         if (e >= 0 && e < L.n_exp && L.slot[e] < 0 && !dre_zc(L, e)) { miss_e[nm] = e; miss_k[nm] = k; miss_t[nm] = k / std::max(1, n_used); nm++; }
     }
     if (dre_fetch_on()) {
+        g_fetch_jobs++;
         uint32_t issued = 0;
+        {   // fetched earlier in this interval (this layer ran before since the last graph_begin): resident already
+            const int li_me = (int) (&L - g_dre.layers.data());
+            const int nfl = g_fetch_n.load(std::memory_order_acquire);
+            int w = 0;
+            for (int m = 0; m < nm; m++) {
+                bool f = false;
+                for (int i = 0; i < nfl && !f; i++) f = g_fetch_list[i].li == li_me && g_fetch_list[i].e == miss_e[m];
+                if (!f) { miss_e[w] = miss_e[m]; miss_k[w] = miss_k[m]; miss_t[w] = miss_t[m]; w++; }
+            }
+            nm = w;
+        }
         if (nm > 0 && L.cls < DRE_FETCH_CLASSES) {
             int uq[DRE_MAX_IDS], nuq = 0;
             for (int m = 0; m < nm; m++) {
@@ -3265,7 +3329,10 @@ void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
     cudaStream_t st = ctx.stream();
     if (g_dre.ev_tok_valid) CUDA_CHECK(cudaEventSynchronize(g_dre.ev_tok));
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    g_fetch_graphs++;
+    g_fetch_stage = 1;
     dre_fetch_fold();
+    g_fetch_stage = 3;
 
     g_dre.tok++;
     dre_profile_fill();
@@ -3412,7 +3479,9 @@ void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
         newslots.push_back(s);
     }
     if (n_backlog_used) g_dre_warm_backlog.erase(g_dre_warm_backlog.begin(), g_dre_warm_backlog.begin() + n_backlog_used);
+    g_fetch_stage = 2;
     dre_fetch_reserve();   // evicts for this graph's fetches; unpublished by the upload below
+    g_fetch_stage = 3;
     dre_upload_dirty(st);
     if (!newslots.empty()) {
         cudaEvent_t ev;
@@ -3498,6 +3567,7 @@ void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
         g_dre.n_use = g_dre.n_hit = 0;
         dre_profile_save();
     }
+    g_fetch_stage = 0;
 }
 
 void ggml_cuda_dre_graph_end(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
