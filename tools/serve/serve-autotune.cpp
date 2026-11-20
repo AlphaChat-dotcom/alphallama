@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -104,6 +105,10 @@ static std::vector<std::vector<int>> l3_domains() {
 
 static std::string cache_path() {
     if (const char * p = getenv("ALPHA_AUTOTUNE_CACHE")) return p;
+#if defined(_WIN32)
+    // no HOME on Windows: the path came out as "/tmp/.cache/...", which does not exist, so nothing was cached
+    if (const char * la = getenv("LOCALAPPDATA")) return std::string(la) + "\\alphainfer\\autotune.tsv";
+#endif
     const char * home = getenv("HOME");
     return std::string(home ? home : "/tmp") + "/.cache/alphainfer/autotune.tsv";
 }
@@ -215,15 +220,10 @@ autotune_rates autotune_measure() {
     r.dram_gbs = measure_dram_gbs();
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "[auto-tune] calibrated in %.1f s (cached in %s)\n", s, path.c_str());
-#if defined(__linux__)
-    const size_t sl = path.rfind('/');
-    if (sl != std::string::npos) {   // mkdir -p of the cache directory
-        const std::string dir = path.substr(0, sl);
-        for (size_t p = 1; p <= dir.size(); ++p) {
-            if (p == dir.size() || dir[p] == '/') mkdir(dir.substr(0, p).c_str(), 0755);
-        }
+    {   // mkdir -p of the cache directory (std::filesystem: Windows too)
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     }
-#endif
     if (r.pcie_gbs > 0) {
         std::ofstream out(path, std::ios::app);
         if (out) out << key << '\t' << r.pcie_gbs << '\t' << r.dram_gbs << '\n';
