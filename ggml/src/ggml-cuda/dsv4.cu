@@ -1,4 +1,8 @@
 #include "common.cuh"
+#include "unary.cuh"
+#include <mutex>
+#include <utility>
+#include <vector>
 #include <cstring>
 #include <cuda_fp16.h>
 #include "ggml.h"
@@ -142,6 +146,105 @@ static __global__ void dsv4_hc_split_wsum_k(const float * __restrict__ x, const 
     dst[2 * n_hc + tid] = c;
 }
 
+// Prompt-batch form (ALPHA_HC_PRE_BIG, default 1): one block of 512 threads per token.
+static __global__ void dsv4_hc_pre_big_k(const float * __restrict__ x, const char * __restrict__ fn, const size_t fn_row,
+        const float * __restrict__ scale, const float * __restrict__ base, float * __restrict__ split, float * __restrict__ out,
+        const int n_embd, const int n_mix, const int sinkhorn_iters, const float eps, const float rms_eps,
+        const size_t split_stride, const size_t out_stride) {
+    constexpr int n_hc = 4;
+    const int D = n_embd * n_hc;
+    const int t = blockIdx.x;
+    const float * xt = x + (size_t) t * D;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    __shared__ float sh_red[32][17];   // [logit row or 24 = sum of squares][warp]
+    __shared__ float sh_mix[32];
+    __shared__ float sh_c[16];
+    __shared__ float sh_pre[4];
+    const int n_blk = D / 32;
+    float acc[24];
+    float ss = 0.0f;
+    for (int r = 0; r < n_mix; r++) acc[r] = 0.0f;
+    for (int bk = tid; bk < n_blk; bk += blockDim.x) {
+        float xv[32];
+        for (int i = 0; i < 32; i++) { xv[i] = xt[bk * 32 + i]; ss += xv[i] * xv[i]; }
+        for (int r = 0; r < n_mix; r++) {
+            const char * blk = fn + (size_t) r * fn_row + (size_t) bk * 34;
+            const float d = __half2float(*(const __half *) blk);
+            const int8_t * qs = (const int8_t *) (blk + 2);
+            float sd = 0.0f;
+            for (int i = 0; i < 32; i++) sd += (float) qs[i] * xv[i];
+            acc[r] += d * sd;
+        }
+    }
+    for (int r = 0; r < n_mix; r++) {
+        const float v = warp_reduce_sum(acc[r]);
+        if (lane == 0) sh_red[r][warp] = v;
+    }
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) sh_red[24][warp] = ss;
+    __syncthreads();
+    if (tid < n_mix) {
+        float tss = 0.0f, tot = 0.0f;
+        for (int w = 0; w < nw; w++) { tss += sh_red[24][w]; tot += sh_red[tid][w]; }
+        sh_mix[tid] = tot * rsqrtf(tss / D + rms_eps);
+    }
+    __syncthreads();
+    if (tid < 16) {
+        const float ps = scale[0], pos = scale[1], cs = scale[2];
+        const int sh = tid & 3, dh = tid >> 2;
+        float * dst = split + (size_t) t * split_stride;
+        if (tid < n_hc) {
+            const float pv = 1.0f / (1.0f + expf(-(sh_mix[tid] * ps + base[tid]))) + eps;
+            sh_pre[tid] = pv;
+            dst[tid] = pv;
+            dst[n_hc + tid] = 2.0f / (1.0f + expf(-(sh_mix[n_hc + tid] * pos + base[n_hc + tid])));
+        }
+        float row[4];
+        float mx = -INFINITY;
+        for (int k = 0; k < n_hc; k++) {
+            const int off = 2 * n_hc + k + dh * n_hc;
+            row[k] = sh_mix[off] * cs + base[off];
+            mx = fmaxf(mx, row[k]);
+        }
+        float sm = 0.0f;
+        for (int k = 0; k < n_hc; k++) { row[k] = expf(row[k] - mx); sm += row[k]; }
+        float c = row[sh] / sm + eps;
+        sh_c[tid] = c;
+        __syncwarp(0xffffu);
+        {
+            float cs2 = 0.0f; for (int k = 0; k < n_hc; k++) cs2 += sh_c[sh + k * n_hc];
+            __syncwarp(0xffffu);
+            c *= 1.0f / (cs2 + eps);
+            sh_c[tid] = c;
+            __syncwarp(0xffffu);
+        }
+        for (int it = 0; it < sinkhorn_iters - 1; ++it) {
+            float rs = 0.0f; for (int k = 0; k < n_hc; k++) rs += sh_c[k + dh * n_hc];
+            __syncwarp(0xffffu);
+            c *= 1.0f / (rs + eps);
+            sh_c[tid] = c;
+            __syncwarp(0xffffu);
+            float cs2 = 0.0f; for (int k = 0; k < n_hc; k++) cs2 += sh_c[sh + k * n_hc];
+            __syncwarp(0xffffu);
+            c *= 1.0f / (cs2 + eps);
+            sh_c[tid] = c;
+            __syncwarp(0xffffu);
+        }
+        dst[2 * n_hc + tid] = c;
+    }
+    __syncthreads();
+    const float p0 = sh_pre[0], p1 = sh_pre[1], p2 = sh_pre[2], p3 = sh_pre[3];
+    float * o = out + (size_t) t * out_stride;
+    for (int d = tid; d < n_embd; d += blockDim.x) {
+        float a = 0.0f;
+        a += xt[d] * p0;
+        a += xt[n_embd + d] * p1;
+        a += xt[2 * n_embd + d] * p2;
+        a += xt[3 * n_embd + d] * p3;
+        o[d] = a;
+    }
+}
+
 // Tries to run nodes i.. (RMS_NORM, MUL_MAT, DSV4_HC_SPLIT_SINKHORN, views, DSV4_HC_WEIGHTED_SUM) as the fused kernel.
 // Returns the index of the last node it covered, or -1.
 int ggml_cuda_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -159,20 +262,37 @@ int ggml_cuda_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx, const ggml_cgra
     float eps; memcpy(&eps, (const int32_t *) sp->op_params + 2, sizeof(float));
     float rms_eps; memcpy(&rms_eps, rn->op_params, sizeof(float));
     const int64_t D = flat->ne[0], nt = flat->ne[1], n_mix = fnw->ne[1];
-    if (n_hc != 4 || n_mix != (2 + n_hc) * n_hc || fnw->ne[0] != D || D % (32 * n_hc) != 0 || nt < 1 || nt > 64) return -1;
+    if (n_hc != 4 || n_mix != (2 + n_hc) * n_hc || fnw->ne[0] != D || D % (32 * n_hc) != 0 || nt < 1 || nt > 65535) return -1;
     if (flat->type != GGML_TYPE_F32 || !ggml_is_contiguous(flat) || sp->type != GGML_TYPE_F32 || sp->nb[0] != sizeof(float)) return -1;
     if (flat->ne[2] != 1 || flat->ne[3] != 1 || sp->ne[0] != n_mix || sp->ne[1] != nt) return -1;
     if (!sp->src[1] || !sp->src[2] || sp->src[1]->type != GGML_TYPE_F32 || sp->src[2]->type != GGML_TYPE_F32) return -1;
     // views of the split, then the weighted sum over the same streams
+    // several tokens: the pre view is made contiguous for the weighted sum (that CONT is covered too)
+    const ggml_tensor * pre_c = nullptr;
     int j = i + 3;
-    while (j < cgraph->n_nodes && j < i + 12 && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE)) j++;
+    for (; j < cgraph->n_nodes && j < i + 12; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE) continue;
+        if (n->op == GGML_OP_CONT && !pre_c && n->src[0] && n->src[0]->view_src == sp && n->src[0]->data == sp->data) { pre_c = n; continue; }
+        break;
+    }
     if (j >= cgraph->n_nodes) return -1;
     const ggml_tensor * ws = cgraph->nodes[j];
     if (ws->op != GGML_OP_DSV4_HC_WEIGHTED_SUM || !ws->src[0] || !ws->src[1]) return -1;
     const ggml_tensor * x = ws->src[0];
-    const ggml_tensor * pre = ws->src[1];
+    const ggml_tensor * pre = pre_c ? pre_c->src[0] : ws->src[1];
+    if (pre_c && ws->src[1] != pre_c) return -1;
     if (x->data != flat->data || !ggml_is_contiguous(x) || x->ne[1] != n_hc || x->ne[0] * n_hc != D || x->ne[2] != nt) return -1;
     if (pre->view_src != sp || pre->data != sp->data || ws->type != GGML_TYPE_F32 || ws->nb[0] != sizeof(float) || ws->ne[0] != x->ne[0]) return -1;
+    static const bool big_on = [] { const char * e = getenv("ALPHA_HC_PRE_BIG"); return !e || atoi(e) != 0; }();
+    if (nt > 64 || pre_c) {
+        if (!big_on || D / 32 > 512 * 64) return -1;
+        { static bool said = false; if (!said) { said = true; fprintf(stderr, "[hc-pre] prompt form: %d logits, %d tokens" "\n", (int) n_mix, (int) nt); } }
+        dsv4_hc_pre_big_k<<<(unsigned) nt, 512, 0, ctx.stream()>>>((const float *) flat->data, (const char *) fnw->data, fnw->nb[1],
+                (const float *) sp->src[1]->data, (const float *) sp->src[2]->data, (float *) sp->data, (float *) ws->data,
+                (int) x->ne[0], (int) n_mix, si, eps, rms_eps, sp->nb[1] / sizeof(float), ws->nb[1] / sizeof(float));
+        return j;
+    }
     if (mm->type != GGML_TYPE_F32 || mm->nb[0] != sizeof(float)) return -1;
     { static bool said = false; if (!said) { said = true; fprintf(stderr, "[hc-pre] mixer pre side fused: %d logits, %d tokens\n", (int) n_mix, (int) nt); } }
     dsv4_hc_mix_k<<<dim3((unsigned) n_mix, (unsigned) nt), 512, 0, ctx.stream()>>>((const float *) flat->data, (const char *) fnw->data,
@@ -328,6 +448,271 @@ int ggml_cuda_idx_score_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph
     idx_score_k<<<(unsigned) ((plane + 255) / 256), 256, 0, ctx.stream()>>>((const float *) kq->data, (const float *) w->data, (float *) c2->data,
             n_pool, n_tok, (int) n_head, w->nb[1] / sizeof(float));
     return i + 5;
+}
+
+// ---- glm5-next linear-attention layer: conv and gate chains for prompt batches --------------------------------------
+// ALPHA_GLM_CONV_FUSED (default 64 = minimum tokens, 0 = off)
+static int glm_conv_min_tok() {
+    static const int v = [] { const char * e = getenv("ALPHA_GLM_CONV_FUSED"); return e ? atoi(e) : 64; }();
+    return v;
+}
+static const ggml_tensor * glm_root(const ggml_tensor * x) { while (x && x->view_src) x = x->view_src; return x; }
+static bool glm_overlap(const void * a, size_t an, const void * b, size_t bn) {
+    const char * a0 = (const char *) a, * b0 = (const char *) b;
+    return a0 < b0 + bn && b0 < a0 + an;
+}
+
+struct glm_conv_plan {
+    int i_ssm = -1, i_last = -1;
+    const ggml_tensor * st = nullptr, * x = nullptr, * w = nullptr, * out = nullptr;
+    bool norm = false;
+    float eps = 0.0f, post = 1.0f;
+    int64_t T = 0, C = 0, row = 0;
+};
+
+// cc = CONCAT(state view [3, C], transpose(x [C, T])) feeding SSM_CONV(w [4, C]) -> SILU [-> RMS_NORM -> SCALE].
+// The same decision is taken at the CONCAT node (which then writes only its tail) and at the SSM_CONV node.
+static bool glm_conv_plan_at(const ggml_cgraph * g, int i_cc, glm_conv_plan & P) {
+    const int min_tok = glm_conv_min_tok();
+    const ggml_tensor * cc = g->nodes[i_cc];
+    if (min_tok <= 0 || cc->op != GGML_OP_CONCAT || ((const int32_t *) cc->op_params)[0] != 0 || cc->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * s = cc->src[0], * xt = cc->src[1];
+    if (!s || !xt || s->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32) return false;
+    const int64_t T = xt->ne[0], C = xt->ne[1];
+    if (T < min_tok || s->ne[0] != 3 || s->ne[1] != C || s->ne[2] != 1 || xt->ne[2] != 1 || cc->ne[0] != T + 3 || cc->ne[1] != C ||
+        cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc) || s->nb[0] != sizeof(float) || s->nb[1] != 3 * sizeof(float)) return false;
+    const ggml_tensor * xr = glm_root(xt);
+    if (!xr || xr == xt || xr->type != GGML_TYPE_F32 || !ggml_is_contiguous(xr) || xr->ne[0] != C || xr->ne[1] != T || ggml_nelements(xr) != C * T ||
+        xt->data != xr->data || xt->nb[0] != (size_t) C * sizeof(float) || xt->nb[1] != sizeof(float)) return false;
+    // consumers of the concat result: one SSM_CONV, and views of its 3 tail rows (the state update)
+    int i_ssm = -1;
+    for (int j = i_cc + 1; j < g->n_nodes; j++) {
+        const ggml_tensor * n = g->nodes[j];
+        if (n->view_src == cc) {
+            if ((const char *) n->data != (const char *) cc->data + (size_t) T * sizeof(float) || n->ne[0] != 3 || n->ne[1] != C ||
+                n->nb[0] != sizeof(float) || n->nb[1] != cc->nb[1] || ggml_nelements(n) != 3 * C) return false;
+            continue;
+        }
+        if (n->src[0] == cc || n->src[1] == cc) {
+            if (n->op != GGML_OP_SSM_CONV || n->src[0] != cc || i_ssm >= 0) return false;
+            i_ssm = j;
+        }
+    }
+    if (i_ssm < 0 || i_ssm + 1 >= g->n_nodes) return false;
+    const ggml_tensor * ssm = g->nodes[i_ssm];
+    const ggml_tensor * w = ssm->src[1];
+    if (!w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || !ggml_is_contiguous(w) || ssm->ne[0] != C || ssm->ne[1] != T ||
+        ssm->src[2] != xr) return false;   // the graph keeps x allocated up to here (the state is snapshotted at the CONCAT)
+    const ggml_tensor * u = g->nodes[i_ssm + 1];
+    if (u->op != GGML_OP_UNARY || (ggml_unary_op) ((const int32_t *) u->op_params)[0] != GGML_UNARY_OP_SILU || u->src[0] != ssm ||
+        u->src[2] != xr || u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u)) return false;
+    P = glm_conv_plan();
+    P.i_ssm = i_ssm; P.i_last = i_ssm + 1; P.st = s; P.x = xr; P.w = w; P.out = u; P.T = T; P.C = C;
+    // optional l2 norm over rows of 128
+    int k = i_ssm + 2;
+    while (k < g->n_nodes && k < i_ssm + 6 && (g->nodes[k]->op == GGML_OP_RESHAPE || g->nodes[k]->op == GGML_OP_VIEW) && g->nodes[k]->view_src == u) k++;
+    if (k + 1 < g->n_nodes) {
+        const ggml_tensor * rn = g->nodes[k], * sc = g->nodes[k + 1];
+        float sb[2] = { 0.0f, 0.0f };
+        if (sc->op == GGML_OP_SCALE) memcpy(sb, sc->op_params, sizeof(sb));
+        if (rn->op == GGML_OP_RMS_NORM && rn->src[0] && glm_root(rn->src[0]) == u && ggml_is_contiguous(rn->src[0]) && rn->ne[0] == 128 && C % 128 == 0 &&
+            rn->src[2] == xr && sc->op == GGML_OP_SCALE && sc->src[0] == rn && sc->src[2] == xr && sb[1] == 0.0f &&
+            sc->type == GGML_TYPE_F32 && ggml_is_contiguous(sc) && ggml_nelements(sc) == C * T) {
+            bool sole = true;   // nothing else may read the un-normed activation or the RMS output
+            for (int j = i_ssm + 2; j < g->n_nodes && sole; j++) {
+                const ggml_tensor * n = g->nodes[j];
+                if (n == rn || n == sc || n->view_src == u) continue;
+                for (int q = 0; q < 2; q++) {
+                    if (n->src[q] && (glm_root(n->src[q]) == u || n->src[q] == rn)) sole = false;
+                }
+            }
+            if (sole) {
+                P.norm = true; P.out = sc; P.i_last = k + 1; P.row = 128; P.post = sb[0];
+                memcpy(&P.eps, rn->op_params, sizeof(float));
+            }
+        }
+    }
+    // x must stay untouched from the CONCAT to the kernel (nothing in between may write over it), and the output must not alias it
+    const size_t xn = ggml_nbytes(xr);
+    for (int j = i_cc; j <= P.i_last; j++) {
+        const ggml_tensor * n = g->nodes[j];
+        if (!n->data || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) continue;
+        if (glm_overlap(n->data, ggml_nbytes(n), xr->data, xn)) return false;
+    }
+    return true;
+}
+
+static __device__ __forceinline__ float glm_conv_tap(const float * __restrict__ x, const float * __restrict__ st,
+        const float * __restrict__ w, const int64_t C, const int c, const int64_t t) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int64_t m = t + j;
+        const float v = m < 3 ? st[m + (int64_t) c * 3] : x[c + (m - 3) * C];
+        sum += v * w[j + c * 4];
+    }
+    return ggml_cuda_op_silu_single(sum);
+}
+
+// out[c, t] = silu(sum_j w[j, c] * in[t + j, c]),  in = the 3 state rows followed by x
+static __global__ void glm_conv_silu_k(const float * __restrict__ x, const float * __restrict__ st, const float * __restrict__ w,
+        float * __restrict__ out, const int64_t C, const int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= C * T) return;
+    out[i] = glm_conv_tap(x, st, w, C, (int) (i % C), i / C);
+}
+
+// the same followed by out = v * post / sqrt(mean_row(v^2) + eps) over rows of 128 channels; one warp per row
+static __global__ void glm_conv_silu_norm_k(const float * __restrict__ x, const float * __restrict__ st, const float * __restrict__ w,
+        float * __restrict__ out, const int64_t C, const int64_t T, const float eps, const float post) {
+    const int lane = threadIdx.x & 31;
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int64_t n_row = C / 128;
+    if (r >= n_row * T) return;
+    const int64_t t = r / n_row;
+    const int c0 = (int) (r % n_row) * 128 + lane;
+    float v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 4; e++) { v[e] = glm_conv_tap(x, st, w, C, c0 + 32 * e, t); ss += v[e] * v[e]; }
+    ss = warp_reduce_sum(ss);
+    const float sc = post / sqrtf(ss / 128.0f + eps);
+#pragma unroll
+    for (int e = 0; e < 4; e++) out[c0 + 32 * e + t * C] = v[e] * sc;
+}
+
+// the concat result's 3 tail rows (what the state update reads): cc[T + j, c] = x[c, T - 3 + j]; and a snapshot of the
+// entering state for the conv kernel (the state update that follows may write the same cells)
+static __global__ void glm_conv_tail_k(const float * __restrict__ x, const float * __restrict__ st, float * __restrict__ cc,
+        float * __restrict__ snap, const int64_t C, const int64_t T) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 3 * C) return;
+    const int c = i / 3, j = i % 3;
+    snap[i] = st[i];
+    cc[T + j + (int64_t) c * (T + 3)] = x[c + (T - 3 + j) * C];
+}
+
+// state snapshots between a CONCAT and its SSM_CONV (q, k and v of a layer are open at the same time)
+struct glm_conv_snaps {
+    std::mutex mu;
+    std::vector<std::pair<const ggml_tensor *, float *>> open;
+    std::vector<std::pair<float *, size_t>> spare;
+};
+static glm_conv_snaps g_glm_snaps;
+
+bool ggml_cuda_glm_conv_concat(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    glm_conv_plan P;
+    if (!glm_conv_plan_at(cgraph, i, P)) return false;
+    const ggml_tensor * cc = cgraph->nodes[i];
+    const size_t need = (size_t) 3 * P.C * sizeof(float);
+    float * snap = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_glm_snaps.mu);
+        for (size_t q = 0; q < g_glm_snaps.open.size(); q++) {   // a stale entry of an abandoned graph
+            if (g_glm_snaps.open[q].first == cc) { snap = g_glm_snaps.open[q].second; g_glm_snaps.open.erase(g_glm_snaps.open.begin() + q); break; }
+        }
+        if (snap) { g_glm_snaps.spare.push_back(std::make_pair(snap, need)); snap = nullptr; }
+        for (size_t q = 0; q < g_glm_snaps.spare.size(); q++) {
+            if (g_glm_snaps.spare[q].second >= need) { snap = g_glm_snaps.spare[q].first; g_glm_snaps.spare.erase(g_glm_snaps.spare.begin() + q); break; }
+        }
+        if (!snap) CUDA_CHECK(cudaMalloc(&snap, need));
+        g_glm_snaps.open.push_back(std::make_pair(cc, snap));
+    }
+    glm_conv_tail_k<<<(unsigned) ((3 * P.C + 255) / 256), 256, 0, ctx.stream()>>>((const float *) P.x->data, (const float *) P.st->data,
+            (float *) cc->data, snap, P.C, P.T);
+    return true;
+}
+
+// Returns the index of the last node covered, or -1.
+int ggml_cuda_glm_conv_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * ssm = cgraph->nodes[i];
+    const ggml_tensor * cc = ssm->src[0];
+    if (glm_conv_min_tok() <= 0 || !cc || cc->op != GGML_OP_CONCAT || ssm->ne[1] < glm_conv_min_tok()) return -1;
+    int i_cc = -1;
+    for (int j = i - 1; j >= 0; j--) if (cgraph->nodes[j] == cc) { i_cc = j; break; }
+    glm_conv_plan P;
+    if (i_cc < 0 || !glm_conv_plan_at(cgraph, i_cc, P) || P.i_ssm != i) return -1;
+    float * snap = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_glm_snaps.mu);
+        for (size_t q = 0; q < g_glm_snaps.open.size(); q++) {
+            if (g_glm_snaps.open[q].first == cc) {
+                snap = g_glm_snaps.open[q].second;
+                g_glm_snaps.open.erase(g_glm_snaps.open.begin() + q);
+                g_glm_snaps.spare.push_back(std::make_pair(snap, (size_t) 3 * P.C * sizeof(float)));   // free for reuse once this kernel is queued
+                break;
+            }
+        }
+    }
+    GGML_ASSERT(snap != nullptr);   // the CONCAT of this conv took the same decision
+    { static bool said = false; if (!said) { said = true; fprintf(stderr, "[glm-conv] fused: %lld channels x %lld tokens, l2 norm %d" "\n", (long long) P.C, (long long) P.T, (int) P.norm); } }
+    if (P.norm) {
+        glm_conv_silu_norm_k<<<(unsigned) ((P.C / 128 * P.T + 3) / 4), 128, 0, ctx.stream()>>>((const float *) P.x->data, snap,
+                (const float *) P.w->data, (float *) P.out->data, P.C, P.T, P.eps, P.post);
+    } else {
+        glm_conv_silu_k<<<(unsigned) ((P.C * P.T + 255) / 256), 256, 0, ctx.stream()>>>((const float *) P.x->data, snap,
+                (const float *) P.w->data, (float *) P.out->data, P.C, P.T);
+    }
+    return P.i_last;
+}
+
+// Decay gate: out = s2 * sigmoid(s1 * ((g + dt[c]) * a[c / head_dim]))
+static __global__ void glm_gate_chain_k(const float * __restrict__ g, const float * __restrict__ dt, const float * __restrict__ a,
+        float * __restrict__ out, const int64_t C, const int64_t n, const int head_dim, const float s1, const float s2) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = (int) (i % C);
+    const float v = ((g[i] + dt[c]) * a[c / head_dim]) * s1;
+    out[i] = (1.0f / (1.0f + expf(-v))) * s2;
+}
+
+// nodes i..: ADD(g, dt), MUL by the per-head factor, SCALE, SIGMOID, SCALE (reshapes between). Returns the last index or -1.
+int ggml_cuda_glm_gate_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const int min_tok = glm_conv_min_tok();
+    const ggml_tensor * ad = cgraph->nodes[i];
+    if (min_tok <= 0 || ad->op != GGML_OP_ADD || ad->type != GGML_TYPE_F32 || !ad->src[0] || !ad->src[1]) return -1;
+    const ggml_tensor * gt = ad->src[0], * dt = ad->src[1];
+    const int64_t C = ad->ne[0], T = ad->ne[1];
+    if (T < min_tok || ad->ne[2] != 1 || ad->ne[3] != 1 || !ggml_is_contiguous(ad) || !ggml_are_same_shape(gt, ad) || gt->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(gt) || dt->type != GGML_TYPE_F32 || ggml_nelements(dt) != C || !ggml_is_contiguous(dt)) return -1;
+    const ggml_tensor * mu = nullptr, * s1 = nullptr, * un = nullptr, * s2 = nullptr;
+    int j = i + 1;
+    for (; j < cgraph->n_nodes && j < i + 12 && !s2; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        switch (n->op) {
+            case GGML_OP_RESHAPE: case GGML_OP_VIEW: break;
+            case GGML_OP_MUL:   if (mu || !n->src[0] || glm_root(n->src[0]) != ad || !n->src[1]) return -1; mu = n; break;
+            case GGML_OP_SCALE: if (!mu) return -1;
+                                if (!s1) { if (n->src[0] != mu) return -1; s1 = n; }
+                                else     { if (!un || n->src[0] != un) return -1; s2 = n; }
+                                break;
+            case GGML_OP_UNARY: if (!s1 || un || n->src[0] != s1 || (ggml_unary_op) ((const int32_t *) n->op_params)[0] != GGML_UNARY_OP_SIGMOID) return -1; un = n; break;
+            default: return -1;
+        }
+    }
+    if (!s2) return -1;
+    j--;
+    const ggml_tensor * a = mu->src[1];
+    float p1[2], p2[2];
+    memcpy(p1, s1->op_params, sizeof(p1));
+    memcpy(p2, s2->op_params, sizeof(p2));
+    const int64_t n_head = mu->ne[1], head_dim = mu->ne[0];
+    if (a->type != GGML_TYPE_F32 || ggml_nelements(a) != n_head || a->ne[1] != n_head || head_dim * n_head != C || ggml_nelements(mu) != C * T ||
+        p1[1] != 0.0f || p2[1] != 0.0f || s2->type != GGML_TYPE_F32 || !ggml_is_contiguous(s2) || ggml_nelements(s2) != C * T) return -1;
+    for (int q = j + 1; q < cgraph->n_nodes; q++) {   // the intermediates have no other readers
+        const ggml_tensor * n = cgraph->nodes[q];
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const ggml_tensor * r = n->src[k] ? glm_root(n->src[k]) : nullptr;
+            if (r && (r == ad || r == mu || r == s1 || r == un)) return -1;
+        }
+    }
+    const size_t nb = (size_t) C * T * sizeof(float);
+    if (s2->data != gt->data && glm_overlap(s2->data, nb, gt->data, nb)) return -1;
+    if (glm_overlap(s2->data, nb, dt->data, ggml_nbytes(dt)) || glm_overlap(s2->data, nb, a->data, ggml_nbytes(a))) return -1;
+    { static bool said = false; if (!said) { said = true; fprintf(stderr, "[glm-gate] fused: %lld x %lld, scales %g %g" "\n", (long long) C, (long long) T, p1[0], p2[0]); } }
+    glm_gate_chain_k<<<(unsigned) ((C * T + 255) / 256), 256, 0, ctx.stream()>>>((const float *) gt->data, (const float *) dt->data,
+            (const float *) a->data, (float *) s2->data, C, C * T, (int) head_dim, p1[0], p2[0]);
+    return j;
 }
 
 // HC expand: block_out[n_embd, n_tokens] + post*block + comb*residual -> [n_embd, n_hc, n_tokens]

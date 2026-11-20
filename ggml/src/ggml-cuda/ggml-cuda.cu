@@ -6643,8 +6643,23 @@ static bool alpha_op_prof_byname() {
     static const bool v = []() { const char * e = getenv("ALPHA_OP_PROF_BYNAME"); return e && atoi(e) != 0; }();
     return v;
 }
+static bool alpha_op_prof_byname_all() {   // ALPHA_OP_PROF_BYNAME=2: every op, keyed by node name (digits stripped) and shape
+    static const bool v = []() { const char * e = getenv("ALPHA_OP_PROF_BYNAME"); return e && atoi(e) >= 2; }();
+    return v;
+}
 static std::string alpha_op_prof_key(const ggml_tensor * node) {
-    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) return std::string();
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        if (!alpha_op_prof_byname_all()) return std::string();
+        std::string nm = node->name;
+        for (char & c : nm) if (c >= '0' && c <= '9') c = '#';
+        const ggml_tensor * a = node->src[0];
+        std::string an = a ? a->name : "";
+        for (char & c : an) if (c >= '0' && c <= '9') c = '#';
+        char buf[224];
+        snprintf(buf, sizeof(buf), "%s %.48s <- %.48s [%lld,%lld,%lld,%lld]", ggml_op_name(node->op), nm.c_str(), an.c_str(),
+                 (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+        return buf;
+    }
     const ggml_tensor * w = node->src[0];
     std::string nm = w && w->name[0] ? w->name : "?";
     if (nm.compare(0, 4, "blk.") == 0) {
@@ -6770,7 +6785,7 @@ static void alpha_op_prof_flush(cudaStream_t st) {
             std::vector<std::pair<double, std::string>> vn;
             for (const auto & kv : p.acc_name) vn.push_back(std::make_pair(kv.second.first, kv.first));
             std::sort(vn.rbegin(), vn.rend());
-            for (size_t i = 0; i < vn.size() && i < 40; i++) {
+            for (size_t i = 0; i < vn.size() && i < (alpha_op_prof_byname_all() ? 90u : 40u); i++) {
                 const std::pair<double, long long> & e = p.acc_name[vn[i].second];
                 fprintf(stderr, "[op-prof-name] %8.3f ms/pass %5.1f%% %6.1f calls/pass  %s\n",
                         e.first / (double) p.passes / 1000.0, 100.0 * e.first / p.total_us,
@@ -7167,6 +7182,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // start of fusion operations
+                // ahead of the generic SSM_CONV + SILU fusion: this conv's CONCAT input was left unmaterialised
+                if (node->op == GGML_OP_SSM_CONV) {   // glm5-next prompt-batch conv, reads the projection and the state directly
+                    const int jf = ggml_cuda_glm_conv_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
                     ggml_cuda_topk_moe_args args;
@@ -7662,6 +7682,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (node->op == GGML_OP_CONCAT && ggml_cuda_glm_conv_concat(*cuda_ctx, cgraph, i)) {
+                    continue;   // glm5-next conv input of a prompt batch: only the state tail is materialised
+                }
+                if (node->op == GGML_OP_ADD) {   // glm5-next decay-gate chain as one kernel
+                    const int jf = ggml_cuda_glm_gate_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 if (node->op == GGML_OP_CONT) {   // glm5-next indexer scoring as one kernel
                     const int jf = ggml_cuda_idx_score_fused(*cuda_ctx, cgraph, i);
                     if (jf > i) { i = jf; continue; }

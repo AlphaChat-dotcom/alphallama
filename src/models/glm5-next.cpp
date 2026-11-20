@@ -76,9 +76,13 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                 (kv_head * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
-    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
-    Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
-    Xcur = ggml_silu(ctx0, Xcur);
+    ggml_tensor * conv = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+    ggml_tensor * Xcur = ggml_silu(ctx0, conv);
+    // extra sources keep the projection and the conv state allocated up to here, so that a backend may read them
+    // directly instead of the concatenated copy (CUDA does, for prompt batches)
+    conv->src[2] = x_proj;
+    Xcur->src[2] = x_proj;
+    GGML_UNUSED(n_tokens);
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
@@ -555,8 +559,13 @@ ggml_tensor * llm_build_glm5_next::build_kda_layer(
 
     // Match FLA l2 norm
     constexpr float l2_eps = 1e-6f;
-    Qcur = glm5_l2_norm(ctx0, Qcur, l2_eps);
-    Kcur = glm5_l2_norm(ctx0, Kcur, l2_eps);
+    {
+        ggml_tensor * q_act = Qcur->src[0], * k_act = Kcur->src[0];   // the conv activations (see glm5_conv1d)
+        Qcur = glm5_l2_norm(ctx0, Qcur, l2_eps);
+        Kcur = glm5_l2_norm(ctx0, Kcur, l2_eps);
+        for (ggml_tensor * n : { Qcur, Qcur->src[0] }) { n->src[2] = q_act->src[2]; }
+        for (ggml_tensor * n : { Kcur, Kcur->src[0] }) { n->src[2] = k_act->src[2]; }
+    }
 
     auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
 

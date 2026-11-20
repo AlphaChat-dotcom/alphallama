@@ -229,4 +229,154 @@ static bool launch(const float * q, const float * k, const float * v, const floa
     return true;
 }
 
+// ---- per-channel gate (KDA), one value head per key head -------------------------------------------------------------
+//   S[i][c] = ge[i] S[i][c];  kv[c] = sum_i S[i][c] k[i];  d[c] = (v[c] - kv[c]) beta;  S[i][c] += k[i] d[c];
+//   o[c] = scale * sum_i S[i][c] q[i]            (ge = exp(g), formed by the caller)
+// per staged token: q[S], k[S], ge[S], v[CB], b
+struct layout_kda {
+    static constexpr int Q = 0, K = S, G = 2 * S, V = 3 * S, B = 3 * S + CB;
+    static constexpr int PER_TOK = B + 1;
+    static constexpr int PER_TOK_PAD = (PER_TOK + 3) & ~3;
+};
+
+__global__ void __launch_bounds__(CB * RG, 1)
+gdn_kh_kda_kernel(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+                  const float * __restrict__ ge, const float * __restrict__ b,
+                  const float * __restrict__ curr_state, float * __restrict__ dst, float * __restrict__ state_out,
+                  const int H, const int n_tokens,
+                  const int64_t sq1, const int64_t sq2, const int64_t sq3,
+                  const int64_t sv1, const int64_t sv2, const int64_t sv3,
+                  const int64_t sb1, const int64_t sb2, const int64_t sb3,
+                  const int rq3, const float scale) {
+    using LY = layout_kda;
+    extern __shared__ float smem[];   // [2][TB][PER_TOK_PAD] staging + reduction arrays
+    float * stage  = smem;
+    float * red_kv = smem + 2 * TB * LY::PER_TOK_PAD;   // [RG][CB]
+    float * red_o  = red_kv + RG * CB;                   // [RG][CB]
+
+    constexpr int NCB = S / CB;
+    const int h    = blockIdx.x / NCB;
+    const int cb   = blockIdx.x % NCB;
+    const int seq  = blockIdx.y;
+    const int c    = threadIdx.x;
+    const int rg   = threadIdx.y;
+    const int tid  = rg * CB + c;
+    const int col  = cb * CB + c;
+    const int iq3  = seq / rq3;
+
+    const int64_t head_state = (int64_t) S * S;
+    float s[RPG];
+    {
+        const float * src = curr_state + ((int64_t) seq * H + h) * head_state + (int64_t) col * S + rg * RPG;
+#pragma unroll
+        for (int j = 0; j < RPG; j += 4) {
+            const float4 x = *(const float4 *) (src + j);
+            s[j] = x.x; s[j + 1] = x.y; s[j + 2] = x.z; s[j + 3] = x.w;
+        }
+    }
+
+    auto stage_block = [&](int t0, int buf) {
+        float * st = stage + buf * TB * LY::PER_TOK_PAD;
+        const int nt = min(TB, n_tokens - t0);
+        // q, k and decay rows: 3 x S floats per token = 3 x 32 16-byte chunks
+        for (int i = tid; i < nt * 3 * (S / 4); i += CB * RG) {
+            const int tt = i / (3 * (S / 4));
+            const int w  = i % (3 * (S / 4));
+            const int which = w / (S / 4), off = (w % (S / 4)) * 4;
+            const float * gsrc = which == 2
+                ? ge + ((int64_t) seq * sb3 + (int64_t) (t0 + tt) * sb2 + (int64_t) h * sb1) * S + off
+                : (which ? k : q) + iq3 * sq3 + (int64_t) (t0 + tt) * sq2 + (int64_t) h * sq1 + off;
+            cp16(st + tt * LY::PER_TOK_PAD + which * S + off, gsrc);
+        }
+        for (int i = tid; i < nt * CB; i += CB * RG) {
+            const int tt = i / CB, cc = i % CB;
+            cp4(st + tt * LY::PER_TOK_PAD + LY::V + cc,
+                v + (int64_t) seq * sv3 + (int64_t) (t0 + tt) * sv2 + (int64_t) h * sv1 + cb * CB + cc);
+        }
+        for (int i = tid; i < nt; i += CB * RG) {
+            cp4(st + i * LY::PER_TOK_PAD + LY::B, b + (int64_t) seq * sb3 + (int64_t) (t0 + i) * sb2 + (int64_t) h * sb1);
+        }
+        cp_commit();
+    };
+
+    const int64_t out_tok = (int64_t) S * H;
+    float * out_base = dst + (int64_t) seq * n_tokens * out_tok + (int64_t) h * S + col;
+
+    if (n_tokens > 0) stage_block(0, 0);
+    for (int t0 = 0, blk = 0; t0 < n_tokens; t0 += TB, blk++) {
+        cp_wait_all();
+        __syncthreads();                                   // block blk landed; everyone is done with buffer blk-1
+        if (t0 + TB < n_tokens) stage_block(t0 + TB, (blk + 1) & 1);
+        const float * st = stage + (blk & 1) * TB * LY::PER_TOK_PAD;
+        const int nt = min(TB, n_tokens - t0);
+        for (int tt = 0; tt < nt; tt++) {
+            const float * tk = st + tt * LY::PER_TOK_PAD;
+            const float * sk = tk + LY::K + rg * RPG;
+            const float * sq = tk + LY::Q + rg * RPG;
+            const float * sg = tk + LY::G + rg * RPG;
+            float kreg[RPG];
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < RPG; j += 4) {
+                const float4 xk = *(const float4 *) (sk + j), xg = *(const float4 *) (sg + j);
+                kreg[j] = xk.x; kreg[j + 1] = xk.y; kreg[j + 2] = xk.z; kreg[j + 3] = xk.w;
+                s[j] *= xg.x; s[j + 1] *= xg.y; s[j + 2] *= xg.z; s[j + 3] *= xg.w;
+                a0 = fmaf(s[j], kreg[j], a0); a1 = fmaf(s[j + 1], kreg[j + 1], a1);
+                a2 = fmaf(s[j + 2], kreg[j + 2], a2); a3 = fmaf(s[j + 3], kreg[j + 3], a3);
+            }
+            red_kv[rg * CB + c] = (a0 + a1) + (a2 + a3);
+            __syncthreads();
+            const float kv_col = red_kv[0 * CB + c] + red_kv[1 * CB + c] + red_kv[2 * CB + c] + red_kv[3 * CB + c];
+            const float d = (tk[LY::V + c] - kv_col) * tk[LY::B];
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < RPG; j += 4) {
+                const float4 xq = *(const float4 *) (sq + j);
+                s[j]     = fmaf(kreg[j],     d, s[j]);     o0 = fmaf(s[j],     xq.x, o0);
+                s[j + 1] = fmaf(kreg[j + 1], d, s[j + 1]); o1 = fmaf(s[j + 1], xq.y, o1);
+                s[j + 2] = fmaf(kreg[j + 2], d, s[j + 2]); o2 = fmaf(s[j + 2], xq.z, o2);
+                s[j + 3] = fmaf(kreg[j + 3], d, s[j + 3]); o3 = fmaf(s[j + 3], xq.w, o3);
+            }
+            red_o[rg * CB + c] = (o0 + o1) + (o2 + o3);
+            __syncthreads();
+            if (rg == 0) {
+                out_base[(int64_t) (t0 + tt) * out_tok] =
+                    (red_o[0 * CB + c] + red_o[1 * CB + c] + red_o[2 * CB + c] + red_o[3 * CB + c]) * scale;
+            }
+        }
+    }
+
+    {
+        float * d = state_out + ((int64_t) seq * H + h) * head_state + (int64_t) col * S + rg * RPG;
+#pragma unroll
+        for (int j = 0; j < RPG; j += 4) *(float4 *) (d + j) = make_float4(s[j], s[j + 1], s[j + 2], s[j + 3]);
+    }
+}
+
+// true when launched; false = the caller takes another path. ge = exp(g), contiguous [S, H, n_tokens, n_seqs].
+static bool launch_kda(const float * q, const float * k, const float * v, const float * ge, const float * b,
+                       const float * curr_state, float * dst, float * state_out_override,
+                       int64_t S_v, int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
+                       int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+                       int64_t sb1, int64_t sb2, int64_t sb3, int64_t rq3, float scale, cudaStream_t stream) {
+    if (S_v != S || H_k != H) return false;
+    if ((sq1 | sq2 | sq3) & 3) return false;
+    if (((uintptr_t) q | (uintptr_t) k | (uintptr_t) ge) & 15) return false;
+    if (((uintptr_t) curr_state & 15)) return false;
+    float * state_out = state_out_override ? state_out_override : dst + S_v * H * n_tokens * n_seqs;
+    if (((uintptr_t) state_out & 15)) return false;
+    const dim3 grid((unsigned) (H * (S / CB)), (unsigned) n_seqs);
+    const dim3 block(CB, RG);
+    const size_t smem = sizeof(float) * (2 * TB * layout_kda::PER_TOK_PAD + 2 * RG * CB);
+    static bool attr_set = false;
+    if (!attr_set) {
+        CUDA_CHECK(cudaFuncSetAttribute(gdn_kh_kda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        attr_set = true;
+    }
+    gdn_kh_kda_kernel<<<grid, block, smem, stream>>>(q, k, v, ge, b, curr_state, dst, state_out, (int) H, (int) n_tokens,
+                                                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, (int) rq3, scale);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 }   // namespace gdn_kh

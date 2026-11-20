@@ -28,7 +28,8 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb3,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
-                                     float         scale) {
+                                     float         scale,
+                                     int           g_is_exp) {   // KDA: g already holds exp(g) (prompt batches)
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -109,12 +110,19 @@ gated_delta_net_cuda(const float * q,
                 attn_data[col] = attn_col * scale;
             }
         } else {
+            // the decay of this step, once: exp(g[i]) (it enters both the read and the update below)
+            float ge[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                ge[r] = g_is_exp ? g_t[i] : expf(g_t[i]);
+            }
+
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += ge[r] * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -127,8 +135,7 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = ge[r] * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -150,6 +157,11 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+static __global__ void gdn_exp_kernel(const float * __restrict__ g, float * __restrict__ out, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = expf(g[i]);
+}
+
 template <bool KDA>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -160,7 +172,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, cudaStream_t stream) {
+        float scale, cudaStream_t stream, int g_is_exp = 0) {
     // chunked prefill lives in gated_delta_net_chunked.cuh (dispatched from the op entry point)
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -177,26 +189,26 @@ static void launch_gated_delta_net(
             gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, g_is_exp);
             break;
         case 32:
             gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, g_is_exp);
             break;
         case 64: {
             gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, g_is_exp);
             break;
         }
         case 128: {
             gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, g_is_exp);
             break;
         }
         default:
@@ -376,9 +388,28 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
 
     if (kda) {
+        // ALPHA_GDN_KDA_EXP_MIN (default 16 tokens, 0 = off): exp(g) for the whole batch in one elementwise kernel.
+        // In the token-serial kernel every thread evaluated it for its channels at every step; same values.
+        static const int exp_min = [] { const char * e = getenv("ALPHA_GDN_KDA_EXP_MIN"); return e ? atoi(e) : 16; }();
+        ggml_cuda_pool_alloc<float> exp_buf(ctx.pool());
+        int g_is_exp = 0;
+        if (exp_min > 0 && n_tokens >= exp_min && ggml_is_contiguous(src_g) && sb1 == 1 && sb2 == H && sb3 == H * n_tokens) {
+            const int64_t n_g = S_v * H * n_tokens * n_seqs;
+            exp_buf.alloc(n_g);
+            gdn_exp_kernel<<<(unsigned) ((n_g + 255) / 256), 256, 0, stream>>>(g_d, exp_buf.get(), n_g);
+            g_d = exp_buf.get();
+            g_is_exp = 1;
+            // ALPHA_GDN_KDA_KH (default 64 tokens, 0 = off): the staged token-serial kernel for prompt batches
+            static const int kda_kh_min = [] { const char * e = getenv("ALPHA_GDN_KDA_KH"); return e ? atoi(e) : 64; }();
+            if (kda_kh_min > 0 && n_tokens >= kda_kh_min &&
+                gdn_kh::launch_kda(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override, S_v, H, neqk1, n_tokens, n_seqs,
+                                   sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3, scale, stream)) {
+                return;
+            }
+        }
         launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+            sb1, sb2, sb3, neqk1, rq3, scale, stream, g_is_exp);
     } else {
         launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_override,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
