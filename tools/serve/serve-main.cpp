@@ -1757,7 +1757,6 @@ int main(int argc, char ** argv) {
             setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
             fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
         }
-        }
         // Thinking effort when the request names none: the template's own default (xhigh), as Strata 0.2.8 does; the
         // answer room keeps a long think from eating the whole max_tokens. 2.0.4 set "low" here (first answer token
         // worst 1.9 s vs 7.5 s on an RTX 4080); ALPHA_DEFAULT_REASONING_EFFORT=low gets that back.
