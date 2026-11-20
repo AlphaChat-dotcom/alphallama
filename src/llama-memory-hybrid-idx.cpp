@@ -862,6 +862,8 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
 //
 
 // the last padded pool is always unused
+uint32_t alpha_get_kv_reserve_cap(void);   // llama-kv-cache.cpp
+
 static uint32_t llama_kpool_pad(uint32_t n_pool) {
     return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
 }
@@ -938,7 +940,12 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
 
     if (is_full) {
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_stream();
+        uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_stream();
+        // a prompt reservation sized for the context this prompt can reach (ALPHA_KV_RESERVE_CAP), as the attention
+        // masks already are: the pooled-key scoring holds pools x tokens x heads temporaries
+        if (const uint32_t cap = alpha_get_kv_reserve_cap(); cap > 0) {
+            n_pool_max = std::min<uint64_t>(n_pool_max, uint64_t((cap + mem->get_kpool() - 1) / mem->get_kpool() + 1) * idx->get_n_stream());
+        }
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         return llama_kpool_pad((uint32_t) n_pool_max);
     }

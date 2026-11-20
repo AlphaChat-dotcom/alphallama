@@ -140,6 +140,14 @@ void dre_pfc_compute() {
         char * pbase = q2p ? (char *) (((uintptr_t) prep.data() + 63) & ~(uintptr_t) 63) : nullptr;
         for (int i = 0; i < m; i++) {
             const float * g = gb.data() + (size_t) i * F, * u = ub.data() + (size_t) i * F;
+            // ALPHA_DRE_SWIGLU_CLAMP: the clamped SwiGLU of deepseek4 / glm5-next, as the decode CPU lane applies it
+            static const float clampv = [] { const char * e = getenv("ALPHA_DRE_SWIGLU_CLAMP"); return e ? (float) atof(e) : 0.0f; }();
+            if (clampv > 1e-6f) {
+                for (int r = 0; r < F; r++) {
+                    const float gc = std::min(g[r], clampv), uc = std::max(-clampv, std::min(clampv, u[r]));
+                    ab[r] = (gc / (1.0f + expf(-gc))) * uc;
+                }
+            } else
             for (int r = 0; r < F; r++) ab[r] = (g[r] / (1.0f + expf(-g[r]))) * u[r];
             ggml_get_type_traits_cpu(td->vec_dot_type)->from_float(ab.data(), qa.data() + i * qa_row, F);
             if (q2p) ggml_cpu_q2_0_prepare(qa.data() + i * qa_row, F, pbase + (size_t) i * q2psz);

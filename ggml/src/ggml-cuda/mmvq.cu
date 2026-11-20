@@ -1469,6 +1469,44 @@ void ggml_cuda_mul_mat_vec_q(
         if (!dre_inner && ids && ggml_cuda_dre_enabled()) {
             const void * b = nullptr; const int64_t * t = nullptr;
             if (ggml_cuda_dre_lookup(src0, nullptr, ctx.stream(), &b, &t)) {
+                // late pass: residents first (gate/up here, down below), then the fetched experts once their bytes landed
+                struct late_pending { bool valid = false; const ggml_tensor * src0 = nullptr; const ggml_tensor * src1 = nullptr;
+                                      const ggml_tensor * ids = nullptr; ggml_tensor * dst = nullptr;
+                                      ggml_cuda_mm_fusion_args_host fusion{}; bool mmid = false; };
+                static thread_local late_pending lp;
+                const int late = ggml_cuda_dre_late_role(src0, src1, ids, fusion != nullptr && fusion->gate != nullptr, ctx.stream());
+                if (late == 1) {
+                    dre_inner = true;
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, fusion, mmid_tokens_as_samples);
+                    dre_inner = false;
+                    lp.valid = true; lp.src0 = src0; lp.src1 = src1; lp.ids = ids; lp.dst = dst; lp.fusion = *fusion; lp.mmid = mmid_tokens_as_samples;
+                    return;
+                }
+                if (late == 2 && lp.valid && ggml_cuda_dre_same_layer(src0, lp.src0)) {
+                    dre_inner = true;
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, fusion, mmid_tokens_as_samples);
+                    ggml_tensor ids_late = *lp.ids;   // output positions 0, 1, 2, ... instead of expert ids
+                    ids_late.data = (void *) ggml_cuda_dre_late_iota();
+                    ids_late.nb[0] = sizeof(int32_t);
+                    ids_late.nb[1] = ids_late.ne[0] * sizeof(int32_t);
+                    ids_late.nb[2] = ids_late.nb[1] * ids_late.ne[1];
+                    ids_late.nb[3] = ids_late.nb[2];
+                    ids_late.view_src = nullptr; ids_late.view_offs = 0;
+                    ggml_cuda_dre_late_wait(lp.src0, lp.ids, 1, ctx.stream());
+                    ggml_cuda_dre_late_override(lp.src0);
+                    ggml_cuda_mul_mat_vec_q(ctx, lp.src0, lp.src1, &ids_late, lp.dst, &lp.fusion, lp.mmid);
+                    ggml_cuda_dre_late_override(nullptr);
+                    ggml_cuda_dre_late_wait(src0, lp.ids, 2, ctx.stream());
+                    ggml_cuda_mmvq_q8_cache_begin_graph();   // the activations changed under the cache
+                    ggml_cuda_dre_late_override(src0);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, &ids_late, dst, fusion, mmid_tokens_as_samples);
+                    ggml_cuda_dre_late_override(nullptr);
+                    dre_inner = false;
+                    lp.valid = false;
+                    ggml_cuda_dre_post(src0, dst, ctx.stream());
+                    return;
+                }
+                lp.valid = false;
                 ggml_cuda_dre_pre(src0, src1, ids, ctx.stream());
                 dre_inner = true;
                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, fusion, mmid_tokens_as_samples);
