@@ -1704,6 +1704,13 @@ void gpu_engine::mtp_window_extend(const BatchRequest & req, BatchResult & resul
     if (t_next == LLAMA_TOKEN_NULL) { rewind(); return; }
 
     mtp_steps++; mtp_accept += n_acc; mtp_drafted += k; mtp_accept_full += (n_acc == k) ? 1 : 0;
+    // ALPHA_MTP_WIN_LOG: one line per window (drafted, accepted, running totals), so the acceptance of a short
+    // request can be read without waiting for the every-16-windows summary
+    {
+        static const bool win_log = alpha_env_on("ALPHA_MTP_WIN_LOG");
+        if (win_log) fprintf(stderr, "[mtp-win-log] pos0=%d drafted=%d accepted=%d | totals: %lld windows, %lld drafted, %lld accepted\n",
+                             (int) pos0, k, n_acc, (long long) mtp_steps, (long long) mtp_drafted, (long long) mtp_accept);
+    }
     if (g_mtp_ngram_adapt && slot_id >= 0) {
         if ((int) ngram_adapt_.size() <= slot_id) ngram_adapt_.resize(slot_id + 1);
         auto & A = ngram_adapt_[slot_id];

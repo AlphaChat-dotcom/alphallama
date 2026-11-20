@@ -15,7 +15,8 @@
 //   - the k-pool indexer re-pools every complete pool on every ubatch (no pooled-key cache, no gather
 //     path), and is skipped altogether while every pool fits in the top-k budget, where the selection
 //     is the whole causal context;
-//   - the NextN (MTP) block is loaded as skipped tensors and has no graph here.
+//   - the NextN (MTP) block has no graph here: with ALPHA_MTP it is loaded and llama-context-mtp5.cpp drafts with
+//     it from the hidden this graph exports (t_mtp_hidden); otherwise its tensors are skipped.
 //
 // ALPHA_GLM5_TOPK=<n> overrides attention.indexer.top_k (testing the sparse path on a short context).
 
@@ -445,8 +446,14 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
         cb(inpL, "l_out", il);
     }
 
+    // ALPHA_MTP with the NextN block loaded: the block drafts from the trunk's hidden after output_norm (upstream's
+    // h_nextn), and the head's latent cache needs that hidden for every row of the ubatch, so the narrowing to the
+    // output rows moves behind the norm (llama_context reads res->t_mtp_hidden; llama-context-mtp5.cpp)
+    static const bool mtp_env = [] { const char * e = getenv("ALPHA_MTP"); return e && atoi(e) != 0; }();
+    const bool mtp_defer = mtp_env && hparams.nextn_predict_layers == 1 && model.layers[n_trunk].nextn.eh_proj != nullptr;
+
     // narrow to the output tokens, then collapse the streams
-    if (inp_out_ids) {
+    if (inp_out_ids && !mtp_defer) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, inpL), n_embd*hc, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);
@@ -457,6 +464,18 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
+    if (mtp_defer) {
+        ggml_tensor * mtp_h = ggml_cont(ctx0, cur);   // [n_embd, n_tokens]
+        cb(mtp_h, "mtp_hidden", -1);
+        ggml_set_output(mtp_h);
+        res->t_mtp_hidden = mtp_h;
+        ggml_build_forward_expand(gf, mtp_h);
+
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, mtp_h, inp_out_ids);
+        }
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
@@ -465,6 +484,15 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // MTP: the verify reads one token per row from an in-graph argmax instead of scanning full-vocab logits
+    if (mtp_defer) {
+        ggml_tensor * am = ggml_argmax(ctx0, cur);
+        cb(am, "mtp_argmax", -1);
+        ggml_set_output(am);
+        res->t_mtp_argmax = am;
+        ggml_build_forward_expand(gf, am);
+    }
 }
 
 // KDA layer, g_a/g_b output gate

@@ -123,6 +123,10 @@ struct llama_context {
     llama_token mtp_draft_qwen4exp(llama_token e_tok);
     bool        mtp_kv_fill_qwen4exp(const std::vector<const float *> & hsrc, const std::vector<llama_token> & ctok,
                                      const std::vector<llama_pos> & cpos, int32_t slot0, int64_t m);
+    // glm5-next (plain block, nope MLA over a latent cache) MTP block, see llama-context-mtp5.cpp
+    llama_token mtp_draft_glm5next(llama_token e_tok);
+    bool        mtp_kv_fill_glm5next(const std::vector<const float *> & hsrc, const std::vector<llama_token> & ctok,
+                                     int32_t slot0, int64_t m);
     // Append the head-KV fill of a prompt chunk to the chunk's own graph (ALPHA_MTP_FILL_INGRAPH, qwen4exp)
     bool        mtp_ingraph_append(const llama_ubatch & ub, llm_graph_result * res, ggml_cgraph * gf);
     void        mtp_ingraph_set_inputs();
