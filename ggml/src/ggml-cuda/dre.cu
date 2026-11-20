@@ -162,7 +162,9 @@ struct dre_answer {
     int32_t           slot[DRE_MAX_IDS];   // which output (token * n_used + k) each answer row fills
     volatile uint32_t fetch;               // fetch lane: (seq << 1) | 1 when this layer job issued expert copies
     volatile uint32_t fetch_done;          // fetch lane: the job's seq once those copies landed
-    int32_t           n_pub;               // fetch lane: table entries the wait kernel writes once fetch_done == seq
+    volatile uint32_t fetch_done_gu;       // fetch lane: the job's seq once the gate and up bytes landed (the down bytes follow)
+    int32_t           n_pub_gu;            // the first n_pub_gu entries below are gate/up entries (written by the first wait)
+    int32_t           n_pub;               // fetch lane: table entries the wait kernels write
     int64_t           pub_off[3 * 64];     //   index into the device table arena (g_tab_d)
     int64_t           pub_val[3 * 64];     //   byte offset of the expert's role in its pool slot
 };
@@ -828,7 +830,7 @@ struct dre_fetch_piece { char * dst; const char * src; size_t n; int64_t * tab; 
 struct dre_fetch_wait { dre_answer * ans; uint32_t seq; int n; dre_fetch_piece pc[3 * 64]; };
 constexpr int DRE_FETCH_EVQ = 128;
 static dre_fetch_wait        g_fetch_evq[DRE_FETCH_EVQ];          // worker -> fetch thread
-static cudaEvent_t           g_fetch_ev = nullptr;
+static cudaEvent_t           g_fetch_ev = nullptr, g_fetch_ev_gu = nullptr;
 static std::atomic<unsigned> g_fetch_evq_w{0}, g_fetch_evq_r{0};
 constexpr int DRE_FETCH_CLASSES = 8, DRE_FETCH_LIST = 8192;
 static std::vector<int>     g_fetch_land[DRE_FETCH_CLASSES];     // reserved free slots, by unit class
@@ -855,6 +857,7 @@ static void dre_fetch_init() {
     CUDA_CHECK(cudaMemset(g_fetch_wait_ns_d, 0, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMallocHost(&g_fetch_ring, DRE_FETCH_RING * sizeof(int64_t)));
     CUDA_CHECK(cudaEventCreateWithFlags(&g_fetch_ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&g_fetch_ev_gu, cudaEventDisableTiming));
     CUDA_CHECK(cudaGetDevice(&g_fetch_dev));
     dre_fetch_debug_start();
     std::thread([] {
@@ -869,17 +872,30 @@ static void dre_fetch_init() {
             }
             idle = 0;
             dre_fetch_wait & q = g_fetch_evq[r % DRE_FETCH_EVQ];
-            for (int i = 0; i < q.n; i++) CUDA_CHECK(cudaMemcpyAsync(q.pc[i].dst, q.pc[i].src, q.pc[i].n, cudaMemcpyHostToDevice, g_fetch_st));
+            // q.pc holds an expert's gate, up, down at 3k, 3k+1, 3k+2: every gate and up first, then every down
+            for (int i = 0; i < q.n; i++) if (i % 3 != 2) CUDA_CHECK(cudaMemcpyAsync(q.pc[i].dst, q.pc[i].src, q.pc[i].n, cudaMemcpyHostToDevice, g_fetch_st));
+            if (q.ans) CUDA_CHECK(cudaEventRecord(g_fetch_ev_gu, g_fetch_st));
+            for (int i = 0; i < q.n; i++) if (i % 3 == 2) CUDA_CHECK(cudaMemcpyAsync(q.pc[i].dst, q.pc[i].src, q.pc[i].n, cudaMemcpyHostToDevice, g_fetch_st));
             if (!q.ans) {   // background admission: published by the next fold (which waits for this stream)
                 g_fetch_evq_r.store(r + 1, std::memory_order_release);
                 continue;
             }
-            for (int i = 0; i < q.n; i++) {   // the table entries: written on the device by the layer's wait kernel
-                q.ans->pub_off[i] = (int64_t) (q.pc[i].tab - g_tab_d);
-                q.ans->pub_val[i] = q.pc[i].val;
+            {   // the table entries: written on the device by the layer's wait kernels, gate/up entries first
+                int k = 0;
+                for (int i = 0; i < q.n; i++) if (i % 3 != 2) { q.ans->pub_off[k] = (int64_t) (q.pc[i].tab - g_tab_d); q.ans->pub_val[k] = q.pc[i].val; k++; }
+                q.ans->n_pub_gu = k;
+                for (int i = 0; i < q.n; i++) if (i % 3 == 2) { q.ans->pub_off[k] = (int64_t) (q.pc[i].tab - g_tab_d); q.ans->pub_val[k] = q.pc[i].val; k++; }
+                q.ans->n_pub = k;
             }
-            q.ans->n_pub = q.n;
             CUDA_CHECK(cudaEventRecord(g_fetch_ev, g_fetch_st));
+            for (;;) {   // the gate and up bytes: the layer's first wait
+                const cudaError_t e = cudaEventQuery(g_fetch_ev_gu);
+                if (e == cudaSuccess) break;
+                if (e != cudaErrorNotReady) { CUDA_CHECK(e); break; }
+                dre_pause();
+            }
+            q.ans->fetch_done_gu = q.seq;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             const auto tw0 = std::chrono::steady_clock::now();
             bool warned = false;
             for (;;) {
@@ -997,7 +1013,7 @@ static void dre_fetch_reserve() {
     }
 }
 static __global__ void dre_fetch_wait_k(const uint32_t * __restrict__ ctr, const dre_answer * ans, int64_t * tab,
-                                        unsigned long long * wait_ns) {
+                                        unsigned long long * wait_ns, const int split) {
     const uint32_t want = *ctr;
     const uint64_t t0 = dre_gtimer();
     const volatile uint32_t * f = &ans->fetch;
@@ -1008,15 +1024,20 @@ static __global__ void dre_fetch_wait_k(const uint32_t * __restrict__ ctr, const
 #endif
     }
     if (v & 1u) {
-        const volatile uint32_t * d = &ans->fetch_done;
+        // split 0: every byte, every entry. split 1 (before gate/up): the gate and up bytes, their entries.
+        // split 2 (before down): the rest.
+        const volatile uint32_t * d = split == 1 ? &ans->fetch_done_gu : &ans->fetch_done;
         while (*d != want) {
 #if __CUDA_ARCH__ >= 700
             __nanosleep(100);
 #endif
         }
         __threadfence_system();
-        const int n = ((const volatile int32_t *) &ans->n_pub)[0];
-        for (int i = 0; i < n; i++) {
+        const int n_gu = ((const volatile int32_t *) &ans->n_pub_gu)[0];
+        const int n_all = ((const volatile int32_t *) &ans->n_pub)[0];
+        const int i0 = split == 2 ? n_gu : 0;
+        const int n = split == 1 ? n_gu : n_all;
+        for (int i = i0; i < n; i++) {
             tab[((const volatile int64_t *) ans->pub_off)[i]] = ((const volatile int64_t *) ans->pub_val)[i];
         }
     }
@@ -3062,6 +3083,12 @@ void ggml_cuda_dre_pre(const ggml_tensor * w, const ggml_tensor * src1, const gg
     if (it == g_dre.by_data.end() || it->second < 0) return;
     dre_tensor & d = g_dre.tens[it->second];
     dre_layer & L = g_dre.layers[d.layer];
+    static const bool fetch_split = dre_env_int("ALPHA_DRE_FETCH_SPLIT", 1) != 0;
+    if (L.complete() && L.bell && d.role == 2 && fetch_split && dre_fetch_on() && g_fetch_st) {
+        // the down bytes of this layer's fetched experts (the gate/up kernel ran while they were copied)
+        dre_fetch_wait_k<<<1, 1, 0, stream>>>(L.ctr_d, L.ans_d, g_tab_d, g_fetch_wait_ns_d, 2);
+        return;
+    }
     if (!L.complete() || !L.bell || d.role == 2 || ids == g_dre_last_bell_ids) return;   // once, before gate/up
     g_dre_last_bell_ids = ids;
     dre_cpu_start();
@@ -3075,14 +3102,12 @@ void ggml_cuda_dre_pre(const ggml_tensor * w, const ggml_tensor * src1, const gg
     L.n_ids = n;
     if (!rung) dre_signal_k<<<1, 256, 0, stream>>>((const float *) src1->data, (int) (src1->ne[0] * ntok), (const int32_t *) ids->data, n,
                                         ntok, (int) (ids->nb[1] / sizeof(int32_t)), L.bell_d, L.ctr_d);
-    if (dre_fetch_on() && g_fetch_st) dre_fetch_wait_k<<<1, 1, 0, stream>>>(L.ctr_d, L.ans_d, g_tab_d, g_fetch_wait_ns_d);
+    if (dre_fetch_on() && g_fetch_st) dre_fetch_wait_k<<<1, 1, 0, stream>>>(L.ctr_d, L.ans_d, g_tab_d, g_fetch_wait_ns_d, fetch_split ? 1 : 0);
 }
 
 // ALPHA_DRE_EARLY_BELL (default 1, CPU-miss mode). graph_begin maps each MoE layer's ids-producing node; this rings
 // the layer's doorbell right after that node, with the same arguments ggml_cuda_dre_pre would use later.
 static void dre_early_scan(const ggml_cgraph * cgraph) {
-    g_dre_graph_id++;
-    g_dre_early.clear();
     static const bool on = dre_cpu_mode() && dre_env_int("ALPHA_DRE_EARLY_BELL", 1) != 0;
     if (!on || !cgraph) return;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3438,6 +3463,8 @@ static void dre_profile_fill() {
 
 void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
     if (ggml_cuda_dre_enabled()) g_dre_ctx = &ctx;
+    g_dre_graph_id++;
+    g_dre_early.clear();
     if (!ggml_cuda_dre_enabled() || g_dre.tens.empty() || g_dre.failed) return;
     bool has_dre = false;
     for (int i = 0; i < cgraph->n_nodes && !has_dre; i++) {

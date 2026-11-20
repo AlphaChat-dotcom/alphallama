@@ -850,7 +850,11 @@ bool gpu_engine::decode_batch(const BatchRequest & req, BatchResult & result) {
                 const char * e = getenv("ALPHA_DRE_PREFILL_MB_PER_TOK");
                 return (size_t) ((e ? atof(e) : 0.40) * 1048576.0);
             }();
-            const size_t need = (size_t) (req.n_tokens - (int) llama_n_ubatch(ctx_)) * per_tok + ((size_t) 384 << 20);
+            // ALPHA_DRE_PREFILL_MB_PER_TOK2 (default 0): a term in tokens squared, for models whose prompt graph holds
+            // tokens x context temporaries (glm5-next's indexer scoring and selection masks)
+            static const double per_tok2 = []() { const char * e = getenv("ALPHA_DRE_PREFILL_MB_PER_TOK2"); return (e ? atof(e) : 0.0) * 1048576.0; }();
+            const size_t need = (size_t) (req.n_tokens - (int) llama_n_ubatch(ctx_)) * per_tok + ((size_t) 384 << 20) +
+                                (size_t) (per_tok2 * (double) req.n_tokens * (double) req.n_tokens);
             const int64_t tb0 = ggml_time_us();
             if (ggml_cuda_dre_borrow(need) > 0) g_dre_lent = true;
             if (getenv("ALPHA_DRE_RETURN_TIMERS")) fprintf(stderr, "[dre-rt] borrow %.1f ms\n", (ggml_time_us() - tb0) / 1e3);
