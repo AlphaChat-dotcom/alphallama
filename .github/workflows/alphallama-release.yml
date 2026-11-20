@@ -153,6 +153,28 @@ jobs:
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
           Copy-Item alphainfer\LICENSE "$r\licenses\LICENSE-alphainfer"
           if (Test-Path "$env:CUDA_PATH\LICENSE") { Copy-Item "$env:CUDA_PATH\LICENSE" "$r\licenses\NVIDIA-CUDA-LICENSE.txt" }
+          # OpenSSL: the build links the runner's OpenSSL 3 (CMake: "Found OpenSSL"), so its two DLLs ship next to the
+          # executables (a PC without them on PATH could not start any of them: 0xC0000135, DLL not found)
+          $inc = (Select-String -Path build\CMakeCache.txt -Pattern '^OPENSSL_INCLUDE_DIR:PATH=(.+)$' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($inc) {
+            $ossl = Split-Path $inc -Parent
+            $dll = @(Get-ChildItem "$ossl\bin" -File | Where-Object { $_.Name -match '^lib(ssl|crypto)-3.*\.dll$' })
+            if ($dll.Count -lt 2) { throw "OpenSSL DLLs not found in $ossl\bin" }
+            $dll | Copy-Item -Destination $r
+            $lic = Get-ChildItem $ossl -File | Where-Object { $_.Name -match '^license' } | Select-Object -First 1
+            if ($lic) { Copy-Item $lic.FullName "$r\licenses\LICENSE-openssl.txt" }
+          }
+          # every DLL an executable imports must be in the package or Windows itself (driver DLLs aside); lib*.dll from
+          # the package only, since a runner's System32 may hold copies a user's PC does not
+          $vc = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC" -Directory | Sort-Object Name | Select-Object -Last 1
+          $dumpbin = "$($vc.FullName)\bin\Hostx64\x64\dumpbin.exe"
+          $missing = foreach ($e in Get-ChildItem $r -Filter *.exe) {
+            & $dumpbin /nologo /dependents $e.FullName | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[\w.-]+\.dll$' } |
+              Where-Object { -not (Test-Path "$r\$_") -and $_ -notmatch '^(nvcuda|api-ms-win-.+|ext-ms-.+)\.dll$' -and
+                             ($_ -match '^lib' -or -not (Test-Path "$env:SystemRoot\System32\$_")) } |
+              ForEach-Object { "$($e.Name): $_" }
+          }
+          if ($missing) { throw "DLLs the package does not carry: $($missing -join ', ')" }
           @(
             "AlphaLlama v2, $n"
             "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
@@ -160,7 +182,7 @@ jobs:
             "cuda architectures: ${{ matrix.archs }}"
             "build options: GGML_CUDA=ON ALPHA_ALPHAINFER=ON BUILD_SHARED_LIBS=OFF GGML_NATIVE=OFF ALPHA_FLASHINFER=OFF"
             "cpu baseline: x86-64 with AVX2, FMA, F16C"
-            "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA), Visual C++ runtime and OpenMP"
+            "bundled: CUDA runtime, cuBLAS, cuBLASLt (NVIDIA CUDA Toolkit EULA), Visual C++ runtime and OpenMP, OpenSSL 3"
             "needs: NVIDIA driver ${{ matrix.driver }}, Windows 10 or 11 x64"
           ) | Set-Content "$r\BUILD_INFO"
           Push-Location dist; 7z a -tzip -mx=5 "$n.zip" $n | Out-Null; $c = $LASTEXITCODE; Pop-Location; if ($c) { throw "7z failed ($c)" }   # Compress-Archive ran out of memory on the CUDA 12.4 package
@@ -235,13 +257,35 @@ jobs:
           Copy-Item LICENSE, NOTICE, README.md $r
           Copy-Item licenses\* "$r\licenses" -Recurse
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
+          # OpenSSL: the build links the runner's OpenSSL 3 (CMake: "Found OpenSSL"), so its two DLLs ship next to the
+          # executables (a PC without them on PATH could not start any of them: 0xC0000135, DLL not found)
+          $inc = (Select-String -Path build\CMakeCache.txt -Pattern '^OPENSSL_INCLUDE_DIR:PATH=(.+)$' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($inc) {
+            $ossl = Split-Path $inc -Parent
+            $dll = @(Get-ChildItem "$ossl\bin" -File | Where-Object { $_.Name -match '^lib(ssl|crypto)-3.*\.dll$' })
+            if ($dll.Count -lt 2) { throw "OpenSSL DLLs not found in $ossl\bin" }
+            $dll | Copy-Item -Destination $r
+            $lic = Get-ChildItem $ossl -File | Where-Object { $_.Name -match '^license' } | Select-Object -First 1
+            if ($lic) { Copy-Item $lic.FullName "$r\licenses\LICENSE-openssl.txt" }
+          }
+          # every DLL an executable imports must be in the package or Windows itself (driver DLLs aside); lib*.dll from
+          # the package only, since a runner's System32 may hold copies a user's PC does not
+          $vc = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC" -Directory | Sort-Object Name | Select-Object -Last 1
+          $dumpbin = "$($vc.FullName)\bin\Hostx64\x64\dumpbin.exe"
+          $missing = foreach ($e in Get-ChildItem $r -Filter *.exe) {
+            & $dumpbin /nologo /dependents $e.FullName | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[\w.-]+\.dll$' } |
+              Where-Object { -not (Test-Path "$r\$_") -and $_ -notmatch '^(nvcuda|api-ms-win-.+|ext-ms-.+)\.dll$' -and
+                             ($_ -match '^lib' -or -not (Test-Path "$env:SystemRoot\System32\$_")) } |
+              ForEach-Object { "$($e.Name): $_" }
+          }
+          if ($missing) { throw "DLLs the package does not carry: $($missing -join ', ')" }
           @(
             "AlphaLlama v2, $n"
             "source: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY commit $env:GITHUB_SHA"
             "toolkit: MSVC $($redist.Name)"
             "build options: GGML_CUDA=OFF ${{ matrix.defines }} (no AlphaInfer on Windows)"
             "cpu baseline: ${{ matrix.info }}"
-            "bundled: Visual C++ runtime and OpenMP"
+            "bundled: Visual C++ runtime and OpenMP$(if (Test-Path "$r\libssl-3*.dll") { ', OpenSSL 3' })"
             "needs: Windows 10 or 11, ${{ matrix.arch }}"
           ) | Set-Content "$r\BUILD_INFO"
           Push-Location dist; 7z a -tzip -mx=5 "$n.zip" $n | Out-Null; $c = $LASTEXITCODE; Pop-Location; if ($c) { throw "7z failed ($c)" }   # Compress-Archive ran out of memory on the CUDA 12.4 package
