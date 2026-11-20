@@ -83,7 +83,7 @@ void ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static __global__ void dsv4_hc_split_sinkhorn_k(
         const void * mixes, const void * scale, const void * base, void * dst,
         int64_t n_mix, int64_t n_tokens, int n_hc, int sinkhorn_iters, float eps,
-        size_t m_nb0, size_t m_nb1, size_t d_nb0, size_t d_nb1) {
+        size_t m_nb0, size_t m_nb1, size_t d_nb0, size_t d_nb1, float * par_out) {
     const int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tokens) return;
 
@@ -130,6 +130,10 @@ static __global__ void dsv4_hc_split_sinkhorn_k(
         float s=0; for (int dh=0;dh<n_hc;++dh) s+=c[sh+dh*n_hc];
         float inv=1.0f/(s+eps); for (int dh=0;dh<n_hc;++dh) c[sh+dh*n_hc]*=inv;
     }
+    if (par_out) {   // the caller continues the iterations in parallel (dsv4_hc_sinkhorn_par_k)
+        for (int i = 0; i < n_hc*n_hc; ++i) par_out[t*256 + i] = c[i];
+        return;
+    }
     for (int it = 0; it < sinkhorn_iters - 1; ++it) {
         // Row-normalize (sum over sh for each dh):
         for (int dh = 0; dh < n_hc; ++dh) {
@@ -146,6 +150,31 @@ static __global__ void dsv4_hc_split_sinkhorn_k(
         DSV4_F32W(dst, (2*n_hc+i)*d_nb0 + t*d_nb1) = c[i];
 }
 
+// One block per token, thread j owns row j in the row step and column j in the column step; the matrix is in shared
+// memory. Each row / column sum adds its elements in the same order as the one-thread loop, so the result is the same.
+static __global__ void dsv4_hc_sinkhorn_par_k(const float * c0, void * dst, int n_hc, int sinkhorn_iters, float eps,
+                                               size_t d_nb0, size_t d_nb1) {
+    __shared__ float c[16*16];
+    const int64_t t = blockIdx.x;
+    const int j = threadIdx.x;
+    for (int i = j; i < n_hc*n_hc; i += blockDim.x) c[i] = c0[t*256 + i];
+    __syncthreads();
+    for (int it = 0; it < sinkhorn_iters - 1; ++it) {
+        if (j < n_hc) {   // row j: sum over sh
+            float s=0; for (int sh=0;sh<n_hc;++sh) s+=c[sh+j*n_hc];
+            float inv=1.0f/(s+eps); for (int sh=0;sh<n_hc;++sh) c[sh+j*n_hc]*=inv;
+        }
+        __syncthreads();
+        if (j < n_hc) {   // column j: sum over dh
+            float s=0; for (int dh=0;dh<n_hc;++dh) s+=c[j+dh*n_hc];
+            float inv=1.0f/(s+eps); for (int dh=0;dh<n_hc;++dh) c[j+dh*n_hc]*=inv;
+        }
+        __syncthreads();
+    }
+    for (int i = j; i < n_hc*n_hc; i += blockDim.x)
+        DSV4_F32W(dst, (2*n_hc+i)*d_nb0 + t*d_nb1) = c[i];
+}
+
 void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -155,8 +184,19 @@ void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
     float eps; memcpy(&eps, (int32_t *)dst->op_params + 2, sizeof(float));
     const int64_t n_mix = mixes->ne[0], n_tokens = mixes->ne[1];
     const int bs = 256;
+    // ALPHA_HC_SINKHORN_PAR (default 1): the iterations on n_hc threads per token; small token counts only (the scratch
+    // is one fixed device buffer)
+    static const bool par_on = [] { const char * e = getenv("ALPHA_HC_SINKHORN_PAR"); return !e || atoi(e) != 0; }();
+    static float * par_buf = nullptr;
+    constexpr int64_t PAR_MAX_TOK = 16384;
+    const bool par = par_on && n_hc <= 16 && n_tokens <= PAR_MAX_TOK && si > 1;
+    if (par && !par_buf) CUDA_CHECK(cudaMalloc(&par_buf, PAR_MAX_TOK * 256 * sizeof(float)));
     dsv4_hc_split_sinkhorn_k<<<(n_tokens+bs-1)/bs, bs, 0, ctx.stream()>>>(
         mixes->data, scale->data, base->data, dst->data,
         n_mix, n_tokens, n_hc, si, eps,
-        mixes->nb[0], mixes->nb[1], dst->nb[0], dst->nb[1]);
+        mixes->nb[0], mixes->nb[1], dst->nb[0], dst->nb[1], par ? par_buf : nullptr);
+    if (par) {
+        dsv4_hc_sinkhorn_par_k<<<n_tokens, 32, 0, ctx.stream()>>>(par_buf, dst->data, n_hc, si, eps, dst->nb[0], dst->nb[1]);
+    }
+
 }

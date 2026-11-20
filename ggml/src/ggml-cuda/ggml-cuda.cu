@@ -6982,6 +6982,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    ggml_cuda_dre_set_eager(!use_cuda_graph);
     while (!graph_evaluated_or_captured) {
         ggml_cuda_mmvq_q8_cache_begin_graph();   // ALPHA_Q8_CACHE: nothing survives a graph boundary (or a capture retry)
         ggml_cuda_mmq_id_cache_begin_graph();    // ALPHA_MMID_CACHE: same rule
