@@ -116,7 +116,10 @@ private:
     long long             hj_fix_ns_ = 0;
     std::vector<float>    hy_;           // its compact outputs, one row of N per listed column
     std::vector<char>     hneed_;        // its tokens with at least one listed column
-    struct Group { int c0, n; };         // columns [c0, c0 + n) of cols_ share one expert (n <= 4)
+    std::vector<int>      qtok_;         // those tokens (phase 3 items: x quantised on the pool)
+    std::vector<int>      tc0_;          // token t's listed columns: [tc0_[t], tc0_[t + 1]) (phase 4: per-token sums)
+    double                ps_[9] = {}, psh_[8] = {};   // AI_Q4X_PF_POOLSTAT accumulators
+    struct Group { int c0, n; };         // columns [c0, c0 + n) of cols_ share one expert (n <= 4 in decode, <= AI_Q4X_PF_SHARE_GROUP in a host job)
     std::vector<Group>    groups_;
     std::vector<char>     prep_;         // Q2_0 down: each column's h prepared once (ggml_cpu_q2_0_prepare)
     size_t                prep_row_ = 0;

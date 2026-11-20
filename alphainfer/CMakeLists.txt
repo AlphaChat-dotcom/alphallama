@@ -184,12 +184,19 @@ target_link_libraries(ai-ref PRIVATE ${AI_LLAMA} ${AI_GGML_CUDA} ${AI_GGML} ${AI
 add_executable(ai-doorbell-bench tools/doorbell_bench.cu)
 set_target_properties(ai-doorbell-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavxvnni" AI_HAVE_MAVXVNNI)
+set(AI_GSQ_GEMM_FLAGS "-mavx2;-mfma;-mf16c")
+if (AI_HAVE_MAVXVNNI)
+    list(APPEND AI_GSQ_GEMM_FLAGS "-mavxvnni")
+endif()
+
 # The qwen4exp forward, with its Op bodies in src/ops/q4x_ops.cpp
 option(AI_Q4X_FORWARD "build the qwen4exp runtime (src/models/qwen4exp_run.cpp + src/ops/q4x_ops.cpp)" ON)
 if (AI_Q4X_FORWARD)
     target_sources(aicore PRIVATE src/models/qwen4exp_run.cpp src/models/qwen4exp_mtp.cpp src/models/qwen4exp_prefill.cpp src/ops/q4x_ops.cpp src/kernels/q4x_qsa.cu src/kernels/q4x_route.cu src/kernels/q4x_experts.cu src/kernels/q4x_dense.cu
                                   src/kernels/q4x_hc.cu src/kernels/q4x_hc_tc.cu src/kernels/q4x_gdn_conv.cu src/kernels/q4x_gdn_scan.cu src/kernels/q4x_fold.cu
-                                  src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/cpu_topo.cpp src/kernels/offload.cu
+                                  src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/gsq_gemm.cpp src/offload/cpu_topo.cpp src/kernels/offload.cu
                                   src/api/q4x_serve.cpp)
     # the C API serves qwen4exp models through api/q4x_serve.cpp
     target_compile_definitions(aicore PUBLIC AI_Q4X_FORWARD)
@@ -201,6 +208,9 @@ if (AI_Q4X_FORWARD)
     # q4x_fold.cu reproduces the fork's gdn_prep_kernel + gated_delta_net_cuda (built -use_fast_math) bit for bit
     set_source_files_properties(src/kernels/q4x_fold.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")
     set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2;-mfma;-mf16c>")
+    # many-token GSQ CPU kernels: + AVX-VNNI, checked at run time (gsq_gemm_supported); without the flag they compile out
+    # (MSVC defines no __AVXVNNI__: Windows keeps the one-token path)
+    set_source_files_properties(src/offload/gsq_gemm.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,${AI_GSQ_GEMM_FLAGS}>")
     target_link_libraries(aicore PUBLIC ${AI_GGML_CPU})
     add_executable(ai-q4x-run tools/q4x_run.cpp)
     target_include_directories(ai-q4x-run PRIVATE ${AI_VENDOR_INCLUDES})
@@ -225,6 +235,10 @@ if (AI_Q4X_FORWARD)
     target_link_libraries(ai-q4x-densebench PRIVATE aicore)
     set_target_properties(ai-q4x-densebench PROPERTIES BUILD_RPATH "${AI_VENDOR_BUILD}/bin" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_executable(ai-gsq-bench tools/gsq_bench.cpp src/offload/gsq_cpu.cpp)
+    add_executable(ai-gsq-gemm-bench tools/gsq_gemm_bench.cpp src/offload/gsq_cpu.cpp src/offload/gsq_gemm.cpp)
+    target_include_directories(ai-gsq-gemm-bench PRIVATE src ${AI_VENDOR_INCLUDES})
+    target_link_libraries(ai-gsq-gemm-bench PRIVATE ${AI_GGML_CPU} ${AI_GGML_BASE} ${AI_GGML})
+    set_target_properties(ai-gsq-gemm-bench PROPERTIES BUILD_RPATH "${AI_VENDOR_BUILD}/bin" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     target_include_directories(ai-gsq-bench PRIVATE src ${AI_VENDOR_INCLUDES})
     target_link_libraries(ai-gsq-bench PRIVATE ${AI_GGML_CPU} ${AI_GGML_BASE} ${AI_GGML})
     set_target_properties(ai-gsq-bench PROPERTIES BUILD_RPATH "${AI_VENDOR_BUILD}/bin" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -237,8 +251,9 @@ if (AI_DOORBELL)
     target_compile_definitions(aicore PUBLIC AI_DOORBELL)
     target_sources(aicore PRIVATE src/offload/doorbell_moe.cpp src/offload/cpu_ffn.cpp src/kernels/doorbell.cu)
     if (NOT AI_Q4X_FORWARD)
-        target_sources(aicore PRIVATE src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/cpu_topo.cpp)
+        target_sources(aicore PRIVATE src/offload/miss_pool.cpp src/offload/gsq_cpu.cpp src/offload/gsq_gemm.cpp src/offload/cpu_topo.cpp)
         set_source_files_properties(src/offload/gsq_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2;-mfma;-mf16c>")
+        set_source_files_properties(src/offload/gsq_gemm.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,${AI_GSQ_GEMM_FLAGS}>")
         target_link_libraries(aicore PUBLIC ${AI_GGML_CPU})
     endif()
 endif()

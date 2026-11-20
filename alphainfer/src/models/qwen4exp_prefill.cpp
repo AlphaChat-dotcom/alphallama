@@ -956,6 +956,13 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
                         if (t < best) { best = t; take = i + 1; }
                     }
                     if (best > t0 - 1e-3) take = 0;
+                    // with no CPU job nothing re-measures F and A, so one slow job (the first prompt's page faults: 4080
+                    // fin4080, F 3.5 ms -> no CPU tail for a whole server's life, +1 s per routed prompt) would stick:
+                    // a layer the CPU sits out moves both back toward typical values (4080 gm2: ~2.7 ms, ~32 us per pass)
+                    if (take == 0) {
+                        g_rs_F = 0.9 * g_rs_F + 0.1 * 2.5e-3;
+                        g_rs_A = 0.9 * g_rs_A + 0.1 * 3e-5;
+                    }
                 }
                 if (take > 0) rs_cpu_e.assign((size_t) E, 0);
                 for (size_t i = 0; i < take; ++i) {
@@ -1156,8 +1163,10 @@ Tensor Qwen4ExpRun::moe_prefill_big(int il, const Tensor & fm, int64_t slice) {
         {   // the job's fixed part (+ 1.5 ms for the x download and the rows' upload) and its cost per decode pass, measured
             // on this path's jobs only (the staged walk's model keeps its own)
             const double w = (double) miss_->host_job_ns() * 1e-9, f = (double) miss_->host_job_fix_ns() * 1e-9;
-            g_rs_F = 0.7 * g_rs_F + 0.3 * (f + 1.5e-3);
-            if (rs_groups > 0) g_rs_A = 0.7 * g_rs_A + 0.3 * std::max(0.0, w - f) / (double) rs_groups;
+            if (!g_rs_warm) {   // the pool warm-up's jobs run on cold buffers (first-touch faults): not a measurement
+                g_rs_F = 0.7 * g_rs_F + 0.3 * (f + 1.5e-3);
+                if (rs_groups > 0) g_rs_A = 0.7 * g_rs_A + 0.3 * std::max(0.0, w - f) / (double) rs_groups;
+            }
             g_rs_job_s  += w;
             g_rs_fix_s  += f;
             g_rs_groups += (uint64_t) rs_groups;

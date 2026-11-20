@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "offload/gsq_cpu.h"
+#include "offload/gsq_gemm.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -145,6 +146,25 @@ void MissPool::compute_share(int part, int n_parts) {
     // dynamic claiming balances a heterogeneous pool (P-cores ~2x the E-cores); static shares wait for the
     // slowest participant every phase
     static const bool steal = !getenv("AI_Q4X_POOL_STEAL") || atoi(getenv("AI_Q4X_POOL_STEAL")) != 0;   // default on
+    if (ph == 3 || ph == 4) {   // host job: x quantised per needed token / each token's weighted sum, one item per token
+        const auto * tx = ggml_get_type_traits_cpu(cg->vec_dot_type);
+        for (int it = steal ? next_item_.fetch_add(1) : part; it < n_items_;
+             it = steal ? next_item_.fetch_add(1) : it + n_parts) {
+            if (ph == 3) {
+                const int t = qtok_[(size_t) it];
+                tx->from_float(hj_x_ + (size_t) t * N_, xq_.data() + (size_t) t * xq_row, K);
+            } else {   // the token's columns in listed order, as the serial sum did: the same bits
+                float * yp = hj_yp_ + (size_t) it * N_;
+                memset(yp, 0, (size_t) N_ * sizeof(float));
+                for (int i = tc0_[(size_t) it]; i < tc0_[(size_t) it + 1]; ++i) {
+                    const float * yc = hy_.data() + (size_t) i * N_;
+                    const float   wc = hj_w_[i];
+                    for (int64_t n = 0; n < N_; ++n) yp[n] += wc * yc[n];
+                }
+            }
+        }
+        return;
+    }
     if (ph == 2) {   // SwiGLU per missed column (silu(gate) * up), quantised for the down type -- one item per column
         const auto * th = ggml_get_type_traits_cpu(cd->vec_dot_type);
         for (int ci = steal ? next_item_.fetch_add(1) : part; ci < n_items_;
@@ -169,51 +189,92 @@ void MissPool::compute_share(int part, int n_parts) {
         const Group & gr = groups_[(size_t) (it / (int) per_grp)];
         const int64_t ch = it % per_grp;
         const int32_t e  = jmiss_[cols_[(size_t) gr.c0]];
-        if (ph == 0) {
-            const char *  G  = (const char *) L.gate.data + (size_t) e * L.gate.nb[2];
-            const char *  U  = (const char *) L.up.data + (size_t) e * L.up.nb[2];
-            const int64_t r0 = ch * kGuRows, r1 = std::min(F, (ch + 1) * kGuRows);
-            if (k_gsq && gsq_dot_preferred(L.gate.type, gr.n) && gsq_dot_preferred(L.up.type, gr.n)) {
-                const void * y[4];
-                for (int i = 0; i < gr.n; ++i) y[i] = xq_.data() + (size_t) jtok(cols_[(size_t) (gr.c0 + i)]) * xq_row;
-                // the group's columns are consecutive in cols_, so their h rows are 2*F_ apart
-                float * gu = h_.data() + (size_t) gr.c0 * 2 * F_;
-                gsq_dot(L.gate.type, (int) K, G, rg, r0, r1, y, gr.n, gu, 2 * F_);
-                gsq_dot(L.up.type, (int) K, U, rg, r0, r1, y, gr.n, gu + F_, 2 * F_);
-            } else {
+        // [AI_GSQ_GEMM_MIN, default 5] a group of that many columns or more: the many-token VNNI kernels (gsq_gemm.cpp,
+        // the same bits), each weight row decoded once for the whole group
+        static const int gemm_min = getenv("AI_GSQ_GEMM_MIN") ? atoi(getenv("AI_GSQ_GEMM_MIN")) : 5;
+        if (k_gsq && gr.n >= gemm_min) {
+            thread_local GsqActs                   acts;
+            thread_local std::vector<const void *> yv;
+            thread_local std::vector<float *>      ov;
+            yv.resize((size_t) gr.n);
+            ov.resize((size_t) gr.n);
+            if (ph == 0 && gsq_gemm_supported(L.gate.type) && L.gate.type == L.up.type) {
+                const int64_t r0 = ch * kGuRows, r1 = std::min(F, (ch + 1) * kGuRows);
                 for (int i = 0; i < gr.n; ++i) {
-                    const int    ci = gr.c0 + i;
-                    const char * xq = xq_.data() + (size_t) jtok(cols_[(size_t) ci]) * xq_row;
-                    float *      gu = h_.data() + (size_t) ci * 2 * F_;
-                    for (int64_t r = r0; r < r1; ++r) {
-                        cg->vec_dot((int) K, &gu[r], 0, G + (size_t) r * rg, 0, xq, 0, 1);
-                        cg->vec_dot((int) K, &gu[F_ + r], 0, U + (size_t) r * rg, 0, xq, 0, 1);
+                    yv[(size_t) i] = xq_.data() + (size_t) jtok(cols_[(size_t) (gr.c0 + i)]) * xq_row;
+                    ov[(size_t) i] = h_.data() + (size_t) (gr.c0 + i) * 2 * F_;
+                }
+                gsq_gemm_prep(L.gate.type, (int) K, yv.data(), gr.n, acts);
+                gsq_gemm(acts, (const char *) L.gate.data + (size_t) e * L.gate.nb[2], rg, r0, r1, ov.data());
+                for (int i = 0; i < gr.n; ++i) ov[(size_t) i] += F_;
+                gsq_gemm(acts, (const char *) L.up.data + (size_t) e * L.up.nb[2], rg, r0, r1, ov.data());
+                continue;
+            }
+            if (ph == 1 && gsq_gemm_supported(L.down.type)) {
+                const int64_t r0 = ch * kDownRows, r1 = std::min(N_, (ch + 1) * kDownRows);
+                const bool    prep = L.down.type == GGML_TYPE_Q2_0;
+                for (int i = 0; i < gr.n; ++i) {
+                    const int ci = gr.c0 + i;
+                    yv[(size_t) i] = prep ? (const void *) (prep_.data() + (size_t) ci * prep_row_)
+                                          : (const void *) (hq_.data() + (size_t) ci * hq_row);
+                    ov[(size_t) i] = jy_ + (size_t) cols_[(size_t) ci] * N_;
+                }
+                gsq_gemm_prep(L.down.type, (int) F, yv.data(), gr.n, acts);
+                gsq_gemm(acts, (const char *) L.down.data + (size_t) e * L.down.nb[2], rd, r0, r1, ov.data());
+                continue;
+            }
+        }
+        // A host-job group can hold more than 4 columns (AI_Q4X_PF_SHARE_GROUP): its runs of 4 go through the same
+        // kernels as 4-column groups (the same bits), one after another over this item's row chunk while it sits
+        // in L2, so the expert is read from DRAM once instead of once per 4 columns
+        for (int s0 = 0; s0 < gr.n; s0 += 4) {
+            const int sn = std::min(4, gr.n - s0), c0 = gr.c0 + s0;
+            if (ph == 0) {
+                const char *  G  = (const char *) L.gate.data + (size_t) e * L.gate.nb[2];
+                const char *  U  = (const char *) L.up.data + (size_t) e * L.up.nb[2];
+                const int64_t r0 = ch * kGuRows, r1 = std::min(F, (ch + 1) * kGuRows);
+                if (k_gsq && gsq_dot_preferred(L.gate.type, sn) && gsq_dot_preferred(L.up.type, sn)) {
+                    const void * y[4];
+                    for (int i = 0; i < sn; ++i) y[i] = xq_.data() + (size_t) jtok(cols_[(size_t) (c0 + i)]) * xq_row;
+                    // the group's columns are consecutive in cols_, so their h rows are 2*F_ apart
+                    float * gu = h_.data() + (size_t) c0 * 2 * F_;
+                    gsq_dot(L.gate.type, (int) K, G, rg, r0, r1, y, sn, gu, 2 * F_);
+                    gsq_dot(L.up.type, (int) K, U, rg, r0, r1, y, sn, gu + F_, 2 * F_);
+                } else {
+                    for (int i = 0; i < sn; ++i) {
+                        const int    ci = c0 + i;
+                        const char * xq = xq_.data() + (size_t) jtok(cols_[(size_t) ci]) * xq_row;
+                        float *      gu = h_.data() + (size_t) ci * 2 * F_;
+                        for (int64_t r = r0; r < r1; ++r) {
+                            cg->vec_dot((int) K, &gu[r], 0, G + (size_t) r * rg, 0, xq, 0, 1);
+                            cg->vec_dot((int) K, &gu[F_ + r], 0, U + (size_t) r * rg, 0, xq, 0, 1);
+                        }
                     }
                 }
-            }
-        } else {
-            const char *  D  = (const char *) L.down.data + (size_t) e * L.down.nb[2];
-            const int64_t r0 = ch * kDownRows, r1 = std::min(N_, (ch + 1) * kDownRows);
-            if (k_gsq && gsq_dot_preferred(L.down.type, gr.n)) {
-                const bool   prep = L.down.type == GGML_TYPE_Q2_0;
-                const void * y[4];
-                for (int i = 0; i < gr.n; ++i) {
-                    y[i] = prep ? (const void *) (prep_.data() + (size_t) (gr.c0 + i) * prep_row_)
-                                : (const void *) (hq_.data() + (size_t) (gr.c0 + i) * hq_row);
-                }
-                float tmp[4 * kDownRows];   // the columns' y rows are not evenly spaced: compute, then scatter
-                gsq_dot(L.down.type, (int) F, D + (size_t) r0 * rd, rd, 0, r1 - r0, y, gr.n, tmp, kDownRows);
-                for (int i = 0; i < gr.n; ++i) {
-                    memcpy(jy_ + (size_t) cols_[(size_t) (gr.c0 + i)] * N_ + r0, tmp + (size_t) i * kDownRows,
-                           (size_t) (r1 - r0) * sizeof(float));
-                }
             } else {
-                for (int i = 0; i < gr.n; ++i) {
-                    const int    ci = gr.c0 + i;
-                    const char * hq = hq_.data() + (size_t) ci * hq_row;
-                    float *      y  = jy_ + (size_t) cols_[(size_t) ci] * N_;
-                    for (int64_t r = r0; r < r1; ++r) {
-                        cd->vec_dot((int) F, &y[r], 0, D + (size_t) r * rd, 0, hq, 0, 1);
+                const char *  D  = (const char *) L.down.data + (size_t) e * L.down.nb[2];
+                const int64_t r0 = ch * kDownRows, r1 = std::min(N_, (ch + 1) * kDownRows);
+                if (k_gsq && gsq_dot_preferred(L.down.type, sn)) {
+                    const bool   prep = L.down.type == GGML_TYPE_Q2_0;
+                    const void * y[4];
+                    for (int i = 0; i < sn; ++i) {
+                        y[i] = prep ? (const void *) (prep_.data() + (size_t) (c0 + i) * prep_row_)
+                                    : (const void *) (hq_.data() + (size_t) (c0 + i) * hq_row);
+                    }
+                    float tmp[4 * kDownRows];   // the columns' y rows are not evenly spaced: compute, then scatter
+                    gsq_dot(L.down.type, (int) F, D + (size_t) r0 * rd, rd, 0, r1 - r0, y, sn, tmp, kDownRows);
+                    for (int i = 0; i < sn; ++i) {
+                        memcpy(jy_ + (size_t) cols_[(size_t) (c0 + i)] * N_ + r0, tmp + (size_t) i * kDownRows,
+                               (size_t) (r1 - r0) * sizeof(float));
+                    }
+                } else {
+                    for (int i = 0; i < sn; ++i) {
+                        const int    ci = c0 + i;
+                        const char * hq = hq_.data() + (size_t) ci * hq_row;
+                        float *      y  = jy_ + (size_t) cols_[(size_t) ci] * N_;
+                        for (int64_t r = r0; r < r1; ++r) {
+                            cd->vec_dot((int) F, &y[r], 0, D + (size_t) r * rd, 0, hq, 0, 1);
+                        }
                     }
                 }
             }
@@ -284,38 +345,83 @@ void MissPool::poll_loop() {
         if (hy_.size() < (size_t) nc * (size_t) N_) hy_.resize((size_t) nc * (size_t) N_);
         hneed_.assign((size_t) T, 0);
         for (int i = 0; i < nc; ++i) hneed_[(size_t) hj_tok_[i]] = 1;
+        // each token's columns are a run of the listing (ascending token order): [tc0_[t], tc0_[t + 1])
+        bool sorted = true;
+        tc0_.assign((size_t) T + 1, 0);
+        for (int i = 0; i < nc; ++i) {
+            if (i > 0 && hj_tok_[i] < hj_tok_[i - 1]) sorted = false;
+            ++tc0_[(size_t) hj_tok_[i] + 1];
+        }
+        for (int t = 0; t < T; ++t) tc0_[(size_t) t + 1] += tc0_[(size_t) t];
+        qtok_.clear();
         for (int t = 0; t < T; ++t)
-            if (hneed_[(size_t) t]) tx->from_float(hj_x_ + (size_t) t * N_, xq_.data() + (size_t) t * xq_row, K);
+            if (hneed_[(size_t) t]) qtok_.push_back(t);
+        (void) tx;
+        if (!qtok_.empty()) run_phase(l, 3, (int) qtok_.size());   // x quantised on the pool (was serial)
+        const auto hj_tq = std::chrono::steady_clock::now();
         cols_.resize((size_t) nc);
         for (int i = 0; i < nc; ++i) cols_[(size_t) i] = i;
         std::stable_sort(cols_.begin(), cols_.end(), [&](int x, int y) { return hj_ids_[x] < hj_ids_[y]; });
+        // [AI_Q4X_PF_SHARE_GROUP, default 64; 4 = the old groups] columns per group: compute_share runs a group's
+        // columns 4 at a time over each row chunk, so a group of n reads the expert from DRAM once, not ceil(n / 4)
+        // times (4080 pf4080b: a 2.6K-token prompt's share waited 2.0 s on 155K columns, ~37 per expert)
+        static const int hgcap = std::max(4, (int) [] { const char * e = getenv("AI_Q4X_PF_SHARE_GROUP"); return e ? atoi(e) : 64; }());
         groups_.clear();
         for (int c = 0; c < nc;) {
             int n = 1;
-            while (c + n < nc && n < 4 && hj_ids_[cols_[(size_t) (c + n)]] == hj_ids_[cols_[(size_t) c]]) ++n;
+            while (c + n < nc && n < hgcap && hj_ids_[cols_[(size_t) (c + n)]] == hj_ids_[cols_[(size_t) c]]) ++n;
             groups_.push_back({ c, n });
             c += n;
         }
         jmiss_ = hj_ids_; jtok_ = hj_tok_; jy_ = hy_.data();
         const int ng = (int) groups_.size();
         const auto hj_t1 = std::chrono::steady_clock::now();
+        auto       hj_tg = hj_t1, hj_tm = hj_t1;
         if (nc > 0) {
             run_phase(l, 0, ng * (int) ((L.gate.ne[1] + kGuRows - 1) / kGuRows));
+            hj_tg = std::chrono::steady_clock::now();
             run_phase(l, 2, nc);
+            hj_tm = std::chrono::steady_clock::now();
             run_phase(l, 1, ng * (int) ((N_ + kDownRows - 1) / kDownRows));
         }
         const auto hj_t2 = std::chrono::steady_clock::now();
-        memset(hj_yp_, 0, (size_t) T * (size_t) N_ * sizeof(float));
-        for (int i = 0; i < nc; ++i) {   // listed order (ascending t * k + j from the caller): a token's columns in slot order
-            float *       yp = hj_yp_ + (size_t) hj_tok_[i] * N_;
-            const float * yc = hy_.data() + (size_t) i * N_;
-            const float   wc = hj_w_[i];
-            for (int64_t n = 0; n < N_; ++n) yp[n] += wc * yc[n];
+        if (sorted) {
+            run_phase(l, 4, T);   // each token's weighted sum on the pool (was serial, after a memset of all T rows)
+        } else {
+            memset(hj_yp_, 0, (size_t) T * (size_t) N_ * sizeof(float));
+            for (int i = 0; i < nc; ++i) {   // listed order: a token's columns in slot order
+                float *       yp = hj_yp_ + (size_t) hj_tok_[i] * N_;
+                const float * yc = hy_.data() + (size_t) i * N_;
+                const float   wc = hj_w_[i];
+                for (int64_t n = 0; n < N_; ++n) yp[n] += wc * yc[n];
+            }
         }
         stats_.misses.fetch_add((unsigned long long) nc, std::memory_order_relaxed);
         const auto hj_t3 = std::chrono::steady_clock::now();
         hj_ns_     = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(hj_t3 - hj_t0).count();
         hj_fix_ns_ = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>((hj_t1 - hj_t0) + (hj_t3 - hj_t2)).count();
+        // AI_Q4X_PF_POOLSTAT=1: the host jobs' phase times and expert sizes, printed after each last-layer job
+        static const bool pstat = getenv("AI_Q4X_PF_POOLSTAT") && atoi(getenv("AI_Q4X_PF_POOLSTAT")) != 0;
+        if (pstat) {
+            using dd = std::chrono::duration<double>;
+            ps_[0] += dd(hj_tq - hj_t0).count(); ps_[1] += dd(hj_t1 - hj_tq).count(); ps_[2] += dd(hj_tg - hj_t1).count();
+            ps_[3] += dd(hj_tm - hj_tg).count(); ps_[4] += dd(hj_t2 - hj_tm).count(); ps_[5] += dd(hj_t3 - hj_t2).count();
+            ps_[6] += dd(hj_t3 - hj_t0).count(); ps_[7] += nc; ps_[8] += 1;
+            for (int c = 0; c < nc;) {   // columns per expert (uncapped), weighted by columns
+                int n = 1;
+                while (c + n < nc && hj_ids_[cols_[(size_t) (c + n)]] == hj_ids_[cols_[(size_t) c]]) ++n;
+                psh_[n <= 1 ? 0 : n <= 2 ? 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : n <= 32 ? 5 : n <= 64 ? 6 : 7] += n;
+                c += n;
+            }
+            if (l == (int) layers_.size() - 1) {
+                fprintf(stderr, "[q4x-pf-pool] %d jobs, %.0f cols | s: quant %.3f group %.3f gate/up %.3f swiglu %.3f down %.3f "
+                                "sums %.3f | total %.3f | cols by expert size 1:%.0f 2:%.0f 3-4:%.0f 5-8:%.0f 9-16:%.0f 17-32:%.0f "
+                                "33-64:%.0f 65+:%.0f\n", (int) ps_[8], ps_[7], ps_[0], ps_[1], ps_[2], ps_[3], ps_[4], ps_[5], ps_[6],
+                        psh_[0], psh_[1], psh_[2], psh_[3], psh_[4], psh_[5], psh_[6], psh_[7]);
+                for (auto & v : ps_) v = 0;
+                for (auto & v : psh_) v = 0;
+            }
+        }
     };
     while (!stop_.load(std::memory_order_relaxed)) {
         if (hj_pending_.load(std::memory_order_acquire)) {
