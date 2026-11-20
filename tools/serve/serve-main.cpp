@@ -1769,6 +1769,20 @@ int main(int argc, char ** argv) {
             setenv("AI_Q4X_WS_MB", std::to_string(ws_mb).c_str(), 0);
             fprintf(stderr, "[auto] Flash-Next workspace %ld MiB for %d cells (AI_Q4X_WS_MB)\n", ws_mb, n_ctx);
         }
+        // Context lending above 32K cells on 32 GB-class sm_120 cards (RTX 5090): the cells a sequence has not reached yet
+        // cache experts (131072 cells: 306-311 slots per layer instead of 263; A/V/R +8-9%, 1.02-1.04 x Strata 0.2.13.1)
+        // until it reads past 32K, where the lent slots go back (-12% to -27% above 32K). AI_Q4X_CTX_LEND=0 turns it off.
+        {
+            cudaDeviceProp lp {};
+            if (n_ctx > 32768 && cudaGetDeviceProperties(&lp, 0) == cudaSuccess && lp.major == 12 &&
+                lp.totalGlobalMem >= (28ull << 30) && !getenv("AI_Q4X_CTX_LEND")) {
+                setenv("AI_Q4X_CTX_LEND", "1", 0);
+                fprintf(stderr, "[auto] Flash-Next context lending on (%d cells): experts use the cells above 32K until a "
+                                "sequence reaches them (AI_Q4X_CTX_LEND=0 turns it off)\n", n_ctx);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
         // Thinking effort when the request names none: the template's own default (xhigh), as Strata 0.2.8 does; the
         // answer room keeps a long think from eating the whole max_tokens. 2.0.4 set "low" here (first answer token
         // worst 1.9 s vs 7.5 s on an RTX 4080); ALPHA_DEFAULT_REASONING_EFFORT=low gets that back.
