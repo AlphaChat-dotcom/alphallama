@@ -149,6 +149,9 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int spl
 #  include <dirent.h>
 #endif
 #include <sys/stat.h>
+#ifdef ALPHA_HAS_ALPHAINFER
+#include "alphainfer/src/core/wddm_budget.h"   // Windows video-memory budget for the free-VRAM figure
+#endif
 // Image input (--mmproj):
 // OpenAI chat content parts {"type":"image_url","image_url":{"url":"data:image/...;base64,..."}} (also "input_image" with
 // "image_url" as a plain string) become the projector's media marker in the text and a bitmap each, in order.
@@ -319,6 +322,11 @@ static inline int alpha_setenv(const char * k, const char * v) {
 static bool alpha_vram_info(size_t * free_b, size_t * total_b) {
 #ifdef GGML_USE_CUDA
     if (cudaMemGetInfo(free_b, total_b) == cudaSuccess) {
+#ifdef ALPHA_HAS_ALPHAINFER
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess) ai::wddm_cap_free(dev, free_b, "serve");   // Windows: this process's budget
+        else (void) cudaGetLastError();
+#endif
         return true;
     }
     cudaGetLastError();

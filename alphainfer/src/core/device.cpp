@@ -3,6 +3,7 @@
 #include <utility>
 #include <algorithm>
 #include "core/device.h"
+#include "core/wddm_budget.h"
 
 #include "kernels/kernels.h"
 
@@ -322,6 +323,7 @@ void * Device::compute_stream() const {
 
 void Device::memory_info(size_t * free_b, size_t * total_b) const {
     ggml_backend_cuda_get_device_memory(device_, free_b, total_b);
+    wddm_cap_free(device_, free_b, "ai");   // Windows: never above this process's video-memory budget
 }
 
 }  // namespace ai

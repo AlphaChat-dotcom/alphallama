@@ -48,6 +48,7 @@ add_library(aicore STATIC
     src/core/compat.cpp
     src/core/tensor.cpp
     src/core/device.cpp
+    src/core/wddm_budget.cpp
     src/core/weights.cpp
     src/core/host_mem.cpp
     src/core/kv.cpp
