@@ -646,7 +646,10 @@ ggml_tensor * llm_build_glm5_next::build_kpool_select(
 
     // Fold in the causal visibility (the F32 mask, before any conversion for flash attention)
     ggml_tensor * kq_mask = inp_attn->self_kq_mask;
-    GGML_ASSERT(kq_mask->type == GGML_TYPE_F32);
+    if (kq_mask->type != GGML_TYPE_F32) {
+        // this fork's serve builds the mask input as F16 (ALPHA_KQ_MASK_F16); the scatter mask is F32
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    }
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
     sel = ggml_add(ctx0, sel, ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens));
     sel = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
