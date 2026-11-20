@@ -27,6 +27,9 @@ void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
 void ggml_cuda_dre_graph_end(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
 // Fetch lane: whether the graph about to run is evaluated op by op (true) or launched as a CUDA graph (false)
 void ggml_cuda_dre_set_eager(bool eager);
+// Early doorbell: called after a node has been launched; rings the doorbell of the MoE layer whose expert ids this
+// node produces (found by graph_begin), so the miss lanes start before the layer's expert matmuls are reached.
+void ggml_cuda_dre_node_done(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 
 // ALPHA_DRE_PF_PIPE: for a routed prefill staging buffer filled in expert groups, returns the group count (0 = not one),
 // e_end[g] = one past group g's last expert, ev[g] = its copies landed (record on the streaming stream)

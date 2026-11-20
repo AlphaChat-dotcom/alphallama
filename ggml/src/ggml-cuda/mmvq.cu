@@ -508,6 +508,7 @@ static __global__ void mul_mat_vec_q(
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
     ggml_glu_op active_glu;
+    float active_clamp = 0.0f;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -517,6 +518,7 @@ static __global__ void mul_mat_vec_q(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        active_clamp  = fusion.glu_clamp;
     }
 
     float x_biases[ncols_dst]    = { 0.0f };
@@ -699,6 +701,9 @@ static __global__ void mul_mat_vec_q(
                     if (use_gate) {
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:     result *= ggml_cuda_op_silu_single(acc_gate[r]); break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = fminf(fmaxf(result, -active_clamp), active_clamp) * ggml_cuda_op_silu_single(fminf(acc_gate[r], active_clamp));
+                                break;
                             case GGML_GLU_OP_GEGLU:      result *= ggml_cuda_op_gelu_single(acc_gate[r]); break;
                             case GGML_GLU_OP_SWIGLU_OAI: result = ggml_cuda_op_swiglu_oai_single(acc_gate[r], result); break;
                             default:                     result = result * acc_gate[r]; break;
@@ -835,6 +840,9 @@ static __global__ void mul_mat_vec_q(
                     switch (active_glu) {
                         case GGML_GLU_OP_SWIGLU:
                             result *= ggml_cuda_op_silu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_CLAMP:
+                            result = fminf(fmaxf(result, -active_clamp), active_clamp) * ggml_cuda_op_silu_single(fminf(gate_value, active_clamp));
                             break;
                         case GGML_GLU_OP_GEGLU:
                             result *= ggml_cuda_op_gelu_single(gate_value);
@@ -1541,6 +1549,7 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_clamp = fusion->glu_clamp;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

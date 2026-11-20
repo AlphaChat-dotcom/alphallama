@@ -1388,6 +1388,13 @@ ggml_tensor * llm_graph_context::build_ffn(
                 // glm5-next: per-layer clamp, same form as upstream's ggml_swiglu_clamp
                 if (arch == LLM_ARCH_GLM5_NEXT && il >= 0) {
                     const float limit = hparams.swiglu_clamp_shexp[il];
+                    static const bool one_op = [] { const char * e = getenv("ALPHA_GLM5_GLU_CLAMP"); return !e || atoi(e) != 0; }();
+                    if (limit > 1e-6f && one_op) {
+                        cur = ggml_swiglu_split_clamp(ctx0, cur, tmp, limit);
+                        cb(cur, "ffn_swiglu", il);
+                        type_gate = LLM_FFN_SEQ;
+                        break;
+                    }
                     if (limit > 1e-6f) {
                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -1697,6 +1704,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts, "ffn_moe_topk_cont", il);
     }
 
+    if (moe_expand_first) {
+        ggml_build_forward_expand(gf, selected_experts);
+        ggml_build_forward_expand(gf, moe_expand_first);
+        moe_expand_first = nullptr;
+    }
+
     // remap argsort expert IDs -> cache slot IDs for MUL_MAT_ID
     ggml_tensor * cache_experts = selected_experts;
     if (expert_remap != nullptr) {
@@ -1910,6 +1923,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
                 // DeepSeek V4: per-layer SwiGLU clamp (reference Expert.forward):
                 // gate = clamp(gate, max=limit) BEFORE silu; up = clamp(up, -limit, limit).
+                if (arch == LLM_ARCH_GLM5_NEXT && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+                    static const bool one_op = [] { const char * e = getenv("ALPHA_GLM5_GLU_CLAMP"); return !e || atoi(e) != 0; }();
+                    if (one_op) {
+                        cur = ggml_swiglu_split_clamp(ctx0, cur, up, hparams.swiglu_clamp_exp[il]);
+                        cb(cur, "ffn_moe_swiglu", il);
+                        break;
+                    }
+                }
                 if ((arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT) && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     if (limit > 1e-6f) {

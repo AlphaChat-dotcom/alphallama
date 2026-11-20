@@ -191,6 +191,7 @@ struct dre_layer {
     uint32_t *   ctr_d = nullptr;   // device-side signal counter
     uint32_t *   fd_d  = nullptr;   // fetch lane: set to the job's seq once its expert copies and table entries landed
     uint32_t     seen  = 0;         // worker: last seq handled
+    long long    bell_graph = -1;   // the graph (g_dre_graph_id) whose early doorbell has been launched for this layer
     bool complete() const { return ti[0] >= 0 && ti[1] >= 0 && ti[2] >= 0; }
 };
 
@@ -249,6 +250,10 @@ int64_t * g_tab_h = nullptr;   // pinned host mirror of the arena
 size_t    g_tab_cap = 0, g_tab_used = 0;
 const ggml_tensor * g_dre_last_ids = nullptr;   // dedupe within one graph build: first call of a layer
 const ggml_tensor * g_dre_last_bell_ids = nullptr;
+// early doorbells of the graph being evaluated: the node that produces a layer's expert ids -> that layer's bell
+struct dre_early { int li; const ggml_tensor * x; const ggml_tensor * ids; };
+std::unordered_map<const ggml_tensor *, dre_early> g_dre_early;
+long long g_dre_graph_id = 0;
 unsigned long long * g_dre_wait_ns_d = nullptr;   // GPU time spent waiting for the CPU answers (stats)
 std::atomic<long long> g_dre_cpu_ns{0};           // CPU worker time computing missed experts (stats)
 // idle iterations before a worker thread naps: a decode token rings one doorbell per MoE layer a fraction of a ms
@@ -932,7 +937,9 @@ static void dre_fetch_debug_start() {
                 if (L.bell->seq != L.seen || L.ans->done != L.bell->seq) pend = true;
                 if ((L.ans->fetch & 1u) && L.ans->fetch_done != (L.ans->fetch >> 1)) pend = true;
             }
-            if (!pend || reported || ++quiet < 6) continue;
+            ++quiet;
+            // 3 s without progress while something is pending, or 15 s in any case (once per quiet period)
+            if (reported || quiet < 6 || (!pend && quiet < 30)) continue;
             reported = true;
 #if defined(__linux__)
             pthread_kill(g_fetch_main, SIGUSR2);
@@ -3058,6 +3065,7 @@ void ggml_cuda_dre_pre(const ggml_tensor * w, const ggml_tensor * src1, const gg
     if (!L.complete() || !L.bell || d.role == 2 || ids == g_dre_last_bell_ids) return;   // once, before gate/up
     g_dre_last_bell_ids = ids;
     dre_cpu_start();
+    const bool rung = L.bell_graph == g_dre_graph_id;   // the early doorbell already carried x and the ids
     // gate/up input: [K, 1, n_tok] (broadcast over the experts), contiguous
     const int ntok = (int) ids->ne[1];
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && src1->ne[0] <= DRE_MAX_EMBD &&
@@ -3065,9 +3073,61 @@ void ggml_cuda_dre_pre(const ggml_tensor * w, const ggml_tensor * src1, const gg
     const int n = (int) (ids->ne[0] * ids->ne[1]);
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && n <= DRE_MAX_IDS);
     L.n_ids = n;
-    dre_signal_k<<<1, 256, 0, stream>>>((const float *) src1->data, (int) (src1->ne[0] * ntok), (const int32_t *) ids->data, n,
+    if (!rung) dre_signal_k<<<1, 256, 0, stream>>>((const float *) src1->data, (int) (src1->ne[0] * ntok), (const int32_t *) ids->data, n,
                                         ntok, (int) (ids->nb[1] / sizeof(int32_t)), L.bell_d, L.ctr_d);
     if (dre_fetch_on() && g_fetch_st) dre_fetch_wait_k<<<1, 1, 0, stream>>>(L.ctr_d, L.ans_d, g_tab_d, g_fetch_wait_ns_d);
+}
+
+// ALPHA_DRE_EARLY_BELL (default 1, CPU-miss mode). graph_begin maps each MoE layer's ids-producing node; this rings
+// the layer's doorbell right after that node, with the same arguments ggml_cuda_dre_pre would use later.
+static void dre_early_scan(const ggml_cgraph * cgraph) {
+    g_dre_graph_id++;
+    g_dre_early.clear();
+    static const bool on = dre_cpu_mode() && dre_env_int("ALPHA_DRE_EARLY_BELL", 1) != 0;
+    if (!on || !cgraph) return;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) continue;
+        auto it = g_dre.by_data.find(node->src[0]->data);
+        if (it == g_dre.by_data.end() || it->second < 0) continue;
+        const dre_tensor & d = g_dre.tens[it->second];
+        if (d.role == 2) continue;
+        const dre_layer & L = g_dre.layers[d.layer];
+        if (!L.complete() || !L.bell) continue;
+        const ggml_tensor * x = node->src[1];
+        const ggml_tensor * ids = node->src[2];
+        const int64_t ntok = ids->ne[1], n = ids->ne[0] * ids->ne[1];
+        if (ntok > DRE_MAX_TOK || n > DRE_MAX_IDS || ids->nb[0] != sizeof(int32_t) || ids->type != GGML_TYPE_I32) continue;
+        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] > DRE_MAX_EMBD || x->ne[1] != 1 || x->ne[2] != ntok) continue;
+        bool have = false;
+        for (const auto & kv : g_dre_early) if (kv.second.li == d.layer) { have = true; break; }
+        if (have) continue;
+        const ggml_tensor * prod = ids; while (prod->view_src) prod = prod->view_src;
+        const ggml_tensor * xp = x;     while (xp->view_src) xp = xp->view_src;
+        int ip = -1, ix = -1;   // both within the nodes just before the matmul: the layer input, then the router
+        for (int j = i - 1; j >= 0 && j >= i - 160 && (ip < 0 || ix < 0); j--) {
+            if (cgraph->nodes[j] == prod) ip = j;
+            if (cgraph->nodes[j] == xp) ix = j;
+        }
+        if (ip < 0 || ix < 0 || ix > ip) continue;   // the layer input must exist before the ids do
+        g_dre_early[prod] = { d.layer, x, ids };
+    }
+}
+
+void ggml_cuda_dre_node_done(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    if (g_dre_early.empty()) return;
+    auto it = g_dre_early.find(node);
+    if (it == g_dre_early.end()) return;
+    dre_layer & L = g_dre.layers[it->second.li];
+    const ggml_tensor * x = it->second.x;
+    const ggml_tensor * ids = it->second.ids;
+    const int ntok = (int) ids->ne[1];
+    const int n = (int) (ids->ne[0] * ids->ne[1]);
+    dre_cpu_start();
+    L.n_ids = n;
+    dre_signal_k<<<1, 256, 0, ctx.stream()>>>((const float *) x->data, (int) (x->ne[0] * ntok), (const int32_t *) ids->data, n,
+                                              ntok, (int) (ids->nb[1] / sizeof(int32_t)), L.bell_d, L.ctr_d);
+    L.bell_graph = g_dre_graph_id;
 }
 
 void ggml_cuda_dre_post(const ggml_tensor * w, ggml_tensor * dst, cudaStream_t stream) {
@@ -3387,6 +3447,7 @@ void ggml_cuda_dre_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgrap
     if (!has_dre) return;
     g_dre_last_ids = nullptr;
     g_dre_last_bell_ids = nullptr;
+    dre_early_scan(cgraph);
     cudaStream_t st = ctx.stream();
     if (g_dre.ev_tok_valid) CUDA_CHECK(cudaEventSynchronize(g_dre.ev_tok));
     std::atomic_thread_fence(std::memory_order_seq_cst);

@@ -3272,6 +3272,34 @@ static void ggml_compute_forward_swiglu_f16(
     }
 }
 
+static void ggml_compute_forward_swiglu_clamp(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous_1(src1) && ggml_is_contiguous_1(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst));
+    const float limit = ggml_get_op_params_f32(dst, 2);
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t nc = dst->ne[0];
+    const int64_t nr = ggml_nrows(dst);
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    for (int64_t i1 = ir0; i1 < ir1; i1++) {
+        const float * g = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
+        const float * u = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+        float * d = (float *) ((char *) dst->data + i1*dst->nb[1]);
+        for (int64_t i = 0; i < nc; i++) {
+            const float gc = g[i] < limit ? g[i] : limit;
+            const float uc = u[i] < -limit ? -limit : (u[i] > limit ? limit : u[i]);
+            d[i] = (gc / (1.0f + expf(-gc))) * uc;
+        }
+    }
+}
+
 static void ggml_compute_forward_swiglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9852,6 +9880,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_OAI:
             {
                 ggml_compute_forward_swiglu_oai(params, dst);
+            } break;
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            {
+                ggml_compute_forward_swiglu_clamp(params, dst);
             } break;
         case GGML_GLU_OP_GEGLU_ERF:
             {

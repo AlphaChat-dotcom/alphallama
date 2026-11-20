@@ -2509,7 +2509,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -4879,6 +4879,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    ggml_cuda_op_swiglu_clamp(ctx, dst);
                     break;
                 case GGML_GLU_OP_GEGLU_ERF:
                     ggml_cuda_op_geglu_erf(ctx, dst);
@@ -7382,7 +7385,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const ggml_tensor * src1 = up->src[1];
                             const ggml_tensor * ids  = up->src[2];
 
-                            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                            // the clamped SwiGLU is fused by the quantised kernel only
+                            const bool glu_clamped = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP;
+                            if (glu_clamped && !ggml_cuda_should_fuse_mul_mat_vec_q(up)) continue;
+                            if (!glu_clamped && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -7397,6 +7403,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
+                                if (glu_clamped) memcpy(&fusion_data.glu_clamp, (const int32_t *) glu->op_params + 2, sizeof(float));
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -7663,6 +7670,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_dre_node_done(*cuda_ctx, node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -8613,6 +8621,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     return ggml_is_contiguous_1(op->src[0]);
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    return op->src[1] != nullptr && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                 default:
                     return false;
             }

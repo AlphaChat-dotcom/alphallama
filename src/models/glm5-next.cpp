@@ -417,6 +417,17 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // the shared expert is built first and placed between the router and the routed experts in the graph
+            // (ALPHA_GLM5_SHEXP_FIRST=0: after them, as upstream orders it); same nodes, same sum
+            static const bool shexp_first = [] { const char * e = getenv("ALPHA_GLM5_SHEXP_FIRST"); return !e || atoi(e) != 0; }();
+            ggml_tensor * ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp,   nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            if (shexp_first) moe_expand_first = ffn_shexp;
+
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -429,13 +440,7 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il);
             cb(moe_out, "ffn_moe_out", il);
-
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(ffn_shexp, "ffn_shexp", il);
+            moe_expand_first = nullptr;
 
             cur = ggml_add(ctx0, moe_out, ffn_shexp);
             cb(cur, "ffn_out", il);

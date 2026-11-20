@@ -742,6 +742,9 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+    // build_moe_ffn: a tensor of the caller (glm5-next: the shared expert's output) to place in the graph right after
+    // the router's expert ids and before the expert matmuls; consumed by the next build_moe_ffn call
+    mutable ggml_tensor * moe_expand_first = nullptr;
     const llm_arch arch;
 
     const llama_hparams & hparams;
