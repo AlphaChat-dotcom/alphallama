@@ -1704,12 +1704,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts, "ffn_moe_topk_cont", il);
     }
 
-    if (moe_expand_first) {
-        ggml_build_forward_expand(gf, selected_experts);
-        ggml_build_forward_expand(gf, moe_expand_first);
-        moe_expand_first = nullptr;
-    }
-
     // remap argsort expert IDs -> cache slot IDs for MUL_MAT_ID
     ggml_tensor * cache_experts = selected_experts;
     if (expert_remap != nullptr) {
@@ -1808,6 +1802,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (moe_expand_first) {   // e.g. glm5-next's shared expert: after the router, before the expert matmuls
+        ggml_build_forward_expand(gf, selected_experts);
+        ggml_build_forward_expand(gf, moe_expand_first);
+        moe_expand_first = nullptr;
+    }
 
     // save final weights for entropy-based difficulty estimation
     if (moe_save_idx >= 0) {

@@ -7662,6 +7662,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (node->op == GGML_OP_UNARY) {   // an MoE router's tail as one kernel
+                    const int jf = ggml_cuda_moe_router_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
+                if (node->op == GGML_OP_RMS_NORM) {   // a hyper-connection mixer's pre side as one kernel
+                    const int jf = ggml_cuda_dsv4_hc_pre_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 const bool prof_this = alpha_op_prof_on() && !use_cuda_graph && !alpha_op_prof_iter();
                 if (prof_this) alpha_op_prof_begin(cuda_ctx->stream(), node);
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
