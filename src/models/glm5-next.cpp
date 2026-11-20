@@ -632,6 +632,9 @@ ggml_tensor * llm_build_glm5_next::build_kpool_select(
     ggml_tensor * weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
     weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
     cb(weights, "indexer_weights", il);
+    // placed in the graph now, so the scoring chain below (permute, relu, weight, sum, permute) stays contiguous
+    // for the CUDA backend's one-kernel form
+    ggml_build_forward_expand(gf, weights);
 
     ggml_tensor * score = nullptr;
     {

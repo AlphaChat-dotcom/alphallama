@@ -7662,6 +7662,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (node->op == GGML_OP_CONT) {   // glm5-next indexer scoring as one kernel
+                    const int jf = ggml_cuda_idx_score_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 if (node->op == GGML_OP_UNARY) {   // an MoE router's tail as one kernel
                     const int jf = ggml_cuda_moe_router_fused(*cuda_ctx, cgraph, i);
                     if (jf > i) { i = jf; continue; }

@@ -274,6 +274,62 @@ int ggml_cuda_moe_router_fused(ggml_backend_cuda_context & ctx, const ggml_cgrap
     return j;
 }
 
+// Indexer score (ALPHA_IDX_SCORE_FUSED, default 1).
+//   kq [n_pool, n_tok, n_head] (contiguous matmul output), w [n_head, n_tok] -> out [n_pool, n_tok]
+static __global__ void idx_score_k(const float * __restrict__ kq, const float * __restrict__ w, float * __restrict__ out,
+        const int64_t n_pool, const int64_t n_tok, const int n_head, const size_t w_stride) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t plane = n_pool * n_tok;
+    if (i >= plane) return;
+    const int64_t t = i / n_pool;
+    const float * wt = w + (size_t) t * w_stride;
+    float s = 0.0f;
+    for (int h = 0; h < n_head; h++) s += fmaxf(kq[i + (int64_t) h * plane], 0.0f) * wt[h];
+    out[i] = s;
+}
+
+// nodes i..: CONT(permute(kq, 2,1,0,3)), UNARY relu, MUL by the head weights, SUM_ROWS, CONT(permute(., 2,1,0,3)).
+// Returns the index of the last node covered, or -1.
+int ggml_cuda_idx_score_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool on = [] { const char * e = getenv("ALPHA_IDX_SCORE_FUSED"); return !e || atoi(e) != 0; }();
+    if (!on || i + 5 >= cgraph->n_nodes) return -1;
+    const ggml_tensor * c1 = cgraph->nodes[i];
+    if (c1->op != GGML_OP_CONT || !c1->src[0] || c1->src[0]->op != GGML_OP_PERMUTE) return -1;
+    const ggml_tensor * kq = c1->src[0]->src[0];
+    if (!kq || kq->op != GGML_OP_MUL_MAT || kq->type != GGML_TYPE_F32 || !ggml_is_contiguous(kq)) return -1;
+    {   // ALPHA_IDX_SCORE_DBG: what follows a candidate, a few times
+        static const bool dbg = getenv("ALPHA_IDX_SCORE_DBG") != nullptr;
+        static int n_dbg = 0;
+        if (dbg && n_dbg < 6 && kq->ne[2] >= 8) {
+            n_dbg++;
+            fprintf(stderr, "[idx-score] candidate kq [%lld,%lld,%lld]:", (long long) kq->ne[0], (long long) kq->ne[1], (long long) kq->ne[2]);
+            for (int q = i; q < i + 8 && q < cgraph->n_nodes; q++) fprintf(stderr, " %s[%lld,%lld,%lld]", ggml_op_name(cgraph->nodes[q]->op),
+                    (long long) cgraph->nodes[q]->ne[0], (long long) cgraph->nodes[q]->ne[1], (long long) cgraph->nodes[q]->ne[2]);
+            fputc(10, stderr);
+        }
+    }
+    const ggml_tensor * re = cgraph->nodes[i + 1];
+    const ggml_tensor * mu = cgraph->nodes[i + 2];
+    const ggml_tensor * sr = cgraph->nodes[i + 3];
+    const ggml_tensor * pm = cgraph->nodes[i + 4];
+    const ggml_tensor * c2 = cgraph->nodes[i + 5];
+    if (re->op != GGML_OP_UNARY || (ggml_unary_op) ((const int32_t *) re->op_params)[0] != GGML_UNARY_OP_RELU || re->src[0] != c1) return -1;
+    if (mu->op != GGML_OP_MUL || mu->src[0] != re || !mu->src[1]) return -1;
+    if (sr->op != GGML_OP_SUM_ROWS || sr->src[0] != mu) return -1;
+    if (pm->op != GGML_OP_PERMUTE || pm->src[0] != sr || c2->op != GGML_OP_CONT || c2->src[0] != pm) return -1;
+    const ggml_tensor * w = mu->src[1];
+    const int64_t n_pool = kq->ne[0], n_tok = kq->ne[1], n_head = kq->ne[2];
+    if (kq->ne[3] != 1 || c1->ne[0] != n_head || c1->ne[1] != n_tok || c1->ne[2] != n_pool) return -1;
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != n_head || w->ne[1] != n_tok || w->ne[2] != 1) return -1;
+    if (c2->type != GGML_TYPE_F32 || c2->ne[0] != n_pool || c2->ne[1] != n_tok || c2->ne[2] != 1 || !ggml_is_contiguous(c2)) return -1;
+    if (n_head > 256) return -1;
+    const int64_t plane = n_pool * n_tok;
+    { static bool said = false; if (!said) { said = true; fprintf(stderr, "[idx-score] fused: %lld pools x %lld tokens x %lld heads\n", (long long) n_pool, (long long) n_tok, (long long) n_head); } }
+    idx_score_k<<<(unsigned) ((plane + 255) / 256), 256, 0, ctx.stream()>>>((const float *) kq->data, (const float *) w->data, (float *) c2->data,
+            n_pool, n_tok, (int) n_head, w->nb[1] / sizeof(float));
+    return i + 5;
+}
+
 // HC expand: block_out[n_embd, n_tokens] + post*block + comb*residual -> [n_embd, n_hc, n_tokens]
 static __global__ void dsv4_hc_expand_k(
         const void * bo, const void * res, const void * post, const void * comb, void * dst,
