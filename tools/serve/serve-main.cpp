@@ -974,15 +974,19 @@ static std::string alpha_ai_find_beside(const char * model_path, const char * re
     std::string mp(model_path);
 #if !defined(_WIN32)
     if (char * abs = realpath(model_path, nullptr)) { mp = abs; free(abs); }
+#else
+    if (char * abs = _fullpath(nullptr, model_path, 0)) { mp = abs; free(abs); }
 #endif
     const std::string r(rel);
-    const size_t s1 = mp.rfind('/');
+    // either separator: Windows paths ("C:\models\x.gguf") carry backslashes, and only splitting on '/' looked for the
+    // file in the current directory instead of beside the model
+    const size_t s1 = mp.find_last_of("/\\");
     const std::string dir = s1 == std::string::npos ? "." : mp.substr(0, s1);
     const size_t rs = r.rfind('/');
     const std::string file = rs == std::string::npos ? r : r.substr(rs + 1);
     if (stat((dir + "/" + file).c_str(), &st) == 0 && S_ISREG(st.st_mode)) return dir + "/" + file;
     if (rs != std::string::npos) {
-        const size_t s2 = dir.rfind('/');
+        const size_t s2 = dir.find_last_of("/\\");
         const std::string cand = (s2 == std::string::npos ? std::string(".") : dir.substr(0, s2)) + "/" + r;
         if (stat(cand.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return cand;
     }
