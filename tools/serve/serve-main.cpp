@@ -1231,25 +1231,22 @@ static bool alpha_auto_qwen4exp(const char * model_path) {
 
 // <model dir>/MTP/ holds exactly one .gguf (the draft head AlphaInfer 2 loads for MTP), and the first dre-profile*.bin
 // in <model dir> or <model dir>/MTP/ ("" when there is none).
+// (std::filesystem, so Windows finds them too: an empty answer there served Flash-Next plain decode, without MTP)
 static std::string alpha_q4x_find(const char * model_path, bool profile) {
-#if defined(_WIN32)
-    (void) model_path; (void) profile;
-    return "";
-#else
     const std::string mp(model_path);
-    const size_t sl = mp.find_last_of('/');
+    const size_t sl = mp.find_last_of("/\\");   // either separator: "C:\models\x.gguf"
     const std::string dir = sl == std::string::npos ? std::string(".") : mp.substr(0, sl);
     std::vector<std::string> found;
     for (const std::string & d : profile ? std::vector<std::string>{ dir, dir + "/MTP" } : std::vector<std::string>{ dir + "/MTP" }) {
-        DIR * dd = opendir(d.c_str());
-        if (!dd) continue;
-        while (struct dirent * e = readdir(dd)) {
-            const std::string n = e->d_name;
+        std::error_code ec;
+        std::vector<std::string> names;
+        for (const auto & de : std::filesystem::directory_iterator(d, ec)) names.push_back(de.path().filename().string());
+        std::sort(names.begin(), names.end());   // readdir order differs by filesystem; the first profile must not
+        for (const std::string & n : names) {
             const bool hit = profile ? (n.rfind("dre-profile", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".bin") == 0)
                                      : (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0);
             if (hit) found.push_back(d + "/" + n);
         }
-        closedir(dd);
         if (profile && !found.empty()) return found[0];
     }
     if (!profile && found.size() > 1) {
@@ -1257,7 +1254,6 @@ static std::string alpha_q4x_find(const char * model_path, bool profile) {
                 found.size(), dir.c_str());
     }
     return !profile && found.size() == 1 ? found[0] : "";
-#endif
 }
 #endif // ALPHA_HAS_ALPHAINFER
 

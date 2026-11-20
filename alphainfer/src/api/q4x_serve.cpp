@@ -68,7 +68,7 @@ void env_default(const char * n, const char * v) {
 
 // the only .gguf in <model dir>/MTP/ ("" when there is none or more than one)
 std::string find_sidecar(const std::string & model) {
-    const size_t      sl  = model.find_last_of('/');
+    const size_t      sl  = model.find_last_of("/\\");   // either separator: Windows paths carry backslashes
     const std::string dir = (sl == std::string::npos ? std::string(".") : model.substr(0, sl)) + "/MTP";
     DIR *             d   = opendir(dir.c_str());
     if (!d) return "";
