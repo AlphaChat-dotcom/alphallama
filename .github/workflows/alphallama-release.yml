@@ -156,7 +156,7 @@ jobs:
           # OpenSSL: the build links the runner's OpenSSL 3 (CMake: "Found OpenSSL"), so its two DLLs ship next to the
           # executables (a PC without them on PATH could not start any of them: 0xC0000135, DLL not found)
           $inc = (Select-String -Path build\CMakeCache.txt -Pattern '^OPENSSL_INCLUDE_DIR:PATH=(.+)$' | Select-Object -First 1).Matches.Groups[1].Value
-          if ($inc) {
+          if ($inc -and $inc -notmatch 'NOTFOUND$' -and (Test-Path $inc)) {   # Windows on ARM: no OpenSSL found, none needed
             $ossl = Split-Path $inc -Parent
             $dll = @(Get-ChildItem "$ossl\bin" -File | Where-Object { $_.Name -match '^lib(ssl|crypto)-3.*\.dll$' })
             if ($dll.Count -lt 2) { throw "OpenSSL DLLs not found in $ossl\bin" }
@@ -260,7 +260,7 @@ jobs:
           # OpenSSL: the build links the runner's OpenSSL 3 (CMake: "Found OpenSSL"), so its two DLLs ship next to the
           # executables (a PC without them on PATH could not start any of them: 0xC0000135, DLL not found)
           $inc = (Select-String -Path build\CMakeCache.txt -Pattern '^OPENSSL_INCLUDE_DIR:PATH=(.+)$' | Select-Object -First 1).Matches.Groups[1].Value
-          if ($inc) {
+          if ($inc -and $inc -notmatch 'NOTFOUND$' -and (Test-Path $inc)) {   # Windows on ARM: no OpenSSL found, none needed
             $ossl = Split-Path $inc -Parent
             $dll = @(Get-ChildItem "$ossl\bin" -File | Where-Object { $_.Name -match '^lib(ssl|crypto)-3.*\.dll$' })
             if ($dll.Count -lt 2) { throw "OpenSSL DLLs not found in $ossl\bin" }
