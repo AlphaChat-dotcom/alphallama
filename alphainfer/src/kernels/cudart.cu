@@ -39,6 +39,15 @@ void stream_wait_event(void * stream, void * event) {
     cudaStreamWaitEvent((cudaStream_t) stream, (cudaEvent_t) event, 0);
 }
 
+void event_sync(void * event) {
+    cudaEventSynchronize((cudaEvent_t) event);
+}
+
+bool stream_capturing(void * stream) {
+    cudaStreamCaptureStatus s = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing((cudaStream_t) stream, &s) == cudaSuccess && s != cudaStreamCaptureStatusNone;
+}
+
 bool capture_begin(void * stream) {
     return cudaStreamBeginCapture((cudaStream_t) stream, cudaStreamCaptureModeRelaxed) == cudaSuccess;
 }

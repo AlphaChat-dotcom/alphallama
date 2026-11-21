@@ -260,6 +260,14 @@ private:
         size_t       tbl_rowb = 0;
         int64_t      tbl_rows = 0;         // vocab, for the id bounds check
         int64_t      tbl_cols = 0;         // E; embd is carved 1-D, so its ne[0] is E*T_cap, not E
+        // The pinned mirrors are the source of upload()'s async copies until those run: `copied` is recorded after
+        // them and stage_rows waits for it before writing the mirrors again. Without it a prefill staged chunk i+1
+        // over chunk i's mask and positions while chunk i's copies were still queued; on Windows (WDDM batches
+        // submissions) a multi-chunk prompt then read the next chunk's inputs, so exact != plain and the text
+        // depended on the server's history.
+        mutable void * copied         = nullptr;
+        mutable bool   copied_pending = false;
+        void host_wait() const;   // the mirrors are free to write
         void alloc(Device & dev, int64_t T, int64_t mask_elems, int64_t B, const char * name);
         void alloc_embd(Device & dev, const Tensor & table, const char * name);
         Qwen35Hybrid::Inputs view(int64_t L, int64_t B, int64_t n_kv, int first_region) const;

@@ -197,6 +197,21 @@ void Engine::Ingress::upload(Device & dev, int64_t L, int64_t B, int64_t n_kv) c
         }
         dev.upload_async(v.embd, h_embd, 0, tbl_rowb * (size_t) T);
     }
+    // not inside a graph capture: the copies are then nodes of the captured round, and a host wait on an event
+    // recorded during a capture is an error
+    void * cs = dev.compute_stream();
+    if (!kern::stream_capturing(cs)) {
+        if (!copied) copied = kern::event_create();
+        kern::event_record(copied, cs);
+        copied_pending = true;
+    }
+}
+
+void Engine::Ingress::host_wait() const {
+    if (copied_pending) {
+        kern::event_sync(copied);
+        copied_pending = false;
+    }
 }
 
 // ------------------------------------------------------------------ init
@@ -1747,6 +1762,7 @@ void Engine::stage_rows(Ingress & g, int seq, int64_t row0, int64_t T, const int
     if (row0 + L > T || T > g.T_cap || (!g.mask_on_device && !g.mask_fits(n_kv, T))) {
         throw std::runtime_error("stage_rows: round larger than its buffers");
     }
+    g.host_wait();   // the previous upload() from these mirrors has run
     if (head) {
         prog_.fill_head_inputs(seq, L, pos0, n_kv, row0, T, g.h_pos, g.h_cells,
                                (g.mask_fits(n_kv, T) && !g.mask_dev_now) ? g.h_mask : nullptr);

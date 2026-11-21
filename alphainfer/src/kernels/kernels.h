@@ -463,6 +463,8 @@ bool   memset_async(void * stream, void * dst, size_t n);   // device-side zero 
 void * event_create();
 void   event_record(void * event, void * stream);
 void   stream_wait_event(void * stream, void * event);   // `stream` waits; the host does not
+void   event_sync(void * event);                         // the host waits for the event
+bool   stream_capturing(void * stream);                  // a graph capture is open on `stream`
 
 // L2 prefetch of n expert slots' row spans in three slot banks (slots < 0 skipped).
 void l2_prefetch_experts(void * stream, const void * up, const void * gate, const void * down, int64_t span_up,
