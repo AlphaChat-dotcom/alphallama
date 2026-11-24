@@ -1754,6 +1754,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_clamp = 0.0f;            // GGML_GLU_OP_SWIGLU_CLAMP: the limit
     alpha_src1_q8_1 src1_q8;           // ALPHA_Q8_STAGE: optional pre-quantised activation
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1761,4 +1762,5 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_clamp = 0.0f;
 };

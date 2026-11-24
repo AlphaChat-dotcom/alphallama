@@ -3272,6 +3272,34 @@ static void ggml_compute_forward_swiglu_f16(
     }
 }
 
+static void ggml_compute_forward_swiglu_clamp(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous_1(src1) && ggml_is_contiguous_1(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst));
+    const float limit = ggml_get_op_params_f32(dst, 2);
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t nc = dst->ne[0];
+    const int64_t nr = ggml_nrows(dst);
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    for (int64_t i1 = ir0; i1 < ir1; i1++) {
+        const float * g = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
+        const float * u = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+        float * d = (float *) ((char *) dst->data + i1*dst->nb[1]);
+        for (int64_t i = 0; i < nc; i++) {
+            const float gc = g[i] < limit ? g[i] : limit;
+            const float uc = u[i] < -limit ? -limit : (u[i] > limit ? limit : u[i]);
+            d[i] = (gc / (1.0f + expf(-gc))) * uc;
+        }
+    }
+}
+
 static void ggml_compute_forward_swiglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -4770,6 +4798,11 @@ static void ggml_compute_forward_get_rows_f16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        if (dst->type == GGML_TYPE_F16) {   // ALPHA: F16 result (ggml_get_rows_t)
+            memcpy((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
+                   (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, nc*sizeof(ggml_fp16_t));
+            continue;
+        }
         ggml_cpu_fp16_to_fp32(
             (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
@@ -4852,6 +4885,12 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        if (dst->type == GGML_TYPE_F16) {   // ALPHA: F32 rows into F16 (ggml_get_rows_t)
+            ggml_cpu_fp32_to_fp16(
+                (const float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                (ggml_fp16_t *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+            continue;
+        }
         ggml_vec_cpy_f32(nc,
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
                 (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
@@ -9853,6 +9892,10 @@ void ggml_compute_forward_glu(
             {
                 ggml_compute_forward_swiglu_oai(params, dst);
             } break;
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            {
+                ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
         case GGML_GLU_OP_GEGLU_ERF:
             {
                 ggml_compute_forward_geglu_erf(params, dst);
@@ -11745,6 +11788,39 @@ void ggml_compute_forward_hc_mix_fused(
             if (wi) for (int64_t k = 0; k < HD; ++k) a += hc_w_at(wi, k, h)*xn[k];
             it[h] = a;
         }
+    }
+}
+
+// ggml_compute_forward_dsv4_idx_score: relu, multiply, ggml_vec_sum_f32 per row (sum_rows(mul(relu(kq), w)))
+
+void ggml_compute_forward_dsv4_idx_score(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kq = dst->src[0];
+    const ggml_tensor * w  = dst->src[1];
+    GGML_ASSERT(kq->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(kq) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
+
+    const int64_t H     = kq->ne[0];
+    const int64_t ne1   = kq->ne[1];
+    const int64_t nrows = ggml_nrows(kq);
+    const int64_t r0 = (nrows * params->ith) / params->nth;
+    const int64_t r1 = (nrows * (params->ith + 1)) / params->nth;
+
+    std::vector<float> tmp(H);
+    const float * x = (const float *) kq->data;
+    const float * wd = (const float *) w->data;
+    float * y = (float *) dst->data;
+    for (int64_t r = r0; r < r1; r++) {
+        const float * xr = x + r*H;
+        const float * wr = wd + (r % ne1)*H;
+        for (int64_t h = 0; h < H; h++) {
+            const float v = (xr[h] > 0.f) ? xr[h] : 0.f;
+            tmp[h] = v * wr[h];
+        }
+        float s = 0;
+        ggml_vec_sum_f32((int) H, &s, tmp.data());
+        y[r] = s;
     }
 }
 

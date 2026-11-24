@@ -194,6 +194,12 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // the whole K tensor of layer il: [n_embd_k_gqa, kv_size, n_stream] (glm5-next k-pool gathers rows across streams)
+    ggml_tensor * get_k_storage(int32_t il) const;
+
+    // the stream holding seq_id's cells
+    uint32_t get_stream(llama_seq_id seq_id) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

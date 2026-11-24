@@ -60,6 +60,7 @@ add_library(aicore STATIC
     src/models/qwen35_hybrid.cpp
     src/models/dflash2.cpp
     src/models/qwen4exp.cpp
+    src/models/glm5next.cpp
     src/engine/tokenizer.cpp
     src/engine/draft_vocab.cpp
     src/engine/engine.cpp
@@ -262,6 +263,10 @@ endif()
 add_executable(ai-q4x-inspect tools/q4x_inspect.cpp)
 target_include_directories(ai-q4x-inspect PRIVATE ${AI_VENDOR_INCLUDES})
 target_link_libraries(ai-q4x-inspect PRIVATE aicore)
+add_executable(ai-glm5-inspect tools/glm5_inspect.cpp)
+target_include_directories(ai-glm5-inspect PRIVATE ${AI_VENDOR_INCLUDES})
+target_link_libraries(ai-glm5-inspect PRIVATE aicore)
+set_target_properties(ai-glm5-inspect PROPERTIES BUILD_RPATH "${AI_VENDOR_BUILD}/bin" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_executable(ai-q4x-load tools/q4x_load.cpp)
 target_include_directories(ai-q4x-load PRIVATE ${AI_VENDOR_INCLUDES})
 target_link_libraries(ai-q4x-load PRIVATE aicore)

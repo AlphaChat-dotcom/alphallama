@@ -614,6 +614,7 @@ extern "C" {
         GGML_OP_HC_COMBINE,
         GGML_OP_HC_MIX_TAIL,
         GGML_OP_HC_MIX_FUSED,
+        GGML_OP_DSV4_IDX_SCORE,
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -666,6 +667,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,   // silu(min(a, limit)) * clamp(b, -limit, limit); limit = op_params f32 [2]
 
         GGML_GLU_OP_COUNT,
     };
@@ -1385,6 +1387,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // silu(min(a, limit)) * clamp(b, -limit, limit)
+    GGML_API struct ggml_tensor * ggml_swiglu_split_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     GGML_API struct ggml_tensor * ggml_geglu_erf_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2028,6 +2037,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
+
+    // DeepSeek V4 indexer head reduction: [1, n1, n2, n3] = sum_h relu(kq[h, i1, i2, i3]) * w[h, i1]
+    // (kq [H, n1, n2, n3] and w [H, n1] F32, contiguous); the same arithmetic as sum_rows(mul(relu(kq), w)).
+    GGML_API struct ggml_tensor * ggml_dsv4_idx_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq,
+            struct ggml_tensor  * w);
 
     // DeepSeek V4 hyperconnection expand helper.
     // Computes post * block_out + comb^T @ residual for each token.

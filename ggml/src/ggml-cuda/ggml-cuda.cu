@@ -2509,7 +2509,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -2883,6 +2883,370 @@ static cudaEvent_t g_xfr_e = nullptr;
 static bool g_pcache_has_misses = false;  // set by pcache_copy, read by mul_mat_id/graph_check
 
 // Per-tensor CPU miss IDs (keyed by gpu_dst pointer), populated by flush, read by mul_mat_id
+
+// ai4: read `n` bytes of a file mapping at `src` with pread() on the mapped file (see stage_expert). Returns false when
+// the address is not in a file mapping or the read fails (the caller then memcpys from the mapping).
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#include <mutex>
+struct ai4_map_range { uintptr_t lo, hi; uint64_t file_off; int fd; };
+static bool ai4_pread_mapped(void * dst, const void * src, size_t n) {
+    static const bool on = [] { const char * e = getenv("ALPHA_AI4_PREAD"); return !e || atoi(e) != 0; }();
+    if (!on) return false;
+    static std::mutex mu;
+    static std::vector<ai4_map_range> ranges;
+    static std::unordered_map<std::string, int> fds;
+    const uintptr_t a = (uintptr_t) src;
+    std::lock_guard<std::mutex> lk(mu);
+    auto find = [&]() -> const ai4_map_range * {
+        for (const auto & r : ranges) if (a >= r.lo && a + n <= r.hi) return &r;
+        return nullptr;
+    };
+    const ai4_map_range * r = find();
+    if (!r) {   // (re)read the process maps: file-backed mappings only
+        ranges.clear();
+        FILE * f = fopen("/proc/self/maps", "r");
+        if (!f) return false;
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long lo, hi, off; char perm[8]; char dev[16]; unsigned long ino; char path[3072] = {0};
+            if (sscanf(line, "%lx-%lx %7s %lx %15s %lu %3071[^\n]", &lo, &hi, perm, &off, dev, &ino, path) < 7) continue;
+            if (ino == 0 || path[0] != '/') continue;
+            const char * pth = path; while (*pth == ' ') pth++;
+            std::string ps(pth);
+            if (ps.size() < 5 || ps.compare(ps.size() - 5, 5, ".gguf") != 0) continue;
+            int fd;
+            auto it = fds.find(ps);
+            if (it == fds.end()) { fd = open(ps.c_str(), O_RDONLY | O_CLOEXEC); fds[ps] = fd; } else fd = it->second;
+            if (fd < 0) continue;
+            ranges.push_back({ (uintptr_t) lo, (uintptr_t) hi, (uint64_t) off, fd });
+        }
+        fclose(f);
+        r = find();
+        if (!r) return false;
+    }
+    const uint64_t fo = r->file_off + (a - r->lo);
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t k = pread(r->fd, (char *) dst + done, n - done, (off_t) (fo + done));
+        if (k <= 0) return false;
+        done += (size_t) k;
+    }
+    return true;
+}
+// ai4: O_DIRECT read of the 4 KiB-aligned file range that holds `n` mapped bytes at `src`, into `slot` (4 KiB
+// aligned, at least ai4_direct_slot_bytes(n) long). *head = where the bytes start inside the slot.
+static bool ai4_direct_on() {
+    static const bool on = [] { const char * e = getenv("ALPHA_AI4_DIRECT"); return !e || atoi(e) != 0; }();
+    return on;
+}
+static size_t ai4_direct_slot_bytes(size_t n) { return ((n + 4096 + 4095) / 4096) * 4096; }
+static bool ai4_direct_read(void * slot, const void * src, size_t n, size_t * head) {
+    static std::mutex mu;
+    static std::vector<ai4_map_range> ranges;     // fd = the O_DIRECT descriptor of the mapped file
+    static std::unordered_map<std::string, int> fds;
+    const uintptr_t a = (uintptr_t) src;
+    const ai4_map_range * r = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const auto & q : ranges) if (a >= q.lo && a + n <= q.hi) { r = &q; break; }
+        if (!r) {
+            ranges.clear();
+            FILE * f = fopen("/proc/self/maps", "r");
+            if (!f) return false;
+            char line[4096];
+            while (fgets(line, sizeof line, f)) {
+                unsigned long lo, hi, off; char perm[8]; char dev[16]; unsigned long ino; char path[3072] = {0};
+                if (sscanf(line, "%lx-%lx %7s %lx %15s %lu %3071[^\n]", &lo, &hi, perm, &off, dev, &ino, path) < 7) continue;
+                if (ino == 0) continue;
+                const char * pth = path; while (*pth == ' ') pth++;
+                std::string ps(pth);
+                if (ps.size() < 5 || ps.compare(ps.size() - 5, 5, ".gguf") != 0) continue;
+                int fd;
+                auto it = fds.find(ps);
+                if (it == fds.end()) { fd = open(ps.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC); fds[ps] = fd; } else fd = it->second;
+                if (fd < 0) continue;
+                ranges.push_back({ (uintptr_t) lo, (uintptr_t) hi, (uint64_t) off, fd });
+            }
+            fclose(f);
+            for (const auto & q : ranges) if (a >= q.lo && a + n <= q.hi) { r = &q; break; }
+            if (!r) return false;
+        }
+    }
+    const uint64_t fo = r->file_off + (a - r->lo);
+    const uint64_t lo = fo & ~(uint64_t) 4095;
+    *head = (size_t) (fo - lo);
+    const size_t len = ((*head + n + 4095) / 4096) * 4096;
+    size_t done = 0;
+    while (done < *head + n) {
+        const ssize_t k = pread(r->fd, (char *) slot + done, len - done, (off_t) (lo + done));
+        if (k <= 0) return false;
+        done += (size_t) k;
+    }
+    return true;
+}
+#else
+static bool ai4_pread_mapped(void *, const void *, size_t) { return false; }
+static bool ai4_direct_on() { return false; }
+static size_t ai4_direct_slot_bytes(size_t n) { return n; }
+static bool ai4_direct_read(void *, const void *, size_t, size_t *) { return false; }
+#endif
+
+// ai4: persistent I/O worker pool for the parallel staging fill (the caller thread works too).
+#include <thread>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
+struct ai4_io_pool {
+    std::vector<std::thread> th;
+    std::mutex m;
+    std::condition_variable cv;
+    std::function<void(int)> fn;
+    std::atomic<int> next{0}, finished{0};
+    int n = 0;
+    uint64_t gen = 0;
+    ai4_io_pool() {
+        const char * e = getenv("ALPHA_AI4_IO_THREADS");
+        const int nt = e ? std::max(0, atoi(e)) : 8;
+        for (int i = 0; i < nt; i++) th.emplace_back([this] { work(); });
+    }
+    // each worker takes part in every generation exactly once and reports when it has left it, so run() never
+    // returns while a worker could still touch the caller's job list
+    void work() {
+        uint64_t seen = 0;
+        for (;;) {
+            std::function<void(int)> f; int nn;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return gen != seen; });
+                seen = gen; f = fn; nn = n;
+            }
+            for (int i; (i = next.fetch_add(1)) < nn; ) f(i);
+            finished.fetch_add(1);
+        }
+    }
+    // run fn(0..nn-1) on the workers and the calling thread; returns when all are done
+    void run(int nn, std::function<void(int)> f) {
+        if (nn <= 0) return;
+        if (th.empty() || nn == 1) { for (int i = 0; i < nn; i++) f(i); return; }
+        {
+            std::lock_guard<std::mutex> lk(m);
+            fn = f; n = nn; next.store(0); finished.store(0); gen++;
+        }
+        cv.notify_all();
+        for (int i; (i = next.fetch_add(1)) < nn; ) f(i);
+        while (finished.load() < (int) th.size()) { std::this_thread::yield(); }
+    }
+};
+static ai4_io_pool & ai4_pool() { static ai4_io_pool p; return p; }
+// ai4: storage bytes this process has read (Linux /proc/self/io read_bytes; 0 elsewhere)
+static int64_t ai4_proc_read_bytes() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/self/io", "r");
+    if (!f) return 0;
+    char line[128];
+    long long v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "read_bytes: %lld", &v) == 1) break;
+    }
+    fclose(f);
+    return (int64_t) v;
+#else
+    return 0;
+#endif
+}
+
+// ai4: prompt-batch accounting (see the multi-token miss branch)
+struct ai4_pf_stats_t {
+    int64_t calls = 0, misses = 0, ring_reads = 0, stage_fills = 0, wraps = 0;
+    double  branch_s = 0, read_s = 0, sync_s = 0, read_gb = 0;
+};
+static ai4_pf_stats_t ai4_pf_stats;
+
+// ai4: prompt-batch lookahead reader (see ALPHA_AI4_LOOKAHEAD_GB)
+struct ai4_la_part { const void * host_base; size_t esz; std::vector<int64_t> eids; std::vector<uint64_t> keys; };
+struct ai4_la_req {
+    int layer = -1;                                   // learned layer index this buffer holds
+    int64_t seq = -1;                                 // position in the running layer sequence (ALPHA_AI4_LA_DEPTH)
+    std::vector<ai4_la_part> parts;
+    std::vector<std::pair<uint64_t, const void *>> out;   // key -> bytes in the buffer
+    bool queued = false, done = true;
+    double read_s = 0, gb = 0;
+    std::chrono::steady_clock::time_point t_q, t_start, t_end;   // ALPHA_AI4_LAYER_LOG
+    int n_cap_skip = 0;                                            // experts that did not fit the buffer
+};
+struct ai4_lookahead {
+    char *  buf[3] = { nullptr, nullptr, nullptr };
+    size_t  buf_size = 0;
+    cudaEvent_t ev[3] = { nullptr, nullptr, nullptr };
+    bool    ev_armed[3] = { false, false, false };
+    ai4_la_req req[3];
+    int     nb = 2;                                   // buffers in use = ALPHA_AI4_LA_DEPTH + 1
+    std::mutex m;
+    std::condition_variable cv, cv_done;
+    std::thread th;
+    bool tried = false, ok = false;
+    ai4_io_pool * pool = nullptr;
+    bool ready() {
+        if (ok) return true;
+        if (tried) return false;
+        tried = true;
+        const char * e = getenv("ALPHA_AI4_LOOKAHEAD_GB");
+        const double gb = e ? atof(e) : 3.5;
+        if (gb <= 0 || !ai4_direct_on()) return false;
+        buf_size = (size_t) (gb * 1024.0 * 1024.0 * 1024.0);
+        {
+            const char * d = getenv("ALPHA_AI4_LA_DEPTH");
+            nb = 1 + std::max(1, std::min(2, d ? atoi(d) : 1));   // default 1: depth 2 read 53.9 vs 48 GB per 8K pass (f57 P2)
+        }
+        for (int b = 0; b < nb; b++) {
+            if (cudaMallocHost((void **) &buf[b], buf_size) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+            if (cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        }
+        pool = new ai4_io_pool();
+        th = std::thread([this] { work(); });
+        th.detach();
+        ok = true;
+        fprintf(stderr, "[expert-cache] ai4 prompt lookahead: %d x %.1f GB pinned, %d layers ahead\n", nb, gb, nb - 1);
+        return true;
+    }
+    void work() {
+        for (;;) {
+            int b = -1;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { for (int i = 0; i < nb; i++) if (req[i].queued) return true; return false; });
+                for (int i = 0; i < nb; i++) {   // the oldest queued request first
+                    if (req[i].queued && (b < 0 || req[i].seq < req[b].seq)) b = i;
+                }
+                req[b].queued = false;
+            }
+            ai4_la_req & r = req[b];
+            // a job reads n_exp adjacent experts (one expert unless ALPHA_AI4_LA_COALESCE_MB > 0)
+            struct job { size_t slot; const char * src; size_t esz; int n_exp; const uint64_t * keys; size_t head; };
+            static const size_t coalesce = [] {
+                const char * e = getenv("ALPHA_AI4_LA_COALESCE_MB");
+                return e ? (size_t) (atof(e) * 1024.0 * 1024.0) : (size_t) 0;
+            }();
+            std::vector<job> jobs;
+            size_t pos = 0;
+            int n_cap_skip = 0;
+            for (const auto & pt : r.parts) {
+                const int max_run = coalesce > pt.esz ? (int) (coalesce / pt.esz) : 1;
+                bool full = false;
+                for (size_t k = 0; k < pt.eids.size() && !full; ) {
+                    int run = 1;
+                    while (run < max_run && k + run < pt.eids.size() && pt.eids[k + run] == pt.eids[k] + run) run++;
+                    // shrink the run to what still fits the buffer
+                    while (run > 0 && pos + ai4_direct_slot_bytes((size_t) run * pt.esz) > buf_size) run--;
+                    if (run == 0) { n_cap_skip += (int) (pt.eids.size() - k); full = true; break; }
+                    jobs.push_back({ pos, (const char *) pt.host_base + (size_t) pt.eids[k] * pt.esz, pt.esz, run, &pt.keys[k], 0 });
+                    pos += ai4_direct_slot_bytes((size_t) run * pt.esz);
+                    k += (size_t) run;
+                }
+                if (full) break;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            char * base = buf[b];
+            pool->run((int) jobs.size(), [&](int i) {
+                job & j = jobs[i];
+                const size_t n = (size_t) j.n_exp * j.esz;
+                if (!ai4_direct_read(base + j.slot, j.src, n, &j.head)) {
+                    j.head = 0;
+                    if (!ai4_pread_mapped(base + j.slot, j.src, n)) memcpy(base + j.slot, j.src, n);
+                }
+            });
+            std::vector<std::pair<uint64_t, const void *>> out;
+            out.reserve(jobs.size());
+            double gb = 0;
+            for (const auto & j : jobs) {
+                for (int x = 0; x < j.n_exp; x++) out.push_back({ j.keys[x], base + j.slot + j.head + (size_t) x * j.esz });
+                gb += (double) j.n_exp * j.esz / 1e9;
+            }
+            {
+                std::lock_guard<std::mutex> lk(m);
+                r.out.swap(out);
+                r.read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                r.gb = gb;
+                r.t_start = t0; r.t_end = std::chrono::steady_clock::now(); r.n_cap_skip = n_cap_skip;
+                r.done = true;
+            }
+            cv_done.notify_all();
+        }
+    }
+};
+static ai4_lookahead ai4_la;
+static std::vector<const void *> ai4_layer_order;              // learned order of layers (group keys) in a pass
+static std::unordered_map<const void *, int> ai4_layer_idx;
+static int64_t ai4_la_seq = -1;     // running layer sequence of prompt passes (lookahead buffer = seq % nb)
+static int     ai4_la_cur_buf = 0;
+static double ai4_la_wait_s = 0, ai4_la_read_s = 0, ai4_la_gb = 0;
+static int64_t ai4_la_used = 0, ai4_la_issued = 0;
+static uint32_t ai4_prompt_pass = 0;                              // prompt passes seen (layer 0 of a prompt batch)
+static std::unordered_map<uint64_t, uint32_t> ai4_use_pass;       // expert key -> last prompt pass that routed it
+static std::unordered_map<const void *, uint32_t> ai4_seen_pass;  // tensor -> last prompt pass it was processed in
+static int64_t ai4_la_skipped = 0;
+static int64_t ai4_la_consumed = 0;   // lookahead copies used by the prompt copy loop
+
+// ai4: next-layer routing predictor (see ALPHA_AI4_PREDICT)
+static const ggml_tensor * ai4_router_w[256] = {};   // ffn_moe_logits-N src0: router weights [n_embd, n_expert] F32
+static const ggml_tensor * ai4_router_b[256] = {};   // ffn_moe_probs_biased-N src1: bias [n_expert] F32
+static uint32_t ai4_pred_bits[256][16];              // per layer: predicted experts (n_expert <= 512)
+static int      ai4_pred_layer = -1;                 // layer whose bitmap is fresh (consumed by the lookahead)
+static int64_t  ai4_pred_calls = 0, ai4_pred_set = 0;
+static bool ai4_predict_on() {
+    static const bool on = [] { const char * e = getenv("ALPHA_AI4_PREDICT"); return !e || atoi(e) != 0; }();
+    return on;
+}
+static void ai4_collect_routers(const ggml_cgraph * cg) {
+    if (!ai4_predict_on()) return;
+    for (int i = 0; i < cg->n_nodes; i++) {
+        const ggml_tensor * n = cg->nodes[i];
+        if (n->op == GGML_OP_MUL_MAT && strncmp(n->name, "ffn_moe_logits-", 15) == 0) {
+            const int il = atoi(n->name + 15);
+            const ggml_tensor * w = n->src[0];
+            if (il >= 0 && il < 256 && w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[1] <= 512 &&
+                w->buffer && !ggml_backend_buffer_is_host(w->buffer)) ai4_router_w[il] = w;
+        } else if (n->op == GGML_OP_ADD && strncmp(n->name, "ffn_moe_probs_biased-", 21) == 0) {
+            const int il = atoi(n->name + 21);
+            const ggml_tensor * b = n->src[1];
+            if (il >= 0 && il < 256 && b && b->type == GGML_TYPE_F32 && b->buffer && !ggml_backend_buffer_is_host(b->buffer)) ai4_router_b[il] = b;
+        }
+    }
+}
+// one warp per token: top-K of sqrt(softplus(logit)) + bias over E experts, OR-ed into bits
+static __global__ void ai4_topk_union_kernel(const float * __restrict__ logits, const float * __restrict__ bias,
+                                             int E, int T, int K, unsigned int * __restrict__ bits) {
+    const int t = blockIdx.x;
+    if (t >= T) return;
+    const int lane = threadIdx.x;
+    float v[16];
+    const int per = (E + 31) / 32;
+    for (int j = 0; j < per; j++) {
+        const int e = lane + 32 * j;
+        if (j < 16 && e < E) {
+            const float l = logits[(size_t) t * E + e];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            v[j] = sqrtf(sp) + (bias ? bias[e] : 0.0f);
+        } else if (j < 16) {
+            v[j] = -INFINITY;
+        }
+    }
+    for (int k = 0; k < K; k++) {
+        float best = -INFINITY; int bi = -1;
+        for (int j = 0; j < per && j < 16; j++) if (v[j] > best) { best = v[j]; bi = lane + 32 * j; }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffff, best, o);
+            const int   oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ob > best || (ob == best && oi < bi && oi >= 0)) { best = ob; bi = oi; }
+        }
+        if (bi < 0) break;
+        if (lane == 0) atomicOr(&bits[bi >> 5], 1u << (bi & 31));
+        if ((bi & 31) == lane) v[bi >> 5] = -INFINITY;
+    }
+}
+
 struct pcache_cpu_miss_entry {
     const void * host_base;
     size_t       expert_size;
@@ -4880,6 +5244,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
                     break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    ggml_cuda_op_swiglu_clamp(ctx, dst);
+                    break;
                 case GGML_GLU_OP_GEGLU_ERF:
                     ggml_cuda_op_geglu_erf(ctx, dst);
                     break;
@@ -5072,6 +5439,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             ggml_cuda_op_dsv4_hc_weighted_sum(ctx, dst);
+            break;
+        case GGML_OP_DSV4_IDX_SCORE:
+            ggml_cuda_op_dsv4_idx_score(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_EXPAND:
             ggml_cuda_op_dsv4_hc_expand(ctx, dst);
@@ -6640,8 +7010,23 @@ static bool alpha_op_prof_byname() {
     static const bool v = []() { const char * e = getenv("ALPHA_OP_PROF_BYNAME"); return e && atoi(e) != 0; }();
     return v;
 }
+static bool alpha_op_prof_byname_all() {   // ALPHA_OP_PROF_BYNAME=2: every op, keyed by node name (digits stripped) and shape
+    static const bool v = []() { const char * e = getenv("ALPHA_OP_PROF_BYNAME"); return e && atoi(e) >= 2; }();
+    return v;
+}
 static std::string alpha_op_prof_key(const ggml_tensor * node) {
-    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) return std::string();
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        if (!alpha_op_prof_byname_all()) return std::string();
+        std::string nm = node->name;
+        for (char & c : nm) if (c >= '0' && c <= '9') c = '#';
+        const ggml_tensor * a = node->src[0];
+        std::string an = a ? a->name : "";
+        for (char & c : an) if (c >= '0' && c <= '9') c = '#';
+        char buf[224];
+        snprintf(buf, sizeof(buf), "%s %.48s <- %.48s [%lld,%lld,%lld,%lld]", ggml_op_name(node->op), nm.c_str(), an.c_str(),
+                 (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+        return buf;
+    }
     const ggml_tensor * w = node->src[0];
     std::string nm = w && w->name[0] ? w->name : "?";
     if (nm.compare(0, 4, "blk.") == 0) {
@@ -6767,7 +7152,7 @@ static void alpha_op_prof_flush(cudaStream_t st) {
             std::vector<std::pair<double, std::string>> vn;
             for (const auto & kv : p.acc_name) vn.push_back(std::make_pair(kv.second.first, kv.first));
             std::sort(vn.rbegin(), vn.rend());
-            for (size_t i = 0; i < vn.size() && i < 40; i++) {
+            for (size_t i = 0; i < vn.size() && i < (alpha_op_prof_byname_all() ? 90u : 40u); i++) {
                 const std::pair<double, long long> & e = p.acc_name[vn[i].second];
                 fprintf(stderr, "[op-prof-name] %8.3f ms/pass %5.1f%% %6.1f calls/pass  %s\n",
                         e.first / (double) p.passes / 1000.0, 100.0 * e.first / p.total_us,
@@ -6982,6 +7367,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    ggml_cuda_dre_set_eager(!use_cuda_graph);
     while (!graph_evaluated_or_captured) {
         ggml_cuda_mmvq_q8_cache_begin_graph();   // ALPHA_Q8_CACHE: nothing survives a graph boundary (or a capture retry)
         ggml_cuda_mmq_id_cache_begin_graph();    // ALPHA_MMID_CACHE: same rule
@@ -7163,6 +7549,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // start of fusion operations
+                // ahead of the generic SSM_CONV + SILU fusion: this conv's CONCAT input was left unmaterialised
+                if (node->op == GGML_OP_SSM_CONV) {   // glm5-next prompt-batch conv, reads the projection and the state directly
+                    const int jf = ggml_cuda_glm_conv_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
                     ggml_cuda_topk_moe_args args;
@@ -7381,7 +7772,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const ggml_tensor * src1 = up->src[1];
                             const ggml_tensor * ids  = up->src[2];
 
-                            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                            // the clamped SwiGLU is fused by the quantised kernel only
+                            const bool glu_clamped = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP;
+                            if (glu_clamped && !ggml_cuda_should_fuse_mul_mat_vec_q(up)) continue;
+                            if (!glu_clamped && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -7396,6 +7790,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
                                 fusion_data.glu_op = ggml_get_glu_op(glu);
+                                if (glu_clamped) memcpy(&fusion_data.glu_clamp, (const int32_t *) glu->op_params + 2, sizeof(float));
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -7654,6 +8049,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (node->op == GGML_OP_CONCAT && ggml_cuda_glm_conv_concat(*cuda_ctx, cgraph, i)) {
+                    continue;   // glm5-next conv input of a prompt batch: only the state tail is materialised
+                }
+                if (node->op == GGML_OP_ADD) {   // glm5-next decay-gate chain as one kernel
+                    const int jf = ggml_cuda_glm_gate_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
+                if (node->op == GGML_OP_CONT) {   // glm5-next indexer scoring as one kernel
+                    const int jf = ggml_cuda_idx_score_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
+                if (node->op == GGML_OP_UNARY) {   // an MoE router's tail as one kernel
+                    const int jf = ggml_cuda_moe_router_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
+                if (node->op == GGML_OP_RMS_NORM) {   // a hyper-connection mixer's pre side as one kernel
+                    const int jf = ggml_cuda_dsv4_hc_pre_fused(*cuda_ctx, cgraph, i);
+                    if (jf > i) { i = jf; continue; }
+                }
                 const bool prof_this = alpha_op_prof_on() && !use_cuda_graph && !alpha_op_prof_iter();
                 if (prof_this) alpha_op_prof_begin(cuda_ctx->stream(), node);
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
@@ -7662,6 +8076,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_dre_node_done(*cuda_ctx, node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -7778,6 +8193,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ai4_collect_routers(cgraph);   // ai4: router weights for the prompt-lookahead predictor
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -8563,6 +8979,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
             return op->src[0] && op->src[0]->type == GGML_TYPE_F32; // CUDA kernels for F32
+        case GGML_OP_DSV4_IDX_SCORE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->src[0]->ne[0] <= 256;
         case GGML_OP_HC_COMBINE:
         case GGML_OP_HC_MIX_TAIL:
             return true;
@@ -8612,6 +9031,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     return ggml_is_contiguous_1(op->src[0]);
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    return op->src[1] != nullptr && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                 default:
                     return false;
             }
@@ -9162,8 +9583,70 @@ struct cuda_expert_persist_cache {
         size_t   offset;          // byte offset in pinned_stage
         size_t   size;            // expert_size
         uint64_t last_access;     // monotonic counter for LRU
+        size_t   head = 0;        // ai4: bytes from the slot start to the expert (O_DIRECT alignment)
+        const void * src = nullptr;   // ai4: owning expert tensor (ALPHA_AI4_STAGE_FRAC)
+        int64_t  eid = -1;        // ai4: expert id (ALPHA_AI4_STAGE_CONTIG)
     };
     std::unordered_map<uint64_t, staged_entry> staged_entries;  // key = hash(cpu_src, eid)
+
+    // ai4: ALPHA_AI4_STAGE_FRAC = f (0 < f < 1): at most ceil(f * n_expert) experts of any one tensor in this tier, so
+    // every layer keeps the same resident share (see patch notes); 0 = off
+    std::unordered_map<const void *, int64_t> nexp_of;     // expert tensor -> n_expert (set by the copy hook)
+    std::unordered_map<const void *, int>     stage_cnt;   // expert tensor -> staged experts
+    static double stage_frac() {
+        static const double v = [] { const char * e = getenv("ALPHA_AI4_STAGE_FRAC"); return e ? atof(e) : 0.0; }();
+        return v;
+    }
+    // experts of `src` that may still be staged (INT_MAX without a cap)
+    int stage_room(const void * src) {
+        const double f = stage_frac();
+        if (f <= 0.0 || f >= 1.0 || !src) return INT_MAX;
+        auto it = nexp_of.find(src);
+        if (it == nexp_of.end()) return INT_MAX;
+        const int cap = (int) std::ceil(f * (double) it->second);
+        auto c = stage_cnt.find(src);
+        return cap - (c == stage_cnt.end() ? 0 : c->second);
+    }
+    // ai4: ALPHA_AI4_STAGE_CONTIG: contiguous block [0, n_c) per tensor + a churn quota (see patch notes)
+    static bool stage_contig_on() {
+        static const bool v = [] { const char * e = getenv("ALPHA_AI4_STAGE_CONTIG"); return e && atoi(e) != 0; }();
+        return v;
+    }
+    static double stage_churn() {
+        static const double v = [] { const char * e = getenv("ALPHA_AI4_STAGE_CHURN"); return e ? atof(e) : 0.04; }();
+        return v;
+    }
+    std::unordered_map<const void *, int> churn_cnt;   // expert tensor -> staged entries outside its block
+    // n_c of tensor `src`, or -1 when the contiguous tier is off / unknown
+    int contig_n(const void * src) {
+        const double f = stage_frac();
+        if (!stage_contig_on() || f <= 0.0 || f >= 1.0 || !src) return -1;
+        auto it = nexp_of.find(src);
+        if (it == nexp_of.end()) return -1;
+        return std::max(0, (int) std::floor((f - stage_churn()) * (double) it->second));
+    }
+    bool is_churn(const staged_entry & e) {
+        const int nc = contig_n(e.src);
+        return nc >= 0 && e.eid >= nc;
+    }
+    int churn_room(const void * src) {
+        auto it = nexp_of.find(src);
+        const int quota = (int) std::ceil(stage_frac() * (double) it->second) - contig_n(src);
+        auto c = churn_cnt.find(src);
+        return quota - (c == churn_cnt.end() ? 0 : c->second);
+    }
+    void stage_add(uint64_t key, const staged_entry & e) {
+        auto it = staged_entries.find(key);
+        if (it != staged_entries.end() && it->second.src) {
+            stage_cnt[it->second.src]--;
+            if (is_churn(it->second)) churn_cnt[it->second.src]--;
+        }
+        staged_entries[key] = e;
+        if (e.src) {
+            stage_cnt[e.src]++;
+            if (is_churn(e)) churn_cnt[e.src]++;
+        }
+    }
     uint64_t staged_access_ctr = 0;
     bool     staging_enabled   = false;
 
@@ -9241,26 +9724,23 @@ struct cuda_expert_persist_cache {
 #endif
     }
 
-    // Stage an expert: copy from mmap -> pinned buffer. Returns pinned address or nullptr.
-    // Slots never change size (same-size reuse only): shrinking pinned_stage_used on the linear
-    // allocator would make new appends overwrite live entries at the tail.
-    void * stage_expert(const void * mmap_src, size_t offset, size_t expert_size, uint64_t key) {
-        if (!staging_enabled) return nullptr;
-        stage_calls++;
-
-        // Already staged -> bump LRU, return pinned address
-        auto it = staged_entries.find(key);
-        if (it != staged_entries.end()) {
-            it->second.last_access = ++staged_access_ctr;
-            return (char *)pinned_stage + it->second.offset;
-        }
-
+    // ai4: a staging slot for one expert of `expert_size` bytes: a fresh one from the linear tail, else the LRU
+    // same-size entry with no in-flight H2D (subject to the churn limiter). SIZE_MAX when none.
+    size_t reserve_slot(size_t expert_size, const void * owner = nullptr, int64_t eid = -1) {
         size_t slot = SIZE_MAX;
+        // ai4: ALPHA_AI4_STAGE_CONTIG: a block id always has room (ids are unique); an id outside the block is capped by
+        // its tensor's churn quota; only churn entries are ever replaced
+        const int  nc     = eid >= 0 ? contig_n(owner) : -1;
+        const bool contig = nc >= 0;
+        const bool capped = contig ? (eid >= nc && churn_room(owner) <= 0)
+                                   : stage_room(owner) <= 0;   // ai4: at its cap: replace one of its own entries
 
         // 1) Carve a fresh slot from the linear tail
-        if (pinned_stage_used + expert_size <= pinned_stage_size) {
+        const size_t slot_bytes = ai4_direct_on() ? ai4_direct_slot_bytes(expert_size) : expert_size;
+        if (ai4_direct_on()) pinned_stage_used = ((pinned_stage_used + 4095) / 4096) * 4096;
+        if (!capped && pinned_stage_used + slot_bytes <= pinned_stage_size) {
             slot = pinned_stage_used;
-            pinned_stage_used += expert_size;
+            pinned_stage_used += slot_bytes;
         }
 
         // 2) Full: evict the LRU same-size entry, but only one that provably has
@@ -9275,7 +9755,7 @@ struct cuda_expert_persist_cache {
                 int v = e ? atoi(e) : 8;
                 return (int64_t)(v < 1 ? 1 : (v > 64 ? 64 : v));
             }();
-            if (stage_evictions * evict_div > stage_calls) return nullptr;
+            if (stage_evictions * evict_div > stage_calls) return SIZE_MAX;
 
             // Advance the safe floor: if the last recorded DMA batch has completed,
             // every staged read issued before that record has executed.
@@ -9287,6 +9767,8 @@ struct cuda_expert_persist_cache {
             uint64_t oldest_key    = 0;
             bool     found         = false;
             for (auto & [k, e] : staged_entries) {
+                if (capped && e.src != owner) continue;            // ai4: a capped tensor replaces its own entry
+                if (contig && !is_churn(e)) continue;              // ai4: contiguous-block entries stay
                 if (e.size != expert_size) continue;               // same-size slots only
                 if (e.last_access > staging_safe_floor) continue;  // may have in-flight H2D
                 if (e.last_access < oldest_access) {
@@ -9295,23 +9777,196 @@ struct cuda_expert_persist_cache {
                     found         = true;
                 }
             }
-            if (!found) return nullptr;  // caller falls back to direct mmap H2D
+            if (!found) return SIZE_MAX;
 
             slot = staged_entries[oldest_key].offset;
+            if (staged_entries[oldest_key].src) {
+                stage_cnt[staged_entries[oldest_key].src]--;
+                if (is_churn(staged_entries[oldest_key])) churn_cnt[staged_entries[oldest_key].src]--;
+            }
             staged_entries.erase(oldest_key);
             stage_evictions++;
         }
+        return slot;
+    }
 
+    // ai4: parallel staging fill for `n` experts of one tensor (see the miss loop): slots reserved here, O_DIRECT reads
+    // on the I/O pool, entries published afterwards. Experts already staged, or with no free slot, are skipped.
+    void stage_prefetch(const void * mmap_src, const int64_t * eids, int n, size_t expert_size) {
+        static const bool on = [] { const char * e = getenv("ALPHA_AI4_PREFETCH"); return !e || atoi(e) != 0; }();
+        if (!on || !staging_enabled || !ai4_direct_on() || n < 2) return;
+        struct job { size_t slot; const char * src; uint64_t key; size_t head; };
+        std::vector<job> jobs;
+        jobs.reserve(n);
+        for (int i = 0; i < n; i++) {
+            const uint64_t key = cuda_expert_persist_cache::key(mmap_src, eids[i]);
+            if (staged_entries.count(key)) continue;
+            bool dup = false;
+            for (const auto & j : jobs) if (j.key == key) { dup = true; break; }
+            if (dup) continue;
+            const size_t slot = reserve_slot(expert_size, mmap_src, eids[i]);
+            if (slot == SIZE_MAX) break;
+            jobs.push_back({ slot, (const char *) mmap_src + (size_t) eids[i] * expert_size, key, 0 });
+        }
+        if (jobs.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        char * base = (char *) pinned_stage;
+        ai4_pool().run((int) jobs.size(), [&](int i) {
+            job & j = jobs[i];
+            if (!ai4_direct_read(base + j.slot, j.src, expert_size, &j.head)) {
+                j.head = 0;
+                if (!ai4_pread_mapped(base + j.slot, j.src, expert_size)) memcpy(base + j.slot, j.src, expert_size);
+            }
+        });
+        stage_memcpy_ns += (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        for (const auto & j : jobs) {
+            stage_add(j.key, { j.slot, expert_size, ++staged_access_ctr, j.head, mmap_src,
+                               (int64_t) ((j.src - (const char *) mmap_src) / (ptrdiff_t) expert_size) });
+        }
+        stage_prefetched += (int64_t) jobs.size();
+    }
+    int64_t stage_prefetched = 0;
+
+    // ai4: transient ring (see ALPHA_AI4_RING_GB)
+    char *   ai4_ring      = nullptr;
+    size_t   ai4_ring_size = 0;
+    size_t   ai4_ring_pos  = 0;
+    bool     ai4_ring_tried = false;
+    std::unordered_map<uint64_t, const void *> ai4_ring_map;   // key -> expert bytes in the ring
+    int64_t  ai4_ring_reads = 0, ai4_ring_wraps = 0;
+    bool ai4_ring_ready() {
+        if (ai4_ring) return true;
+        if (ai4_ring_tried) return false;
+        ai4_ring_tried = true;
+        const char * e = getenv("ALPHA_AI4_RING_GB");
+        const double gb = e ? atof(e) : 6.0;
+        if (gb <= 0 || !ai4_direct_on()) return false;
+        const size_t bytes = (size_t) (gb * 1024.0 * 1024.0 * 1024.0);
+        if (cudaMallocHost((void **) &ai4_ring, bytes) != cudaSuccess) { (void) cudaGetLastError(); ai4_ring = nullptr; return false; }
+        ai4_ring_size = bytes;
+        fprintf(stderr, "[expert-cache] ai4 prompt ring: %.1f GB pinned\n", gb);
+        return true;
+    }
+    // read the not-staged experts of eids[0..n) into the ring (parallel O_DIRECT) and record them in ai4_ring_map;
+    // s1 / s2: the streams that copy out of the ring (synchronised before the ring wraps)
+    void ring_prefetch(const void * mmap_src, const int64_t * eids, int n, size_t expert_size, cudaStream_t s1, cudaStream_t s2) {
+        if (n < 1 || !ai4_ring_ready()) return;
+        const size_t sb = ai4_direct_slot_bytes(expert_size);
+        struct job { size_t slot; const char * src; uint64_t key; size_t head; };
+        std::vector<job> jobs;
+        jobs.reserve(n);
+        size_t lo0 = SIZE_MAX, hi0 = 0, lo1 = SIZE_MAX, hi1 = 0;   // ring ranges claimed by this call
+        bool wrapped = false;
+        std::vector<job> sjobs;   // ai4: free staging slots first: these become staged (RAM-tier) entries
+        for (int i = 0; i < n; i++) {
+            const uint64_t key = cuda_expert_persist_cache::key(mmap_src, eids[i]);
+            if (staged_entries.count(key) || ai4_ring_map.count(key)) continue;
+            const int nc_r = contig_n(mmap_src);
+            if (staging_enabled && (nc_r >= 0 ? eids[i] < nc_r : (int) sjobs.size() < stage_room(mmap_src))) {
+                pinned_stage_used = ((pinned_stage_used + 4095) / 4096) * 4096;
+                if (pinned_stage_used + sb <= pinned_stage_size) {
+                    bool dup = false;
+                    for (const auto & j : sjobs) if (j.key == key) { dup = true; break; }
+                    if (dup) continue;
+                    sjobs.push_back({ pinned_stage_used, (const char *) mmap_src + (size_t) eids[i] * expert_size, key, 0 });
+                    pinned_stage_used += sb;
+                    continue;
+                }
+            }
+            if (ai4_ring_pos + sb > ai4_ring_size) {
+                if (wrapped || sb > ai4_ring_size) break;     // never lap this call's own reads
+                const auto tw = std::chrono::steady_clock::now();
+                if (s1) CUDA_CHECK(cudaStreamSynchronize(s1));
+                if (s2 && s2 != s1) CUDA_CHECK(cudaStreamSynchronize(s2));
+                ai4_pf_stats.sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+                ai4_pf_stats.wraps++;
+                ai4_ring_pos = 0; wrapped = true; ai4_ring_wraps++;
+            }
+            const size_t slot = ai4_ring_pos;
+            if (wrapped && lo0 != SIZE_MAX && slot + sb > lo0) break;   // would reach this call's pre-wrap slots
+            ai4_ring_pos += sb;
+            if (!wrapped) { lo0 = std::min(lo0, slot); hi0 = std::max(hi0, slot + sb); }
+            else          { lo1 = std::min(lo1, slot); hi1 = std::max(hi1, slot + sb); }
+            jobs.push_back({ slot, (const char *) mmap_src + (size_t) eids[i] * expert_size, key, 0 });
+        }
+        const auto tr0 = std::chrono::steady_clock::now();
+        ai4_pf_stats.stage_fills += (int64_t) sjobs.size();
+        ai4_pf_stats.ring_reads  += (int64_t) jobs.size();
+        ai4_pf_stats.read_gb     += (double) (sjobs.size() + jobs.size()) * (double) expert_size / 1e9;
+        struct ai4_tr { std::chrono::steady_clock::time_point t; ~ai4_tr() {
+            ai4_pf_stats.read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); } } ai4_tr_ = { tr0 };
+        if (!sjobs.empty()) {
+            char * sbase = (char *) pinned_stage;
+            ai4_pool().run((int) sjobs.size(), [&](int i) {
+                job & j = sjobs[i];
+                if (!ai4_direct_read(sbase + j.slot, j.src, expert_size, &j.head)) {
+                    j.head = 0;
+                    if (!ai4_pread_mapped(sbase + j.slot, j.src, expert_size)) memcpy(sbase + j.slot, j.src, expert_size);
+                }
+            });
+            for (const auto & j : sjobs) {
+                stage_add(j.key, { j.slot, expert_size, ++staged_access_ctr, j.head, mmap_src,
+                                   (int64_t) ((j.src - (const char *) mmap_src) / (ptrdiff_t) expert_size) });
+            }
+            stage_prefetched += (int64_t) sjobs.size();
+        }
+        if (jobs.empty()) return;
+        // drop older ring copies that this call's reads overwrite
+        for (auto it = ai4_ring_map.begin(); it != ai4_ring_map.end(); ) {
+            const size_t off = (size_t) ((const char *) it->second - ai4_ring);
+            const bool hit0 = lo0 != SIZE_MAX && off + 1 > lo0 && off < hi0;
+            const bool hit1 = lo1 != SIZE_MAX && off + 1 > lo1 && off < hi1;
+            if (hit0 || hit1) it = ai4_ring_map.erase(it); else ++it;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        ai4_pool().run((int) jobs.size(), [&](int i) {
+            job & j = jobs[i];
+            if (!ai4_direct_read(ai4_ring + j.slot, j.src, expert_size, &j.head)) {
+                j.head = 0;
+                if (!ai4_pread_mapped(ai4_ring + j.slot, j.src, expert_size)) memcpy(ai4_ring + j.slot, j.src, expert_size);
+            }
+        });
+        stage_memcpy_ns += (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        for (const auto & j : jobs) ai4_ring_map[j.key] = ai4_ring + j.slot + j.head;
+        ai4_ring_reads += (int64_t) jobs.size();
+    }
+
+    // Stage an expert: copy from mmap -> pinned buffer. Returns pinned address or nullptr.
+    // Slots never change size (same-size reuse only): shrinking pinned_stage_used on the linear
+    // allocator would make new appends overwrite live entries at the tail.
+    void * stage_expert(const void * mmap_src, size_t offset, size_t expert_size, uint64_t key) {
+        if (!staging_enabled) return nullptr;
+        stage_calls++;
+
+        // Already staged -> bump LRU, return pinned address
+        auto it = staged_entries.find(key);
+        if (it != staged_entries.end()) {
+            it->second.last_access = ++staged_access_ctr;
+            return (char *)pinned_stage + it->second.offset + it->second.head;
+        }
+
+        size_t slot = reserve_slot(expert_size, mmap_src, (int64_t) (offset / expert_size));
+        if (slot == SIZE_MAX) return nullptr;  // caller falls back to direct mmap H2D
+
+        size_t ai4_head = 0;
         // Timed: this memcpy is on the flush's critical path, and no GPU-side change (gather kernel,
         // batching) can remove it, so its cost shows whether raising pin coverage would help.
         {
             const auto t0 = std::chrono::steady_clock::now();
-            memcpy((char *)pinned_stage + slot, (const char *)mmap_src + offset, expert_size);
+            ai4_head = 0;
+            if (!(ai4_direct_on() && ai4_direct_read((char *)pinned_stage + slot, (const char *)mmap_src + offset, expert_size, &ai4_head))) {
+                ai4_head = 0;
+                if (!ai4_pread_mapped((char *)pinned_stage + slot, (const char *)mmap_src + offset, expert_size)) {
+                    memcpy((char *)pinned_stage + slot, (const char *)mmap_src + offset, expert_size);
+                }
+            }
             stage_memcpy_ns += (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count();
         }
-        staged_entries[key] = {slot, expert_size, ++staged_access_ctr};
-        return (char *)pinned_stage + slot;
+        stage_add(key, {slot, expert_size, ++staged_access_ctr, ai4_head, mmap_src, (int64_t) (offset / expert_size)});
+        return (char *)pinned_stage + slot + ai4_head;
     }
 
     // --- Hybrid CPU/GPU miss tracking ---
@@ -9845,6 +10500,20 @@ struct cuda_expert_persist_cache {
         it->second.last_access = ++lru_counter;
         if (it->second.hits < 0xffffffffu) it->second.hits++;   // freq input for eviction scoring
         return (char *)pool + it->second.offset;
+    }
+
+    // ai4: take `bytes` off the top of the entry space for good (entries there are dropped); nullptr if the pool
+    // would keep less than 1 GB. Call only between passes' kernels (the scheduler has synchronised the GPU).
+    char * carve_top(size_t bytes) {
+        bytes = (bytes + 4095) & ~(size_t) 4095;
+        if (bytes + ((size_t) 1 << 30) > pool_size) return nullptr;
+        const size_t new_end = pool_size - bytes;
+        for (auto it = entries.begin(); it != entries.end(); ) {
+            if (it->second.offset + it->second.size > new_end) it = entries.erase(it); else ++it;
+        }
+        pool_size = new_end;
+        if (used > new_end) used = new_end;
+        return (char *) pool + new_end;
     }
 
     void * insert(uint64_t k, size_t size, size_t type_align = 0) {
@@ -10575,6 +11244,257 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_set_group(const void * ids_tenso
     g_pcache_group_isnew = true;
 }
 
+// ai4: sibling copy-ahead (see ALPHA_AI4_SIB above the patch notes in the window logs)
+struct ai4_sib_buf { char * p = nullptr; size_t cap = 0; const void * src = nullptr; cudaEvent_t ev = nullptr; bool ready = false; };
+static ai4_sib_buf ai4_sib[2];
+static bool         ai4_sib_failed = false;
+static bool         ai4_sib_lent   = false;   // the side buffers' region is carved out of the pool right now
+static size_t       ai4_sib_bytes  = 0;       // its size (2 buffers)
+static const void * ai4_sib_cur  = nullptr;   // sibling whose copy calls are being skipped (its flush comes next)
+static void *       ai4_sib_redir = nullptr;  // buffer the next redirect call hands the scheduler
+static const void * ai4_last_src = nullptr;   // the tensor the next flush belongs to
+static std::unordered_map<const void *, int64_t> ai4_nexp;   // expert tensor -> n_expert
+static int64_t ai4_sib_issued = 0, ai4_sib_used = 0, ai4_sib_fallback = 0, ai4_sib_layers = 0;
+static int64_t ai4_sib_src_pool = 0, ai4_sib_src_stage = 0, ai4_sib_src_la = 0, ai4_sib_src_ring = 0;   // per pass ([ai4-pass])
+static double  ai4_sib_read_s = 0, ai4_sib_read_gb = 0;
+// ai4: gate copy-ahead (ALPHA_AI4_XL, see ai4_xl_issue)
+static char *       ai4_xl_buf[2] = { nullptr, nullptr };
+static const void * ai4_xl_src[2] = { nullptr, nullptr };   // gate tensor whose experts buffer b holds
+static std::vector<uint8_t> ai4_xl_have[2];
+static int64_t ai4_xl_copied = 0, ai4_xl_hits = 0;
+static bool ai4_xl_on() {
+    static const bool v = [] { const char * e = getenv("ALPHA_AI4_XL"); return !e || atoi(e) != 0; }();
+    return v;
+}
+static int ai4_xl_min() {
+    static const int v = [] { const char * e = getenv("ALPHA_AI4_XL_MIN"); return e ? atoi(e) : 4096; }();
+    return v;
+}
+static size_t ai4_sib_need = 0;   // one side buffer (the largest expert tensor + MMQ tail)
+static int    ai4_sib_nbuf = 0;   // buffers in the current loan (2 sibling, + 2 gate)
+static double  ai4_sib_gb = 0;
+static bool ai4_sib_on() {
+    static const bool v = [] { const char * e = getenv("ALPHA_AI4_SIB"); return !e || atoi(e) != 0; }();
+    return v;
+}
+static int ai4_sib_min() {
+    static const int v = [] { const char * e = getenv("ALPHA_AI4_SIB_MIN"); return e ? atoi(e) : 1024; }();
+    return v;
+}
+// at the end of the flush of a layer's first expert tensor: copy the routed experts of its siblings into side buffers
+static void ai4_sib_issue(cudaStream_t h2d, cudaStream_t compute) {
+    if (!ai4_sib_on() || ai4_sib_failed || g_pcache_batch_ntokens < ai4_sib_min() || !g_expert_pcache.dma_stream) return;
+    const void * gk = g_pcache_group_key;
+    if (!gk || ai4_last_src != gk) return;
+    auto git = g_pcache_groups.find(gk);
+    if (git == g_pcache_groups.end() || !git->second.complete || git->second.n_members < 2) return;
+    const pcache_layer_group & grp = git->second;
+    {   // a loan of the other size (2 vs 4 buffers) goes back first; nothing reads the buffers between passes
+        const int want = ai4_xl_on() && g_pcache_batch_ntokens >= ai4_xl_min() ? 4 : 2;
+        if (ai4_sib_lent && want != ai4_sib_nbuf && !ai4_sib[0].ready && !ai4_sib[1].ready && !ai4_sib_redir) {
+            g_expert_pcache.pool_size += ai4_sib_bytes;
+            ai4_sib_lent = false;
+            ai4_xl_src[0] = ai4_xl_src[1] = nullptr;
+            ai4_xl_buf[0] = ai4_xl_buf[1] = nullptr;
+        }
+    }
+    if (!ai4_sib_lent) {
+        if (ai4_sib_need == 0) {
+            // one buffer = the largest expert tensor of any learned layer (+ the 512-byte MMQ tail)
+            size_t need = 0;
+            for (const auto & kv : g_pcache_groups) {
+                const pcache_layer_group & g = kv.second;
+                for (int m = 0; m < g.n_members; m++) {
+                    auto it = ai4_nexp.find(g.members[m]);
+                    if (it != ai4_nexp.end()) need = std::max(need, (size_t) it->second * g.expert_size[m]);
+                }
+            }
+            ai4_sib_need = ((need + 512 + 4095) / 4096) * 4096;
+            for (auto & b : ai4_sib) CUDA_CHECK(cudaEventCreateWithFlags(&b.ev, cudaEventDisableTiming));
+        }
+        const size_t need = ai4_sib_need;
+        // the pool lends 2 sibling buffers, + 2 gate buffers for big prompt batches (ALPHA_AI4_XL_MIN)
+        const int nbuf = ai4_xl_on() && g_pcache_batch_ntokens >= ai4_xl_min() ? 4 : 2;
+        char * base = need ? g_expert_pcache.carve_top((size_t) nbuf * need) : nullptr;
+        if (!base) { ai4_sib_failed = true; fprintf(stderr, "[ai4-sib] off: no room for %d x %.2f GB\n", nbuf, need / 1e9); return; }
+        for (int k = 0; k < 2; k++) {
+            ai4_sib[k].p = base + (size_t) k * need; ai4_sib[k].cap = need;
+        }
+        ai4_xl_buf[0] = nbuf == 4 ? base + 2 * need : nullptr;
+        ai4_xl_buf[1] = nbuf == 4 ? base + 3 * need : nullptr;
+        ai4_sib_bytes = (size_t) nbuf * need;
+        ai4_sib_nbuf  = nbuf;
+        ai4_sib_lent  = true;
+        static int shown = 0;
+        if (shown++ < 4) {
+            fprintf(stderr, "[ai4-sib] %d side buffers of %.2f GB lent by the expert pool for a %d-token prompt (pool now %.0f MB)\n",
+                    nbuf, need / 1e9, g_pcache_batch_ntokens, g_expert_pcache.pool_size / 1048576.0);
+        }
+    }
+    // routed experts of this layer (all members share the routing)
+    const int ne0 = g_pcache_ids_ne0, ne1 = g_pcache_ids_ne1;
+    if (ne0 <= 0 || ne1 < ai4_sib_min()) return;
+    std::vector<uint8_t> used(1024, 0);
+    for (int t = 0; t < ne1; t++) {
+        for (int j = 0; j < ne0; j++) {
+            const size_t idx = (size_t) t * g_pcache_ids_s1 + (size_t) j * g_pcache_ids_s0;
+            if (idx >= g_pcache_batch_ids.size()) break;
+            const int32_t e = g_pcache_batch_ids[idx];
+            if (e >= 0 && e < 1024) used[e] = 1;
+        }
+    }
+    for (auto & b : ai4_sib) b.ready = false;
+    int k = 0;
+    for (int m = 0; m < grp.n_members && k < 2; m++) {
+        const void * src = grp.members[m];
+        if (!src || src == gk || grp.expert_size[m] == 0) continue;
+        if (g_expert_pcache.host_registered.count(src)) continue;
+        auto nit = ai4_nexp.find(src);
+        if (nit == ai4_nexp.end() || nit->second > 1024) continue;
+        const int64_t nexp = nit->second;
+        const size_t  esz  = grp.expert_size[m];
+        ai4_sib_buf & b = ai4_sib[k];
+        if ((size_t) nexp * esz + 512 > b.cap) continue;
+        // experts in neither VRAM nor RAM: read them now (parallel O_DIRECT into the ring / free staging)
+        std::vector<int64_t> miss;
+        for (int64_t e = 0; e < nexp; e++) {
+            if (!used[e]) continue;
+            const uint64_t key = cuda_expert_persist_cache::key(src, e);
+            if (g_expert_pcache.entries.count(key) || g_expert_pcache.staged_entries.count(key) ||
+                g_expert_pcache.ai4_ring_map.count(key)) continue;
+            miss.push_back(e);
+        }
+        if (!miss.empty()) {
+            const auto tr = std::chrono::steady_clock::now();
+            g_expert_pcache.ring_prefetch(src, miss.data(), (int) miss.size(), esz, h2d, compute);
+            ai4_sib_read_s  += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count();
+            ai4_sib_read_gb += (double) miss.size() * (double) esz / 1e9;
+        }
+        // unused experts read as zero, like the scheduler's staging tensor; then the routed ones
+        int64_t z0 = -1;
+        auto zero_run = [&](int64_t e_end) {
+            if (z0 >= 0) CUDA_CHECK(cudaMemsetAsync(b.p + (size_t) z0 * esz, 0, (size_t) (e_end - z0) * esz, h2d));
+            z0 = -1;
+        };
+        for (int64_t e = 0; e < nexp; e++) {
+            if (!used[e]) { if (z0 < 0) z0 = e; continue; }
+            zero_run(e);
+            const uint64_t key = cuda_expert_persist_cache::key(src, e);
+            const void * from = nullptr;
+            auto pit = g_expert_pcache.entries.find(key);
+            if (pit != g_expert_pcache.entries.end()) {
+                pit->second.last_access = ++g_expert_pcache.lru_counter;
+                from = (const char *) g_expert_pcache.pool + pit->second.offset;
+                ai4_sib_src_pool++;
+            } else {
+                auto sit = g_expert_pcache.staged_entries.find(key);
+                if (sit != g_expert_pcache.staged_entries.end()) {
+                    sit->second.last_access = ++g_expert_pcache.staged_access_ctr;
+                    from = (const char *) g_expert_pcache.pinned_stage + sit->second.offset + sit->second.head;
+                    ai4_sib_src_stage++;
+                } else {
+                    auto rit = g_expert_pcache.ai4_ring_map.find(key);
+                    if (rit != g_expert_pcache.ai4_ring_map.end()) {
+                        from = rit->second;
+                        bool in_la = false;
+                        for (int lb = 0; lb < ai4_la.nb && ai4_la.ok; lb++) {
+                            const char * q = (const char *) from;
+                            if (q >= ai4_la.buf[lb] && q < ai4_la.buf[lb] + ai4_la.buf_size) in_la = true;
+                        }
+                        (in_la ? ai4_sib_src_la : ai4_sib_src_ring)++;
+                    } else {
+                        from = (const char *) src + (size_t) e * esz;   // pageable mapping: a synchronous copy
+                        ai4_sib_fallback++;
+                    }
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(b.p + (size_t) e * esz, from, esz, cudaMemcpyDefault, h2d));
+            ai4_sib_gb += (double) esz / 1e9;
+        }
+        zero_run(nexp);
+        CUDA_CHECK(cudaMemsetAsync(b.p + (size_t) nexp * esz, 0, 512, h2d));
+        CUDA_CHECK(cudaEventRecord(b.ev, h2d));
+        b.src = src; b.ready = true;
+        ai4_sib_issued++;
+        k++;
+    }
+    if (k > 0 && ++ai4_sib_layers % 40 == 0) {
+        fprintf(stderr, "[ai4-sib] %lld layers: %lld side copies issued, %lld used, %.2f GB, %lld pageable fallbacks; "
+                        "gate copy-ahead %lld experts, %lld taken\n",
+                (long long) ai4_sib_layers, (long long) ai4_sib_issued, (long long) ai4_sib_used, ai4_sib_gb,
+                (long long) ai4_sib_fallback, (long long) ai4_xl_copied, (long long) ai4_xl_hits);
+        ai4_xl_copied = ai4_xl_hits = 0;
+        ai4_sib_gb = 0; ai4_sib_issued = ai4_sib_used = ai4_sib_fallback = 0;
+    }
+}
+
+// at the last sibling's flush of layer L: layer L+1's predicted gate experts that are already in RAM -> gate buffer
+static void ai4_xl_issue(cudaStream_t h2d) {
+    if (!ai4_xl_on() || !ai4_xl_buf[0] || !ai4_sib_lent || !h2d) return;
+    const void * gk = g_pcache_group_key;
+    auto lit = gk ? ai4_layer_idx.find(gk) : ai4_layer_idx.end();
+    if (lit == ai4_layer_idx.end()) return;
+    const int L = lit->second, nl = (int) ai4_layer_order.size();
+    const int Ln = L + 1;
+    if (Ln >= nl || Ln >= 256 || ai4_pred_layer != Ln) return;
+    const void * gsrc = ai4_layer_order[Ln];
+    auto git = g_pcache_groups.find(gsrc);
+    if (git == g_pcache_groups.end() || !git->second.complete || git->second.members[0] != gsrc) return;
+    const size_t esz = git->second.expert_size[0];
+    auto nit = ai4_nexp.find(gsrc);
+    if (esz == 0 || nit == ai4_nexp.end() || nit->second > 512) return;
+    const int64_t nexp = nit->second;
+    if ((size_t) nexp * esz + 512 > ai4_sib[0].cap) return;
+    const int b = Ln & 1;
+    // a finished lookahead read of layer Ln (not waited for: the down matmul is not launched yet)
+    std::unordered_map<uint64_t, const void *> la;
+    {
+        std::lock_guard<std::mutex> lk(ai4_la.m);
+        for (int bi = 0; bi < ai4_la.nb && ai4_la.ok; bi++) {
+            const ai4_la_req & r = ai4_la.req[bi];
+            if (r.layer == Ln && r.done) {
+                for (const auto & kv : r.out) la.emplace(kv.first, kv.second);
+            }
+        }
+    }
+    ai4_xl_have[b].assign((size_t) nexp, 0);
+    ai4_xl_src[b] = nullptr;
+    int64_t n = 0;
+    for (int64_t e = 0; e < nexp; e++) {
+        if (!(ai4_pred_bits[Ln][e >> 5] & (1u << (e & 31)))) continue;
+        const uint64_t key = cuda_expert_persist_cache::key(gsrc, e);
+        if (g_expert_pcache.entries.count(key)) continue;   // pool-resident: the gate flush copies it on the device anyway
+        const void * from = nullptr;
+        auto sit = g_expert_pcache.staged_entries.find(key);
+        if (sit != g_expert_pcache.staged_entries.end()) {
+            sit->second.last_access = ++g_expert_pcache.staged_access_ctr;
+            from = (const char *) g_expert_pcache.pinned_stage + sit->second.offset + sit->second.head;
+        } else {
+            auto l2 = la.find(key);
+            if (l2 != la.end()) {
+                from = l2->second;
+            } else {
+                auto rit = g_expert_pcache.ai4_ring_map.find(key);
+                if (rit != g_expert_pcache.ai4_ring_map.end()) from = rit->second;
+            }
+        }
+        if (!from) continue;
+        CUDA_CHECK(cudaMemcpyAsync(ai4_xl_buf[b] + (size_t) e * esz, from, esz, cudaMemcpyHostToDevice, h2d));
+        ai4_xl_have[b][(size_t) e] = 1;
+        n++;
+    }
+    if (n > 0) ai4_xl_src[b] = gsrc;
+    ai4_xl_copied += n;
+}
+
+// the scheduler's redirect hook (registered by the server): a sibling's staging tensor -> its side buffer
+GGML_BACKEND_API_C void * ggml_cuda_ai4_sib_redirect(void * backend_ptr, void * gpu_dst) {
+    (void) backend_ptr; (void) gpu_dst;
+    void * r = ai4_sib_redir;
+    ai4_sib_redir = nullptr;
+    return r;
+}
+
 GGML_BACKEND_API_C bool ggml_cuda_expert_pcache_copy(
         void * backend_ptr,      // ggml_backend_t (for stream)
         void * gpu_dst,          // input_cpy->data  (GPU)
@@ -10649,6 +11569,23 @@ GGML_BACKEND_API_C bool ggml_cuda_expert_pcache_copy(
         g_pcache_cpu_misses.clear();
         g_pcache_tensor_build.clear();
         g_pcache_batch_flushed = false;
+    }
+
+    // ai4: sibling copy-ahead (ai4_sib_issue): this tensor's routed experts are already on their way to a side buffer
+    if (cpu_src != ai4_last_src) {
+        ai4_last_src = cpu_src;
+        if (n_expert > 0) { ai4_nexp[cpu_src] = n_expert; g_expert_pcache.nexp_of[cpu_src] = n_expert; }
+    }
+    if (ai4_sib_lent && g_pcache_batch_ntokens == 1 && !ai4_sib[0].ready && !ai4_sib[1].ready && !ai4_sib_redir) {
+        g_expert_pcache.pool_size += ai4_sib_bytes;
+        ai4_sib_lent = false;
+        ai4_xl_src[0] = ai4_xl_src[1] = nullptr;   // the pool may write into the gate buffers now
+        ai4_xl_buf[0] = ai4_xl_buf[1] = nullptr;
+    }
+    if (ai4_sib_on() && g_pcache_batch_ntokens >= ai4_sib_min()) {
+        for (const auto & b : ai4_sib) {
+            if (b.ready && b.src == cpu_src) { ai4_sib_cur = cpu_src; return true; }
+        }
     }
 
     // Zero the full input_cpy expert region once per tensor-eval before its experts are written (see
@@ -11135,10 +12072,71 @@ GGML_BACKEND_API_C bool ggml_cuda_expert_pcache_copy(
 //
 // When misses exist: splits each tensor's misses into GPU-half (H2D now) and CPU-half
 // (computed by CPU thread in parallel with graph execution). Only waits for GPU-half DMA.
+// ai4: x-hook for prompt batches (registered by the server): predict layer L+1's experts from layer L's MoE input
+GGML_BACKEND_API_C void ggml_cuda_ai4_predict_x(void * backend_ptr, const struct ggml_tensor * x, const void * weight,
+                                                const int32_t * ids, int ne0, int ne1, int s0, int s1) {
+    (void) weight; (void) ids; (void) ne0; (void) s0; (void) s1;
+    if (!ai4_predict_on() || !x || ne1 < 256) return;
+    const char * dash = strrchr(x->name, '-');
+    int il = -1;
+    if (dash) { il = atoi(dash + 1); }
+    if (il < 0 || il + 1 >= 256) return;
+    const ggml_tensor * w = ai4_router_w[il + 1];
+    const ggml_tensor * b = ai4_router_b[il + 1];
+    if (!w || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != w->ne[0]) return;
+    ai4_pred_calls++;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_ptr)->context;
+    cudaStream_t st = ctx->stream();
+    const int64_t Kd = x->ne[0], T = ggml_nrows(x), E = w->ne[1];
+    static float * d_logits = nullptr; static size_t d_logits_n = 0;
+    static unsigned int * d_bits = nullptr; static unsigned int * h_bits = nullptr;
+    if ((size_t) (E * T) > d_logits_n) {
+        if (d_logits) CUDA_CHECK(cudaFree(d_logits));
+        d_logits_n = (size_t) (E * T);
+        CUDA_CHECK(cudaMalloc(&d_logits, d_logits_n * sizeof(float)));
+    }
+    if (!d_bits) { CUDA_CHECK(cudaMalloc(&d_bits, 16 * sizeof(unsigned int))); CUDA_CHECK(cudaMallocHost(&h_bits, 16 * sizeof(unsigned int))); }
+    cublasHandle_t h = ctx->cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(h, st));
+    const float one = 1.0f, zero = 0.0f;
+    // logits[T][E] = x[T][Kd] * w[E][Kd]^T   (column-major: C(E x T) = W^T(E x Kd) * X(Kd x T))
+    CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, (int) T, (int) Kd, &one,
+                             (const float *) w->data, (int) Kd, (const float *) x->data, (int) Kd, &zero, d_logits, (int) E));
+    CUDA_CHECK(cudaMemsetAsync(d_bits, 0, 16 * sizeof(unsigned int), st));
+    static const int K = [] { const char * e = getenv("ALPHA_AI4_PRED_K"); return e ? std::max(1, atoi(e)) : 8; }();
+    ai4_topk_union_kernel<<<(int) T, 32, 0, st>>>(d_logits, b ? (const float *) b->data : nullptr, (int) E, (int) T, K, d_bits);
+    CUDA_CHECK(cudaMemcpyAsync(h_bits, d_bits, 16 * sizeof(unsigned int), cudaMemcpyDeviceToHost, st));
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    memcpy(ai4_pred_bits[il + 1], h_bits, sizeof(ai4_pred_bits[0]));
+    ai4_pred_layer = il + 1;
+    ai4_pred_set++;
+}
+
 GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
     ggml_backend_t backend = (ggml_backend_t)backend_ptr;
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
     cudaStream_t compute_stream = ctx->stream();
+
+    // ai4: a sibling copied ahead (ai4_sib_issue): wait for its side buffer, hand it to the redirect hook
+    if (ai4_sib_cur) {
+        for (auto & b : ai4_sib) {
+            if (b.ready && b.src == ai4_sib_cur) {
+                CUDA_CHECK(cudaStreamWaitEvent(compute_stream, b.ev, 0));
+                ai4_sib_redir = b.p;
+                b.ready = false;
+                ai4_sib_used++;
+                break;
+            }
+        }
+        ai4_sib_cur = nullptr;
+        if (!ai4_sib[0].ready && !ai4_sib[1].ready) {
+            ai4_xl_issue(g_expert_pcache.dma_stream);   // the layer's last sibling: copy the next gate ahead
+        }
+        g_pcache_last_all_hit = false;
+        g_pcache_last_offset  = { nullptr, nullptr };
+        g_pcache_batch_flushed = true;
+        return;
+    }
 
     // Sync any pending DMA from cache inserts (background warming)
     if (g_expert_pcache.dma_pending) {
@@ -11384,6 +12382,7 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
     // If no misses this token: nothing more to do (the ids trace still runs)
     if (!g_expert_pcache.token_has_misses) {
         write_ids_trace();
+        ai4_sib_issue(h2d_stream, compute_stream);
         g_pcache_batch_flushed = true;
         return;
     }
@@ -11489,6 +12488,70 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
                             g_pcache_batch_ntokens, g_pcache_ids_ne0, g_pcache_ids_ne1,
                             (int)pool_direct_mt, (int)inline_mt_ok, (int)table_ok,
                             n_misses, cpu_take);
+                }
+            }
+
+            // ai4: parallel O_DIRECT staging fill of this tensor's staged misses, and at the layer's first member the
+            // same experts of its sibling tensors that are not resident in the pool.
+            if (n_misses > 0 && !g_expert_pcache.host_registered.count(tmi.host_base) && g_expert_pcache.staging_enabled) {
+                const int n_stage = n_misses - (cpu_take > 0 ? cpu_take : 0);
+                g_expert_pcache.stage_prefetch(tmi.host_base, tmi.all_miss_ids.data(), n_stage, tmi.expert_size);
+                static const void * ai4_pf_layer = nullptr;
+                if (g_pcache_group_key && ai4_pf_layer != g_pcache_group_key) {
+                    auto git = g_pcache_groups.find(g_pcache_group_key);
+                    if (git != g_pcache_groups.end() && git->second.complete) {
+                        ai4_pf_layer = g_pcache_group_key;
+                        const pcache_layer_group & grp = git->second;
+                        for (int m = 0; m < grp.n_members; m++) {
+                            if (!grp.members[m] || grp.members[m] == tmi.host_base || grp.expert_size[m] == 0) continue;
+                            if (g_expert_pcache.host_registered.count(grp.members[m])) continue;
+                            std::vector<int64_t> sib;
+                            sib.reserve(n_stage);
+                            for (int i = 0; i < n_stage; i++) {
+                                const int64_t eid = tmi.all_miss_ids[i];
+                                if (!g_expert_pcache.entries.count(cuda_expert_persist_cache::key(grp.members[m], eid))) sib.push_back(eid);
+                            }
+                            g_expert_pcache.stage_prefetch(grp.members[m], sib.data(), (int) sib.size(), grp.expert_size[m]);
+                        }
+                    }
+                }
+            }
+            // ai4: queue all of this tensor's missed expert bytes (and, at the layer's first member, the same experts
+            // of its sibling tensors) for kernel readahead before the first copy, so the staging memcpys below find
+            // their pages in flight or resident instead of faulting them in one after another. Advisory only.
+            {
+                static const bool ai4_wn = [] { const char * e = getenv("ALPHA_AI4_WILLNEED"); return !e || atoi(e) != 0; }();
+                static const void * ai4_wn_layer = nullptr;
+                if (ai4_wn && n_misses > 0 && !g_expert_pcache.host_registered.count(tmi.host_base)) {
+#ifdef __linux__
+                    auto wn = [](const void * base, size_t off, size_t sz) {
+                        const uintptr_t a = (uintptr_t) base + off, al = a & ~(uintptr_t) 4095;
+                        posix_madvise((void *) al, sz + (a - al), POSIX_MADV_WILLNEED);
+                    };
+                    for (int i = 0; i < n_misses; i++) {
+                        const int64_t eid = tmi.all_miss_ids[i];
+                        if (g_expert_pcache.staging_enabled &&
+                            g_expert_pcache.staged_entries.count(cuda_expert_persist_cache::key(tmi.host_base, eid))) {
+                            continue;   // already in the pinned RAM tier
+                        }
+                        wn(tmi.host_base, (size_t) eid * tmi.expert_size, tmi.expert_size);
+                    }
+                    if (g_pcache_group_key && ai4_wn_layer != g_pcache_group_key) {
+                        auto git = g_pcache_groups.find(g_pcache_group_key);
+                        if (git != g_pcache_groups.end() && git->second.complete) {
+                            ai4_wn_layer = g_pcache_group_key;
+                            const pcache_layer_group & grp = git->second;
+                            for (int m = 0; m < grp.n_members; m++) {
+                                if (!grp.members[m] || grp.members[m] == tmi.host_base || grp.expert_size[m] == 0) continue;
+                                for (int i = 0; i < n_misses; i++) {
+                                    const int64_t eid = tmi.all_miss_ids[i];
+                                    if (g_expert_pcache.entries.count(cuda_expert_persist_cache::key(grp.members[m], eid))) continue;
+                                    wn(grp.members[m], (size_t) eid * grp.expert_size[m], grp.expert_size[m]);
+                                }
+                            }
+                        }
+                    }
+#endif
                 }
             }
 
@@ -11638,6 +12701,197 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
             //   2. Tier 2 staging (pinned RAM) -> async DMA on dma_stream
             //   3. Fallback -> direct mmap on the compute stream (ordering vs reused addresses)
             // The reverse sync above ordered dma_stream after all prior compute work.
+            // ai4: prompt-batch accounting for this branch (printed every 120 calls)
+            struct ai4_branch_timer {
+                std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+                int n;
+                ~ai4_branch_timer() {
+                    ai4_pf_stats.branch_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                    ai4_pf_stats.misses += n;
+                    if (++ai4_pf_stats.calls % 120 == 0) {
+                        fprintf(stderr, "[ai4-pf] lookahead: issued %lld, used %lld copies, %.2f GB read in %.2f s (background), main thread waited %.2f s, skipped by history %lld, prompt pass %u, consumed %lld of the read copies, predictions %lld/%lld\n",
+                            (long long) ai4_la_issued, (long long) ai4_la_used, ai4_la_gb, ai4_la_read_s, ai4_la_wait_s,
+                            (long long) ai4_la_skipped, ai4_prompt_pass, (long long) ai4_la_consumed, (long long) ai4_pred_set, (long long) ai4_pred_calls);
+                        ai4_la_consumed = 0;
+                        ai4_la_issued = ai4_la_used = 0; ai4_la_gb = ai4_la_read_s = ai4_la_wait_s = 0; ai4_la_skipped = 0;
+                        fprintf(stderr, "[ai4-pf] %lld passes: miss branch %.2f s (reads %.2f s for %.2f GB = %.2f GB/s, ring syncs %.2f s x%lld) | misses %lld, staged-fills %lld, ring %lld\n",
+                            (long long) ai4_pf_stats.calls, ai4_pf_stats.branch_s, ai4_pf_stats.read_s, ai4_pf_stats.read_gb,
+                            ai4_pf_stats.read_s > 0 ? ai4_pf_stats.read_gb / ai4_pf_stats.read_s : 0.0, ai4_pf_stats.sync_s,
+                            (long long) ai4_pf_stats.wraps, (long long) ai4_pf_stats.misses, (long long) ai4_pf_stats.stage_fills,
+                            (long long) ai4_pf_stats.ring_reads);
+                        ai4_pf_stats = ai4_pf_stats_t();
+                    }
+                }
+            } ai4_bt_; ai4_bt_.n = n_misses;
+            // ai4: prompt lookahead: at the first tensor of a layer, take the copies read ahead for it and start reading
+            // the next layer's non-resident experts in the background
+            int ai4_la_buf = -1;
+            if (g_pcache_batch_ntokens >= 256 && g_pcache_group_key && g_expert_pcache.ai4_ring_ready() && ai4_la.ready()) {
+                static const void * ai4_la_layer = nullptr;
+                const void * gk = g_pcache_group_key;
+                if (!ai4_layer_idx.count(gk)) { ai4_layer_idx[gk] = (int) ai4_layer_order.size(); ai4_layer_order.push_back(gk); }
+                const int L = ai4_layer_idx[gk];
+                if (ai4_la_layer != gk) {
+                    ai4_la_seq++;
+                    ai4_la_cur_buf = (int) (ai4_la_seq % ai4_la.nb);
+                }
+                ai4_la_buf = ai4_la_cur_buf;
+                if (ai4_la_layer != gk && L == 0) ai4_prompt_pass++;
+                for (int i = 0; i < n_misses; i++) {
+                    ai4_use_pass[cuda_expert_persist_cache::key(tmi.host_base, tmi.all_miss_ids[i])] = ai4_prompt_pass;
+                }
+                ai4_seen_pass[tmi.host_base] = ai4_prompt_pass;
+                if (ai4_la_layer != gk) {
+                    ai4_la_layer = gk;
+                    // (a) this layer's read-ahead copies -> ring lookup
+                    {
+                        static const bool layer_log = [] { const char * e = getenv("ALPHA_AI4_LAYER_LOG"); return e && atoi(e) != 0; }();
+                        static std::chrono::steady_clock::time_point lp_t0, lp_prev;
+                        static double lp_sync0 = 0;
+                        static int64_t lp_io0 = 0;
+                        const auto t_now = std::chrono::steady_clock::now();
+                        if (L == 0) { lp_t0 = t_now; lp_prev = t_now; lp_sync0 = ai4_pf_stats.sync_s; lp_io0 = ai4_proc_read_bytes(); }
+                        const auto rel = [&](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(t - lp_t0).count(); };
+                        double lp_wait = 0;
+                        ai4_la_req & r = ai4_la.req[ai4_la_cur_buf];
+                        std::unique_lock<std::mutex> lk(ai4_la.m);
+                        const bool lp_have = r.layer == L && r.seq == ai4_la_seq;
+                        if (lp_have) {
+                            const auto tw = std::chrono::steady_clock::now();
+                            ai4_la.cv_done.wait(lk, [&] { return r.done; });
+                            lp_wait = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+                            ai4_la_wait_s += lp_wait;
+                            for (const auto & kv : r.out) g_expert_pcache.ai4_ring_map[kv.first] = kv.second;
+                            ai4_la_used += (int64_t) r.out.size();
+                            ai4_la_read_s += r.read_s; ai4_la_gb += r.gb;
+                        }
+                        if (layer_log && g_pcache_batch_ntokens >= 1024) {
+                            const int64_t io = ai4_proc_read_bytes();
+                            if (lp_have) {
+                                fprintf(stderr, "[ai4-layer] n=%d L=%2d t=%6.3f prev %.3f s wait %.3f | la q@%6.3f start@%6.3f end@%6.3f read %.3f s %.2f GB cap-skip %d | prev sync %.3f s io %.2f GB\n",
+                                        (int) g_pcache_batch_ntokens, L, rel(t_now), std::chrono::duration<double>(t_now - lp_prev).count(), lp_wait,
+                                        rel(r.t_q), rel(r.t_start), rel(r.t_end), r.read_s, r.gb, r.n_cap_skip,
+                                        ai4_pf_stats.sync_s - lp_sync0, (io - lp_io0) / 1e9);
+                            } else {
+                                fprintf(stderr, "[ai4-layer] n=%d L=%2d t=%6.3f prev %.3f s (no lookahead) | prev sync %.3f s io %.2f GB\n",
+                                        (int) g_pcache_batch_ntokens, L, rel(t_now), std::chrono::duration<double>(t_now - lp_prev).count(),
+                                        ai4_pf_stats.sync_s - lp_sync0, (io - lp_io0) / 1e9);
+                            }
+                            lp_prev = t_now; lp_sync0 = ai4_pf_stats.sync_s; lp_io0 = io;
+                        }
+                    }
+                    // (b) read layer L+1 into buffer (L+1)&1, once the copies out of it (layer L-1) have finished
+                    // ai4: wrap to layer 0 at the last layer (for the next prompt pass; only when the layer count is even, so
+                    // that layer 0's buffer is not the one the last layer is still reading from)
+                    const int nl = (int) ai4_layer_order.size();
+                    {   // [ai4-pass]: this prompt pass up to its last layer
+                        static auto t_pass = std::chrono::steady_clock::now();
+                        static ai4_pf_stats_t st0;
+                        static int64_t cons0 = 0;
+                        static int64_t io0 = 0;
+                        static int64_t ai4_la_consumed_total = 0;
+                        (void) ai4_la_consumed_total;
+                        if (L == 0) {
+                            t_pass = std::chrono::steady_clock::now();
+                            st0 = ai4_pf_stats;
+                            ai4_sib_src_pool = ai4_sib_src_stage = ai4_sib_src_la = ai4_sib_src_ring = 0;
+                            ai4_sib_read_s = ai4_sib_read_gb = 0;
+                            cons0 = ai4_la_consumed;
+                            io0 = ai4_proc_read_bytes();
+                        } else if (L + 1 == nl) {
+                            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pass).count();
+                            fprintf(stderr, "[ai4-pass] %d tokens, layers 0..%d: %.2f s | sync reads %.2f s %.2f GB (ring %lld, stage-fill %lld), "
+                                            "miss branch %.2f s | sib reads %.2f s %.2f GB, sib from pool %lld stage %lld lookahead %lld ring %lld | "
+                                            "lookahead consumed %lld | storage read %.2f GB (%.2f GB/s)\n",
+                                    g_pcache_batch_ntokens, nl - 2, wall, ai4_pf_stats.read_s - st0.read_s, ai4_pf_stats.read_gb - st0.read_gb,
+                                    (long long) (ai4_pf_stats.ring_reads - st0.ring_reads), (long long) (ai4_pf_stats.stage_fills - st0.stage_fills),
+                                    ai4_pf_stats.branch_s - st0.branch_s, ai4_sib_read_s, ai4_sib_read_gb,
+                                    (long long) ai4_sib_src_pool, (long long) ai4_sib_src_stage, (long long) ai4_sib_src_la,
+                                    (long long) ai4_sib_src_ring, (long long) (ai4_la_consumed - cons0),
+                                    (ai4_proc_read_bytes() - io0) / 1e9, (ai4_proc_read_bytes() - io0) / 1e9 / std::max(wall, 1e-3));
+                        }
+                    }
+                    // two layers ahead only for big prompt batches (ALPHA_AI4_LA_DEEP_MIN, default 4096): the deeper reads
+                    // are not filtered by the routing predictor, which spares a 2K prompt ~5 GB of unused experts
+                    static const int deep_min = [] { const char * e = getenv("ALPHA_AI4_LA_DEEP_MIN"); return e ? atoi(e) : 4096; }();
+                    const int la_d = std::min(ai4_la.nb - 1, g_pcache_batch_ntokens >= deep_min ? 2 : 1);
+                    const bool wrap0 = L + la_d >= nl;   // a read for the next prompt pass
+                    const int Ln = !wrap0 ? L + la_d : (nl >= 2 && ai4_prompt_pass >= 1 ? L + la_d - nl : -1);
+                    if (Ln >= 0 && Ln < nl) {
+                        auto git = g_pcache_groups.find(ai4_layer_order[Ln]);
+                        if (git != g_pcache_groups.end() && (git->second.complete || wrap0)) {
+                            const int b = (int) ((ai4_la_seq + la_d) % ai4_la.nb);
+                            ai4_la_req & r = ai4_la.req[b];
+                            std::unique_lock<std::mutex> lk(ai4_la.m);
+                            ai4_la.cv_done.wait(lk, [&] { return r.done; });
+                            lk.unlock();
+                            if (ai4_la.ev_armed[b]) CUDA_CHECK(cudaEventSynchronize(ai4_la.ev[b]));
+                            // drop lookup entries that point into this buffer
+                            const char * lo = ai4_la.buf[b];
+                            const char * hi = lo + ai4_la.buf_size;
+                            for (auto it = g_expert_pcache.ai4_ring_map.begin(); it != g_expert_pcache.ai4_ring_map.end(); ) {
+                                const char * q = (const char *) it->second;
+                                if (q >= lo && q < hi) it = g_expert_pcache.ai4_ring_map.erase(it); else ++it;
+                            }
+                            const pcache_layer_group & grp = git->second;
+                            std::vector<ai4_la_part> parts;
+                            for (int m = 0; m < grp.n_members; m++) {
+                                if (!grp.members[m] || grp.expert_size[m] == 0) continue;
+                                if (g_expert_pcache.host_registered.count(grp.members[m])) continue;
+                                ai4_la_part pt; pt.host_base = grp.members[m]; pt.esz = grp.expert_size[m];
+                                static const int hist = [] { const char * e = getenv("ALPHA_AI4_LA_HIST"); return e ? atoi(e) : 2; }();
+                                auto sit = ai4_seen_pass.find(grp.members[m]);
+                                const bool have_hist = hist > 0 && sit != ai4_seen_pass.end() && sit->second + 1 >= ai4_prompt_pass &&
+                                                       ai4_prompt_pass >= 2;
+                                const bool use_pred = ai4_predict_on() && !wrap0 && ai4_pred_layer == Ln && tmi.n_expert <= 512;
+                                for (int64_t eid = 0; eid < tmi.n_expert; eid++) {
+                                    const uint64_t key = cuda_expert_persist_cache::key(grp.members[m], eid);
+                                    if (g_expert_pcache.entries.count(key) || g_expert_pcache.staged_entries.count(key)) continue;
+                                    if (use_pred && !(ai4_pred_bits[Ln][eid >> 5] & (1u << (eid & 31)))) { ai4_la_skipped++; continue; }
+                                    if (have_hist) {
+                                        auto uit = ai4_use_pass.find(key);
+                                        if (uit == ai4_use_pass.end() || uit->second + (uint32_t) hist < ai4_prompt_pass) { ai4_la_skipped++; continue; }
+                                    }
+                                    pt.eids.push_back(eid); pt.keys.push_back(key);
+                                }
+                                parts.push_back(std::move(pt));
+                            }
+                            lk.lock();
+                            r.layer = Ln; r.seq = ai4_la_seq + la_d; r.parts.swap(parts); r.out.clear(); r.done = false; r.queued = true;
+                            r.t_q = std::chrono::steady_clock::now();
+                            lk.unlock();
+                            ai4_la.cv.notify_all();
+                            ai4_la_issued++;
+                        }
+                    }
+                }
+            }
+            // record, after this tensor's copies, that buffer ai4_la_buf has been read out up to here
+            struct ai4_la_rec { int b; cudaStream_t st; ~ai4_la_rec() {
+                if (b >= 0 && ai4_la.ok) { CUDA_CHECK(cudaEventRecord(ai4_la.ev[b], st)); ai4_la.ev_armed[b] = true; } } } ai4_la_rec_ = { ai4_la_buf, h2d_stream };
+            // ai4: prompt batches too: parallel O_DIRECT staging fill of this tensor's misses and its siblings'.
+            if (n_misses > 1 && !g_expert_pcache.host_registered.count(tmi.host_base) && g_expert_pcache.staging_enabled) {
+                const bool ai4_ring_on = g_expert_pcache.ai4_ring_ready();
+                if (ai4_ring_on) {
+                    g_expert_pcache.ring_prefetch(tmi.host_base, tmi.all_miss_ids.data(), n_misses, tmi.expert_size, h2d_stream, compute_stream);
+                } else {
+                    g_expert_pcache.stage_prefetch(tmi.host_base, tmi.all_miss_ids.data(), n_misses, tmi.expert_size);
+                }
+                static const void * ai4_pfmt_layer = nullptr;
+                if (g_pcache_group_key && ai4_pfmt_layer != g_pcache_group_key) {
+                    auto git = g_pcache_groups.find(g_pcache_group_key);
+                    if (git != g_pcache_groups.end() && git->second.complete) {
+                        ai4_pfmt_layer = g_pcache_group_key;
+                        const pcache_layer_group & grp = git->second;
+                        for (int m = 0; m < grp.n_members; m++) {
+                            if (!grp.members[m] || grp.members[m] == tmi.host_base || grp.expert_size[m] == 0) continue;
+                            if (g_expert_pcache.host_registered.count(grp.members[m])) continue;
+                            if (ai4_ring_on) g_expert_pcache.ring_prefetch(grp.members[m], tmi.all_miss_ids.data(), n_misses, grp.expert_size[m], h2d_stream, compute_stream);
+                            else g_expert_pcache.stage_prefetch(grp.members[m], tmi.all_miss_ids.data(), n_misses, grp.expert_size[m]);
+                        }
+                    }
+                }
+            }
             for (int i = 0; i < n_misses; i++) {
                 int64_t eid = tmi.all_miss_ids[i];
                 size_t offset = eid * tmi.expert_size;
@@ -11645,12 +12899,30 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
 
                 const void * h2d_src = nullptr;
                 cudaStream_t s;
-                if (g_expert_pcache.host_registered.count(tmi.host_base) && g_expert_pcache.dma_stream) {
+                bool ai4_xl_d2d = false;   // ai4: copied ahead into a gate buffer (ai4_xl_issue): a device copy
+                for (int xb = 0; xb < 2 && !ai4_xl_d2d; xb++) {
+                    if (ai4_xl_src[xb] == tmi.host_base && (size_t) eid < ai4_xl_have[xb].size() && ai4_xl_have[xb][(size_t) eid]) {
+                        h2d_src = ai4_xl_buf[xb] + offset;
+                        s = h2d_stream;
+                        ai4_xl_d2d = true;
+                        ai4_xl_hits++;
+                    }
+                }
+                if (ai4_xl_d2d) {
+                    // nothing else to resolve
+                } else if (g_expert_pcache.host_registered.count(tmi.host_base) && g_expert_pcache.dma_stream) {
                     h2d_src = (const char *)tmi.host_base + offset;
                     s = h2d_stream;  // pinned tensor source -> true async DMA
                     g_expert_pcache.mark_dma_pending();
                 } else {
-                    if (g_expert_pcache.staging_enabled) {
+                    auto rit = g_expert_pcache.ai4_ring_map.find(key);
+                    if (rit != g_expert_pcache.ai4_ring_map.end()) {
+                        h2d_src = rit->second;   // ai4: prompt ring copy
+                        if (ai4_la.ok) {
+                            const char * q = (const char *) h2d_src;
+                            for (int b = 0; b < ai4_la.nb; b++) if (q >= ai4_la.buf[b] && q < ai4_la.buf[b] + ai4_la.buf_size) { ai4_la_consumed++; break; }
+                        }
+                    } else if (g_expert_pcache.staging_enabled) {
                         h2d_src = g_expert_pcache.stage_expert(
                             tmi.host_base, offset, tmi.expert_size, key);
                     }
@@ -11666,7 +12938,7 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     (char *)gpu_dst + offset,
                     h2d_src, tmi.expert_size,
-                    cudaMemcpyHostToDevice, s));
+                    ai4_xl_d2d ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, s));
 
                 // Pool insert: D2D from the input_cpy bytes just written (same stream ->
                 // ordered after the H2D).
@@ -11846,6 +13118,8 @@ GGML_BACKEND_API_C void ggml_cuda_expert_pcache_flush(void * backend_ptr) {
     // Close the timing bracket: the fence is an event record on the same stream and costs
     // nothing on the stream timeline.
     if (g_pcache_dma_stats_now) g_expert_pcache.fetch_timing_end(h2d_stream);
+
+    ai4_sib_issue(h2d_stream, compute_stream);   // ai4: after the fence, so this tensor's matmul does not wait for them
 
     // Mark batch as flushed; the next pcache_copy call clears state for the new token
     g_pcache_batch_flushed = true;

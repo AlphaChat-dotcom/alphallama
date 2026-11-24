@@ -2612,6 +2612,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--ple", "--shard"}, "FNAME,...",
+        "extra GGUF files holding the DeepSeek-V4.1 Engram tables (per_layer_token_embd.weight or\n"
+        "blk.N.engram_embd.weight), comma separated; may be given more than once. The tables stay on disk and\n"
+        "their rows are read on demand. Same as env ALPHA_ENGRAM_SHARDS",
+        [](common_params &, const std::string & value) {
+            const char * cur = getenv("ALPHA_ENGRAM_SHARDS");
+            const std::string all = (cur && *cur) ? std::string(cur) + "," + value : value;
+#ifdef _WIN32
+            _putenv_s("ALPHA_ENGRAM_SHARDS", all.c_str());
+#else
+            setenv("ALPHA_ENGRAM_SHARDS", all.c_str(), 1);
+#endif
+        }
+    ));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",
         [](common_params & params, const std::string & value) {

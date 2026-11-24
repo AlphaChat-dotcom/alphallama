@@ -16,6 +16,7 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_engram_table;
 struct llama_model_loader;
 
 // available models
@@ -139,6 +140,7 @@ enum llm_type {
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_744B_A40B, // GLM-5
+    LLM_TYPE_320B_A18B, // GLM-5.3-Flash
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -539,6 +541,19 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // glm5-next k-pool indexer
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
+
+    // deepseek41
+    struct ggml_tensor * wkv                = nullptr; // shared key / value latent projection
+    struct ggml_tensor * attn_kv_norm       = nullptr;
+    struct ggml_tensor * attn_comp_wkv      = nullptr;
+    struct ggml_tensor * attn_comp_wgate    = nullptr;
+    struct ggml_tensor * attn_comp_norm     = nullptr;
+    struct ggml_tensor * engram_kv          = nullptr;
+    struct ggml_tensor * engram_gate        = nullptr; // q_weight*k_weight folded
+
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -607,6 +622,12 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+
+    // deepseek41 Engram: token id -> id of its normalized form (hashed into the n-grams), and the on-disk tables
+    std::vector<int32_t> engram_token_map;
+    std::shared_ptr<struct llama_engram_table> engram_table;
+    int  engram_index(int il) const; // index of the Engram module of layer il, -1 if it has none
+    void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
 
     // qwen4exp: there is no output_norm; the final HC mixer carries it
     struct ggml_tensor * hc_head_norm = nullptr;

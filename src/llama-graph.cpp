@@ -743,7 +743,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {   // unconsumed -> unallocated (identity fast path), as in llm_graph_input_mem_hybrid
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1385,6 +1385,22 @@ ggml_tensor * llm_graph_context::build_ffn(
                     }
                 }
 
+                // glm5-next: per-layer clamp, same form as upstream's ggml_swiglu_clamp
+                if ((arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_DEEPSEEK41) && il >= 0) {
+                    const float limit = hparams.swiglu_clamp_shexp[il];
+                    static const bool one_op = [] { const char * e = getenv("ALPHA_GLM5_GLU_CLAMP"); return !e || atoi(e) != 0; }();
+                    if (limit > 1e-6f && one_op) {
+                        cur = ggml_swiglu_split_clamp(ctx0, cur, tmp, limit);
+                        cb(cur, "ffn_swiglu", il);
+                        type_gate = LLM_FFN_SEQ;
+                        break;
+                    }
+                    if (limit > 1e-6f) {
+                        cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                        tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                    }
+                }
+
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
                 type_gate = LLM_FFN_SEQ;
@@ -1771,7 +1787,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else {
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -1786,6 +1807,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (moe_expand_first) {   // e.g. glm5-next's shared expert: after the router, before the expert matmuls
+        ggml_build_forward_expand(gf, selected_experts);
+        ggml_build_forward_expand(gf, moe_expand_first);
+        moe_expand_first = nullptr;
+    }
 
     // save final weights for entropy-based difficulty estimation
     if (moe_save_idx >= 0) {
@@ -1901,7 +1928,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
                 // DeepSeek V4: per-layer SwiGLU clamp (reference Expert.forward):
                 // gate = clamp(gate, max=limit) BEFORE silu; up = clamp(up, -limit, limit).
-                if (arch == LLM_ARCH_DEEPSEEK4 && il >= 0) {
+                if (arch == LLM_ARCH_GLM5_NEXT && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+                    static const bool one_op = [] { const char * e = getenv("ALPHA_GLM5_GLU_CLAMP"); return !e || atoi(e) != 0; }();
+                    if (one_op) {
+                        cur = ggml_swiglu_split_clamp(ctx0, cur, up, hparams.swiglu_clamp_exp[il]);
+                        cb(cur, "ffn_moe_swiglu", il);
+                        break;
+                    }
+                }
+                if ((arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_DEEPSEEK41) && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     if (limit > 1e-6f) {
                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);

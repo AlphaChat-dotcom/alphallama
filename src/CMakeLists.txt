@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-context-mtp4.cpp
+            llama-context-mtp5.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
@@ -25,6 +26,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-dsv41.cpp
+            llama-engram.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-idx.cpp

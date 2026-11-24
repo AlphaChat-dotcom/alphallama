@@ -386,6 +386,26 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, blo
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst, q8_dst);
 }
 
+// GGML_GLU_OP_SWIGLU_CLAMP, split form: silu(min(g, limit)) * clamp(u, -limit, limit)
+static __global__ void swiglu_clamp_kernel(const float * g, const float * u, float * dst, const int64_t k, const float limit) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) return;
+    dst[i] = ggml_cuda_op_silu_single(fminf(g[i], limit)) * fminf(fmaxf(u[i], -limit), limit);
+}
+
+void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst));
+    float limit;
+    memcpy(&limit, (const int32_t *) dst->op_params + 2, sizeof(float));
+    const int64_t k = ggml_nelements(dst);
+    swiglu_clamp_kernel<<<(k + 255) / 256, 256, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
+                                                                    (float *) dst->data, k, limit);
+}
+
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_gelu_erf>(ctx, dst);
 }

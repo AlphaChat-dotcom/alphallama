@@ -1042,6 +1042,10 @@ bool llama_context::mtp_kv_prealloc() {
     const int mtp_il = (int) hp.n_layer - 1;
     if (mtp_il < 0 || mtp_il >= (int) model.layers.size()) return false;
     const auto & L = model.layers[mtp_il];
+    if (model.arch == LLM_ARCH_GLM5_NEXT) {   // the head caches the MLA latent, one n_lora_kv column per position
+        if (!L.nextn.eh_proj || !L.wkv_a_mqa || !L.wkv_a_mqa->buffer) return false;
+        return mtp_kv_ensure(hp.n_lora_kv, ggml_backend_buffer_get_type(L.wkv_a_mqa->buffer));
+    }
     if (!L.nextn.eh_proj || !L.wq || !L.wq->buffer) return false;
     return mtp_kv_ensure(hp.n_embd_head_k() * hp.n_head_kv(mtp_il), ggml_backend_buffer_get_type(L.wq->buffer));
 }
@@ -1072,9 +1076,12 @@ bool llama_context::mtp_kv_ensure(int64_t kv_row, ggml_backend_buffer_type_t buf
     // ALPHA_MTP_HEAD_FA (default on, =0 restores F32): qwen4exp uses an F16 cache read by flash attention
     // (llama-context-mtp4.cpp); every other arch's draft graph reads it as F32
     static const bool head_fa = [] { const char * e = getenv("ALPHA_MTP_HEAD_FA"); return !e || atoi(e) != 0; }();
-    const ggml_type kvt = (head_fa && model.arch == LLM_ARCH_QWEN4EXP) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // glm5-next: the latent cache is F16 like the trunk's (same switch), and MLA reads keys and values from the one
+    // latent, so its V cache is a one-row dummy
+    const bool glm5 = model.arch == LLM_ARCH_GLM5_NEXT;
+    const ggml_type kvt = (head_fa && (model.arch == LLM_ARCH_QWEN4EXP || glm5)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     mtp_k_cache = ggml_new_tensor_2d(mtp_kv_ctx, kvt, kv_row, cols);
-    mtp_v_cache = ggml_new_tensor_2d(mtp_kv_ctx, kvt, kv_row, cols);
+    mtp_v_cache = ggml_new_tensor_2d(mtp_kv_ctx, kvt, glm5 ? 1 : kv_row, cols);
     mtp_kv_buf  = ggml_backend_alloc_ctx_tensors_from_buft(mtp_kv_ctx, buft);
     if (mtp_kv_buf) {
         ggml_backend_buffer_clear(mtp_kv_buf, 0);   // the padded attention window reads past hi: must be finite
@@ -1346,6 +1353,15 @@ void llama_context::mtp_kv_fill() {
         if (!mtp_kv_fill_qwen4exp(hsrc, ctok, cpos, slot0, m) && dbg) fprintf(stderr, "[mtp-fill] qwen4exp chunk failed\n");
         return;
     }
+    if (model.arch == LLM_ARCH_GLM5_NEXT) {
+        const auto & L5 = model.layers[model.hparams.n_layer - 1];
+        if (!L5.nextn.eh_proj || !L5.wkv_a_mqa) { if (dbg) fprintf(stderr, "[mtp-fill] bail: glm5-next NextN block not loaded\n"); return; }
+        if (!mtp_kv_ensure(model.hparams.n_lora_kv, ggml_backend_buffer_get_type(L5.wkv_a_mqa->buffer))) return;
+        if (slot0 + m > mtp_kv_cols) m = mtp_kv_cols - slot0;
+        if (m < 1) return;
+        if (!mtp_kv_fill_glm5next(hsrc, ctok, slot0, m) && dbg) fprintf(stderr, "[mtp-fill] glm5-next chunk failed\n");
+        return;
+    }
     const float   eps    = model.hparams.f_norm_rms_eps;
     const int mtp_il = (int) model.hparams.n_layer - 1;
     if (mtp_il < 0 || mtp_il >= (int) model.layers.size()) return;
@@ -1518,6 +1534,9 @@ llama_token llama_context::mtp_draft_graph(llama_token e_tok) {
 llama_token llama_context::mtp_draft(llama_token e_tok) {
     if (model.arch == LLM_ARCH_QWEN4EXP) {
         return mtp_draft_qwen4exp(e_tok);   // llama-context-mtp4.cpp
+    }
+    if (model.arch == LLM_ARCH_GLM5_NEXT) {
+        return mtp_draft_glm5next(e_tok);   // llama-context-mtp5.cpp
     }
     // Architectures whose MTP block the hand-built graph below cannot express delegate to a model-built
     // LLM_GRAPH_TYPE_DECODER_MTP graph. No architecture opts in yet, so the qwen35moe path below is reached.
@@ -3102,6 +3121,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ALPHA_DECODE_LOG=1: print each decode call's token count and its ubatch sizes
+static bool alpha_decode_log() {
+    static const bool v = [] { const char * e = getenv("ALPHA_DECODE_LOG"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
     // ALPHA_DECODE_TIMERS=1: host phase split of decode() for small batches (prepare / ubatches / fill)
@@ -3161,6 +3186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    if (alpha_decode_log()) fprintf(stderr, "[decode] llama_decode n_tokens=%u\n", n_tokens_all);
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
@@ -3247,6 +3273,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        if (alpha_decode_log()) fprintf(stderr, "[decode] ubatch n_tokens=%u\n", ubatch.n_tokens);
 
         // count the outputs in this ubatch
         {
@@ -3784,6 +3811,17 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+        // unfused mHC (Sinkhorn as separate ops) and the chunked indexer scoring on top of the MoE aggregation
+        const uint32_t n_expert  = model.hparams.n_expert;
+        const uint32_t per_layer = 2u*n_expert + 2u*10u*model.hparams.hc_sinkhorn_iters + 1200u;
+        return std::max<uint32_t>(per_layer*model.hparams.n_layer + 8192u, std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors()));
+    }
+    if (model.arch == LLM_ARCH_GLM5_NEXT) {
+        const uint32_t n_expert  = model.hparams.n_expert;
+        const uint32_t moe_nodes = (uint32_t)((2u * n_expert + 100u) * model.hparams.n_layer * 1.3f) + 4096u;
+        return std::max<uint32_t>(moe_nodes, std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors()));
+    }
     // MoE models: during warmup, the build_moe_ffn aggregation loop creates n_expert views +
     // (n_expert-1) adds per MoE layer (256 experts x 40 layers = 20K+ extra tensors). Scale
     // max_nodes to accommodate.

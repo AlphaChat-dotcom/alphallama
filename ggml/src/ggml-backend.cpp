@@ -117,6 +117,14 @@ static ggml_expert_cache_ids_fn_t g_expert_cache_ids_fn = nullptr;
 typedef void (*ggml_expert_cache_pfx_fn_t)(void * backend, const struct ggml_tensor * x, const void * weight,
                                             const int32_t * ids, int ne0, int ne1, int s0, int s1);
 static ggml_expert_cache_pfx_fn_t g_expert_cache_pfx_fn = nullptr;
+// ALPHA: inputs a model fills asynchronously (deepseek41 Engram rows): called with each split input (its view source
+// for a view) before the input is copied, so the filler can finish first
+typedef void (*ggml_alpha_input_wait_fn_t)(const struct ggml_tensor * t);
+static ggml_alpha_input_wait_fn_t g_alpha_input_wait_fn = nullptr;
+GGML_API_C void ggml_backend_sched_set_input_wait_fn(ggml_alpha_input_wait_fn_t fn) {
+    g_alpha_input_wait_fn = fn;
+}
+
 GGML_API_C void ggml_backend_set_expert_cache_pfx_fn(ggml_expert_cache_pfx_fn_t fn) {
     g_expert_cache_pfx_fn = fn;
 }
@@ -1805,6 +1813,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (g_alpha_input_wait_fn) {
+                g_alpha_input_wait_fn(input->view_src ? input->view_src : input);
+            }
 
             // ALPHA_SCHED_SMALL_INPUT_ASYNC (default 1): a small user input in host memory is copied from a private
             // pageable copy, asynchronously on the split's stream: no GPU drain. The synchronous path below drains the

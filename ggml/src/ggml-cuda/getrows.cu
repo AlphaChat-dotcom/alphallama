@@ -195,6 +195,52 @@ static void get_rows_cuda_q(
         s10, s11, s12/*, s13*/);
 }
 
+// ALPHA: F16 rows into F16 rows, a multiple of 8 halves long, 16-byte aligned: one warp per row, uint4 copies (ai4's
+// gathered-attention K)
+static __global__ void k_get_rows_f16_vec(
+        const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t n16,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t nrows = ne10*ne11*ne12;
+    if (row >= nrows) {
+        return;
+    }
+    const int64_t i12 = row / (ne10*ne11);
+    const int64_t i11 = (row - i12*ne10*ne11) / ne10;
+    const int64_t i10 = row - i12*ne10*ne11 - i11*ne10;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const uint4 * s4 = (const uint4 *) (src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    uint4 * d4 = (uint4 *) (dst + i10*nb1 + i11*nb2 + i12*nb3);
+    for (int64_t j = lane; j < n16; j += WARP_SIZE) {
+        d4[j] = s4[j];
+    }
+}
+
+// ALPHA: rows of a single element (the gathered-attention mask, ai4): one thread per row instead of a 256-thread block
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_scalar(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int64_t i10 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i10 >= ne10) {
+        return;
+    }
+    for (int64_t z = blockIdx.y; z < ne11*ne12; z += gridDim.y) {
+        const int64_t i11 = z / ne12;
+        const int64_t i12 = z % ne12;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i10*s1 + i11*s2 + i12*s3] = ggml_cuda_cast<dst_t>(src0_row[0]);
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -216,6 +262,13 @@ static void get_rows_cuda_float(
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
     // const size_t s13 = nb13 / sizeof(int32_t);
+
+    if (ne00 == 1) {
+        const dim3 grid_s((unsigned) ((ne10 + 255) / 256), (unsigned) MIN(ne11*ne12, (int64_t) UINT16_MAX), 1);
+        k_get_rows_scalar<<<grid_s, 256, 0, stream>>>(src0_d, src1_d, dst_d, ne10, ne11, ne12, s1, s2, s3,
+            nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
 
     k_get_rows_float<<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
@@ -350,6 +403,23 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
+    // ai4: F16 -> F16 rows of 16-byte multiples with 16-byte aligned strides: warp-per-row vector copy
+    if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16 && (src0->ne[0] % 8) == 0 &&
+        ((uintptr_t) src0->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0 &&
+        src0->nb[1] % 16 == 0 && src0->nb[2] % 16 == 0 && src0->nb[3] % 16 == 0 &&
+        dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0 && dst->nb[3] % 16 == 0) {
+        const int64_t nrows = src1->ne[0]*src1->ne[1]*src1->ne[2];
+        const int rows_per_block = 8;
+        const int64_t nblk = (nrows + rows_per_block - 1) / rows_per_block;
+        if (nblk <= INT32_MAX) {
+            k_get_rows_f16_vec<<<(unsigned) nblk, rows_per_block*WARP_SIZE, 0, ctx.stream()>>>(
+                (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
+                src1->ne[0], src1->ne[1], src1->ne[2], src0->ne[0] / 8,
+                dst->nb[1], dst->nb[2], dst->nb[3], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0] / sizeof(int32_t), src1->nb[1] / sizeof(int32_t), src1->nb[2] / sizeof(int32_t));
+            return;
+        }
+    }
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }

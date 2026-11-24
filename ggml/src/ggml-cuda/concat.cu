@@ -177,6 +177,43 @@ static __global__ void concat_f32_dim0_rows(
     }
 }
 
+// any element type, any strides, any dim: one thread per destination element (grid-stride), so the row count of a
+// long dim (e.g. deepseek41's window | compressed cache rows along dim 2) never meets the grid's y / z limits
+template <typename T>
+static __global__ void concat_flat_any(
+        const char * __restrict__ s0, const char * __restrict__ s1, char * __restrict__ d, const int dim,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        const int64_t ne0,  const int64_t ne1,  const int64_t ne2,  const int64_t ne3,
+        const int64_t nb0,  const int64_t nb1,  const int64_t nb2,  const int64_t nb3) {
+    const int64_t n = ne0*ne1*ne2*ne3;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+        int64_t t = i;
+        int64_t o0 = t % ne0; t /= ne0;
+        int64_t o1 = t % ne1; t /= ne1;
+        int64_t o2 = t % ne2;
+        int64_t o3 = t / ne2;
+        const char * src;
+        const bool first = dim == 0 ? o0 < ne00 : dim == 1 ? o1 < ne01 : dim == 2 ? o2 < ne02 : o3 < ne03;
+        if (first) {
+            src = s0 + o0*nb00 + o1*nb01 + o2*nb02 + o3*nb03;
+        } else {
+            if      (dim == 0) { o0 -= ne00; }
+            else if (dim == 1) { o1 -= ne01; }
+            else if (dim == 2) { o2 -= ne02; }
+            else               { o3 -= ne03; }
+            src = s1 + o0*nb10 + o1*nb11 + o2*nb12 + o3*nb13;
+        }
+        int64_t u = i;   // destination offsets from the unshifted coordinates
+        const int64_t d0 = u % ne0; u /= ne0;
+        const int64_t d1 = u % ne1; u /= ne1;
+        const int64_t d2 = u % ne2;
+        const int64_t d3 = u / ne2;
+        *(T *) (d + d0*nb0 + d1*nb1 + d2*nb2 + d3*nb3) = *(const T *) src;
+    }
+}
+
 void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -184,6 +221,19 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
+
+    if (ggml_type_size(src0->type) == 2 && ggml_blck_size(src0->type) == 1) {
+        // F16 / BF16: bits copied as 2-byte words
+        GGML_ASSERT(src1->type == src0->type && dst->type == src0->type);
+        const int64_t n = ggml_nelements(dst);
+        const int nblk = (int) std::min<int64_t>((n + 255)/256, 65536);
+        concat_flat_any<uint16_t><<<nblk, 256, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data, dim,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        return;
+    }
 
     // F32, or I32 copied as 4-byte words (no arithmetic touches the values, so the bits are preserved)
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_I32);

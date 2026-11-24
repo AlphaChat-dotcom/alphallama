@@ -156,10 +156,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(V->ne[0] == 256);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
-        case 512:
+        case 512: {
             GGML_ASSERT(V->ne[0] == 512);
+            // ai4: the gathered attention (one query per sequence, many sequences): 16 / 32 heads per tile
+            // (ALPHA_FA512_GQA, default 32; 8 = the generic choice)
+            static const int fa512_gqa = [] { const char * e = getenv("ALPHA_FA512_GQA"); return e ? atoi(e) : 32; }();
+            float mb = 0.0f;
+            memcpy(&mb, (const float *) KQV->op_params + 1, sizeof(float));
+            const int gqa = (int) (Q->ne[2] / K->ne[2]);
+            if (fa512_gqa > 8 && Q->ne[1] == 1 && Q->ne[3] > 1 && mask && mb == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                gqa % fa512_gqa == 0) {
+                if (fa512_gqa == 32) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 32>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 16>(ctx, dst);
+                }
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
-            break;
+        } break;
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.
             GGML_ASSERT(V->ne[0] == 512);

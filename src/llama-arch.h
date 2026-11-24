@@ -139,6 +139,8 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_GLM5_NEXT,
+    LLM_ARCH_DEEPSEEK41,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -248,10 +250,24 @@ enum llm_kv {
     LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
     LLM_KV_ATTENTION_INDEXER_TOP_K,
+    LLM_KV_ATTENTION_INDEXER_KPOOL,
+    LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,
     LLM_KV_ATTENTION_COMPRESS_RATIOS,
+    LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,           // deepseek41
+    LLM_KV_ATTENTION_KV_SOURCE_LAYERS,                  // deepseek41
+    LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS,             // deepseek41
+    LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER,    // deepseek41
+    LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS,    // deepseek41
+    LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,      // deepseek41
+    LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,                // deepseek41
+    LLM_KV_ATTENTION_OUTPUT_LORA_RANK,                  // deepseek41
+    LLM_KV_ENGRAM_PAD_TOKEN_ID,                         // deepseek41
+    LLM_KV_ENGRAM_TOKEN_MAP,                            // deepseek41
 
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_LOW_RANK,
+    LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
+    LLM_KV_HYPER_CONNECTION_EPSILON,
 
     LLM_KV_PLE_LAYERS,
     LLM_KV_PLE_NGRAM_SIZE,
@@ -293,6 +309,7 @@ enum llm_kv {
     LLM_KV_SSM_DT_B_C_RMS,
 
     LLM_KV_KDA_HEAD_DIM,
+    LLM_KV_KDA_GATE_LOWER_BOUND,
 
     LLM_KV_WKV_HEAD_SIZE,
 
@@ -607,6 +624,15 @@ enum llm_tensor {
     LLM_TENSOR_INDEXER_PROJ,
     LLM_TENSOR_INDEXER_ATTN_K,
     LLM_TENSOR_INDEXER_ATTN_Q_B,
+    LLM_TENSOR_INDEXER_KPOOL_GATE,   // glm5-next: k-pool gate scores
+    LLM_TENSOR_INDEXER_KPOOL_APE,    // glm5-next: k-pool position bias
+    LLM_TENSOR_ATTN_KV,                // deepseek41: shared key / value latent
+    LLM_TENSOR_ATTN_COMPRESSOR_WKV,    // deepseek41: compressor kv projection (KV source layers)
+    LLM_TENSOR_ATTN_COMPRESSOR_WGATE,  // deepseek41: compressor gate (ratio > 1)
+    LLM_TENSOR_ATTN_COMPRESSOR_NORM,   // deepseek41: compressor norm
+    LLM_TENSOR_ENGRAM_KV,              // deepseek41: Engram key | value projection
+    LLM_TENSOR_ENGRAM_GATE,            // deepseek41: Engram gate weight
+    LLM_TENSOR_FFN_EXP_PROBS_B_VL,     // deepseek41: router bias of image tokens (not used, text only)
     LLM_TENSOR_NEXTN_EH_PROJ,
     LLM_TENSOR_NEXTN_EMBED_TOKENS,
     LLM_TENSOR_NEXTN_ENORM,

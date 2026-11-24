@@ -121,6 +121,7 @@ extern "C" {
 #endif
 void ggml_compute_forward_dsv4_hc_split_sinkhorn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_weighted_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_idx_score(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_expand(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_hc_combine(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_hc_mix_tail(const struct ggml_compute_params * params, struct ggml_tensor * dst);

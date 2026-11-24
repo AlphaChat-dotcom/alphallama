@@ -89,6 +89,8 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_prealloc(void);
 ALPHA_CUDA_API_C void ggml_cuda_set_pool_reserve_bytes(size_t);   // KV/compute-aware pool reserve
 typedef void (*ggml_expert_pcache_ids_fn_t)(const int32_t *, int, int, int, int);
 ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_ids(const int32_t *, int, int, int, int);
+ALPHA_CUDA_API_C void ggml_cuda_ai4_predict_x(void *, const struct ggml_tensor *, const void *, const int32_t *, int, int, int, int);
+ALPHA_CUDA_API_C void * ggml_cuda_ai4_sib_redirect(void *, void *);
 GGML_API_C void ggml_backend_set_expert_cache_ids_fn(ggml_expert_pcache_ids_fn_t);
 // Layer-fuse (ALPHA_LAYER_FUSE): MoE layer boundary, so the cache can fetch a whole layer's
 // expert misses in one flush instead of one flush per expert tensor.
@@ -1442,7 +1444,9 @@ int main(int argc, char ** argv) {
             // with n_ubatch; on VRAM-tight MoE offload configs this displaces expert-pool budget.
             n_ubatch = atoi(argv[++i]);
             if (n_ubatch < 128)  n_ubatch = 128;
-            if (n_ubatch > 8192) n_ubatch = 8192;
+            // ai4: up to 16384, so an 8K-token prompt (8195 with the template) is one micro-batch, not two even
+            // chunks (ALPHA_SERVE_EVEN_CHUNKS) that each move every expert
+            if (n_ubatch > 16384) n_ubatch = 16384;
             ubatch_explicit = true;
         }
         else if (strcmp(argv[i], "--reasoning-budget") == 0 && i + 1 < argc) {
@@ -2426,6 +2430,8 @@ int main(int argc, char ** argv) {
             ggml_backend_set_expert_cache_ntokens_fn(ggml_cuda_expert_pcache_set_ntokens);
             ggml_backend_set_expert_cache_pass_begin_fn(ggml_cuda_expert_pcache_pass_begin);
             ggml_backend_set_expert_cache_ids_fn(ggml_cuda_expert_pcache_set_ids);
+            ggml_backend_set_expert_cache_pfx_fn(ggml_cuda_ai4_predict_x);   // ai4: prompt lookahead predictor
+            ggml_backend_set_expert_cache_redirect_fn(ggml_cuda_ai4_sib_redirect);   // ai4: sibling copy-ahead
             ggml_backend_set_expert_cache_group_fn(ggml_cuda_expert_pcache_set_group);
             fprintf(stderr, "[serve] Fused-infer expert cache registered (VMM + D2D fallback)\n");
         }

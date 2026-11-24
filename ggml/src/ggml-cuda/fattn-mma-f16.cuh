@@ -1616,7 +1616,7 @@ static __global__ void flash_attn_ext_f16(
         const int sequence =  kbc /(iter_k*iter_j*iter_z_gqa*ne12);
         const int z_KV     = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence)/(iter_k*iter_j*iter_z_gqa);
         const int zt_gqa   = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV)/(iter_k*iter_j);
-        const int jt       = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k;
+        const int jt       = fattn_jt_order((kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k, iter_j);
 
         const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
@@ -1662,7 +1662,7 @@ static __global__ void flash_attn_ext_f16(
     const int sequence =  kbc /(iter_k*iter_j*iter_z_gqa*ne12);
     const int z_KV     = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence)/(iter_k*iter_j*iter_z_gqa);
     const int zt_gqa   = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV)/(iter_k*iter_j);
-    const int jt       = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k;
+    const int jt       = fattn_jt_order((kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k, iter_j);
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
@@ -1819,6 +1819,8 @@ extern DECL_FATTN_MMA_F16_CASE(512, 512,  1,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  8);
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  1, 16);   // ai4: gathered attention
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  1, 32);
 
 // The number of viable configurations for Deepseek is very limited:
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);

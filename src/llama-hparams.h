@@ -5,6 +5,7 @@
 #include <array>
 #include <bitset>
 #include <cassert>
+#include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -150,6 +151,7 @@ struct llama_hparams {
 
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
+    float    kda_gate_lower_bound = -INFINITY; // glm5-next: bounded decay gate (lb * sigmoid) instead of softplus
 
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
@@ -209,12 +211,29 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0;    // glm5-next: pool size of the k-pool indexer (0 = no k-pool)
+    bool     indexer_kpool_select_tail = true;
+
+    // deepseek41 (DeepSeek-V4.1): grouped low-rank attention output, compressed attention with shared sources
+    uint32_t dsv4_o_group_count      = 0;
+    uint32_t dsv4_o_lora_rank        = 0;
+    float    dsv4_compress_rope_base = 0.0f;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_src   = {}; // layer whose compressed KV this layer reads, -1 = none
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src = {}; // layer whose top-k this layer uses, -1 = none
+    int32_t  dsv41_cand_src         = -1;   // -1 = no candidate block selection
+    uint32_t dsv41_cand_topk_blocks = 0;
+    uint32_t dsv41_cand_block_size  = 0;
+    // Engram: hash constant sets stored back to back, 1 shared by all PLE layers (qwen4exp) or 1 per layer (deepseek41)
+    uint32_t ple_n_modules = 1;
+    uint32_t engram_pad_id = 0;     // index into llama_model::engram_token_map
 
     // qwen4exp
     // HyperConnections: the residual stream carries hc_count parallel copies of
     // n_embd, so the wide state is hc_count * n_embd (n_embd_out_impl).
     uint32_t hc_count    = 0;   // qwen4exp.hyper_connection.count
     uint32_t hc_low_rank = 0;   // 0 = full rank (DeepSeek-V4)
+    uint32_t hc_sinkhorn_iters = 0;     // glm5-next mHC
+    float    hc_eps            = 0.0f;  // glm5-next mHC
 
     // per-layer attention compression ratio; 0 = dense attention on that layer
     std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios = {};

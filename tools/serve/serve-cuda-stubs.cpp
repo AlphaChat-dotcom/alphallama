@@ -70,6 +70,8 @@ void   ggml_cuda_expert_pcache_set_draft_norecord(int) {}
 void   ggml_cuda_expert_pcache_set_group(const void *, int) {}
 void   ggml_cuda_expert_pcache_set_hidden(const float *, int, int, int) {}
 void   ggml_cuda_expert_pcache_set_ids(const int32_t *, int, int, int, int) {}
+void   ggml_cuda_ai4_predict_x(void *, const struct ggml_tensor *, const void *, const int32_t *, int, int, int, int) {}
+void * ggml_cuda_ai4_sib_redirect(void *, void *) { return nullptr; }
 void   ggml_cuda_expert_pcache_set_ntokens(int, int, int, int) {}
 void   ggml_cuda_expert_pcache_set_weights(const float *, int) {}
 void   ggml_cuda_expert_pcache_set_window_admit(int) {}

@@ -2107,6 +2107,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_split_sinkhorn(params, tensor);
             } break;
+        case GGML_OP_DSV4_IDX_SCORE:
+            {
+                ggml_compute_forward_dsv4_idx_score(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             {
                 ggml_compute_forward_dsv4_hc_weighted_sum(params, tensor);
@@ -2367,6 +2371,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SWIGLU_CLAMP:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2527,6 +2532,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             }
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
             case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            case GGML_OP_DSV4_IDX_SCORE:
             case GGML_OP_DSV4_HC_EXPAND:
             case GGML_OP_DSV4_FP8_KV_QUANTIZE:
             case GGML_OP_DSV4_ROPE_TAIL:

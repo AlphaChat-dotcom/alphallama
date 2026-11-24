@@ -686,6 +686,13 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// Stream-k token-tile order for prompt batches: 0, n-1, 1, n-2, ... With a causal mask the key bound (KV_max) grows
+// with the token position, and blocks own runs of consecutive tiles; in this order every pair carries the same work.
+static __device__ __forceinline__ int fattn_jt_order(const int jt, const int iter_j) {
+    if (iter_j < 16) return jt;
+    return (jt & 1) ? iter_j - 1 - (jt >> 1) : (jt >> 1);
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -720,7 +727,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     const int sequence = dm0.x;
     const int z_KV     = dm1.x;
     const int zt_gqa   = dm2.x;
-    const int jt       = dm2.y;
+    const int jt       = fattn_jt_order(dm2.y, (ne01 + ncols1 - 1) / ncols1);
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
@@ -807,7 +814,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     const int sequence = dm0.x;
     const int z_KV     = dm1.x;
     const int zt_gqa   = dm2.x;
-    const int jt       = dm3.x;
+    const int jt       = fattn_jt_order(dm3.x, (ne01 + ncols1 - 1) / ncols1);
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 

@@ -1158,6 +1158,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "HC_COMBINE",
     "HC_MIX_TAIL",
     "HC_MIX_FUSED",
+    "DSV4_IDX_SCORE",
 
     "UNARY",
 
@@ -1175,7 +1176,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT mismatch");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT mismatch");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1277,6 +1278,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "hc_combine(a, b, c)",
     "hc_mix_tail(x, g)",
     "hc_mix_fused(x)",
+    "dsv4_idx_score(kq, w)",
 
     "unary(x)",
 
@@ -1294,7 +1296,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT mismatch");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT mismatch");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1332,9 +1334,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SWIGLU_CLAMP",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3083,6 +3086,17 @@ struct ggml_tensor * ggml_glu_split(
     return ggml_glu_impl(ctx, a, b, op, false);
 }
 
+struct ggml_tensor * ggml_swiglu_split_clamp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 limit) {
+    GGML_ASSERT(b != NULL);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_CLAMP, false);
+    ggml_set_op_params_f32(result, 2, limit);
+    return result;
+}
+
 // ggml_reglu
 
 struct ggml_tensor * ggml_reglu(
@@ -3980,6 +3994,29 @@ struct ggml_tensor * ggml_get_rows(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+// ALPHA: ggml_get_rows with an explicit result type (F32 or F16); declared by its users, not in ggml.h (which would
+// rebuild every backend)
+GGML_API struct ggml_tensor * ggml_get_rows_t(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b, enum ggml_type type);
+
+struct ggml_tensor * ggml_get_rows_t(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    struct ggml_tensor * result = ggml_get_rows(ctx, a, b);
+    if (type != result->type) {
+        result->type  = type;
+        result->nb[0] = ggml_type_size(type);
+        result->nb[1] = result->nb[0]*result->ne[0];
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
+        }
+    }
     return result;
 }
 
@@ -8045,6 +8082,26 @@ struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_idx_score
+
+struct ggml_tensor * ggml_dsv4_idx_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kq,
+        struct ggml_tensor  * w) {
+    GGML_ASSERT(kq->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(kq) && ggml_is_contiguous(w));
+    GGML_ASSERT(w->ne[0] == kq->ne[0] && w->ne[1] == kq->ne[1] && w->ne[2] == 1 && w->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, kq->ne[1], kq->ne[2], kq->ne[3]);
+
+    result->op     = GGML_OP_DSV4_IDX_SCORE;
+    result->src[0] = kq;
+    result->src[1] = w;
 
     return result;
 }

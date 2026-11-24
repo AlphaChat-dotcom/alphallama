@@ -860,7 +860,11 @@ bool gpu_engine::decode_batch(const BatchRequest & req, BatchResult & result) {
                 const char * e = getenv("ALPHA_DRE_PREFILL_MB_PER_TOK");
                 return (size_t) ((e ? atof(e) : 0.40) * 1048576.0);
             }();
-            const size_t need = (size_t) (req.n_tokens - (int) llama_n_ubatch(ctx_)) * per_tok + ((size_t) 384 << 20);
+            // ALPHA_DRE_PREFILL_MB_PER_TOK2 (default 0): a term in tokens squared, for models whose prompt graph holds
+            // tokens x context temporaries (glm5-next's indexer scoring and selection masks)
+            static const double per_tok2 = []() { const char * e = getenv("ALPHA_DRE_PREFILL_MB_PER_TOK2"); return (e ? atof(e) : 0.0) * 1048576.0; }();
+            const size_t need = (size_t) (req.n_tokens - (int) llama_n_ubatch(ctx_)) * per_tok + ((size_t) 384 << 20) +
+                                (size_t) (per_tok2 * (double) req.n_tokens * (double) req.n_tokens);
             const int64_t tb0 = ggml_time_us();
             if (ggml_cuda_dre_borrow(need) > 0) g_dre_lent = true;
             if (getenv("ALPHA_DRE_RETURN_TIMERS")) fprintf(stderr, "[dre-rt] borrow %.1f ms\n", (ggml_time_us() - tb0) / 1e3);
@@ -1714,6 +1718,13 @@ void gpu_engine::mtp_window_extend(const BatchRequest & req, BatchResult & resul
     if (t_next == LLAMA_TOKEN_NULL) { rewind(); return; }
 
     mtp_steps++; mtp_accept += n_acc; mtp_drafted += k; mtp_accept_full += (n_acc == k) ? 1 : 0;
+    // ALPHA_MTP_WIN_LOG: one line per window (drafted, accepted, running totals), so the acceptance of a short
+    // request can be read without waiting for the every-16-windows summary
+    {
+        static const bool win_log = alpha_env_on("ALPHA_MTP_WIN_LOG");
+        if (win_log) fprintf(stderr, "[mtp-win-log] pos0=%d drafted=%d accepted=%d | totals: %lld windows, %lld drafted, %lld accepted\n",
+                             (int) pos0, k, n_acc, (long long) mtp_steps, (long long) mtp_drafted, (long long) mtp_accept);
+    }
     if (g_mtp_ngram_adapt && slot_id >= 0) {
         if ((int) ngram_adapt_.size() <= slot_id) ngram_adapt_.resize(slot_id + 1);
         auto & A = ngram_adapt_[slot_id];
