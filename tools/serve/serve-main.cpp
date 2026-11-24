@@ -145,6 +145,10 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int spl
 #if defined(_WIN32)
 #  include <io.h>
 #  include <process.h>   // _spawnv (the alphallama-latest handover)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>   // the handover's kill-on-close job object
 #else
 #  include <execinfo.h>
 #  include <unistd.h>
@@ -1457,7 +1461,8 @@ static void alpha_latest_handoff(const char * model_path, int argc, char ** argv
     if (!given({ "-ctv", "--cache-type-v" }))          { args.push_back("-ctv"); args.push_back("q8_0"); }
     if (!given({ "-fitt", "--fit-target" }))           { args.push_back("-fitt"); args.push_back("512"); }
     if (!given({ "-bs", "--backend-sampling", "-no-bs", "--no-backend-sampling" })) args.push_back("-bs");
-    // speculation: n-gram lookup by default (Inkling-2-Mini on a 16 GB card, thinking off: Q3_K_XL 134 tok/s vs 98 with the
+    // speculation (the speed mode, the default decode mode as on the AlphaInfer models; --decode-mode is AlphaServe-only and
+    // dropped above): n-gram lookup by default (Inkling-2-Mini on a 16 GB card, thinking off: Q3_K_XL 134 tok/s vs 98 with the
     // DSpark drafter, Q4_K_M 96 vs 71; the drafter's memory pushes experts to the CPU). ALPHA_LATEST_DRAFTER=1 uses the
     // drafter found beside the model instead. Not token-identical to plain decoding.
     if (!given({ "-md", "--model-draft", "--spec-draft-model", "--spec-type" })) {
@@ -1476,8 +1481,9 @@ static void alpha_latest_handoff(const char * model_path, int argc, char ** argv
     fprintf(stderr, "[latest] architecture '%s' -> alphallama-latest (ALPHA_LATEST=0 disables)\n[latest] %s\n", arch.c_str(), line.c_str());
     fflush(stderr); fflush(stdout);
 #if defined(_WIN32)
-    // no exec on Windows: run it in this console, wait, and exit with its code. _spawnv joins the arguments with
-    // spaces, so quote the ones that need it.
+    // no exec on Windows: run it in this console, wait, and exit with its code. It runs in a kill-on-close job, so
+    // stopping this process (TerminateProcess from an app, a closed console) stops it too instead of leaving it on the
+    // port. _spawnv joins the arguments with spaces, so quote the ones that need it.
     std::vector<std::string> q;
     for (const auto & a : args) {
         if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) { q.push_back(a); continue; }
@@ -1494,8 +1500,20 @@ static void alpha_latest_handoff(const char * model_path, int argc, char ** argv
     std::vector<const char *> av;
     for (const auto & a : q) av.push_back(a.c_str());
     av.push_back(nullptr);
-    const intptr_t rc = _spawnv(_P_WAIT, exe.c_str(), av.data());
-    if (rc == -1) { fprintf(stderr, "[latest] could not start %s: %s\n", exe.c_str(), strerror(errno)); return; }
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
+    const intptr_t ph = _spawnv(_P_NOWAIT, exe.c_str(), av.data());
+    if (ph == -1) { fprintf(stderr, "[latest] could not start %s: %s\n", exe.c_str(), strerror(errno)); return; }
+    if (job && !AssignProcessToJobObject(job, (HANDLE) ph)) {
+        fprintf(stderr, "[latest] note: alphallama-latest is not in a job (error %lu): stopping this process will not stop it\n", GetLastError());
+    }
+    WaitForSingleObject((HANDLE) ph, INFINITE);
+    DWORD rc = 1;
+    GetExitCodeProcess((HANDLE) ph, &rc);
     exit((int) rc);
 #else
     std::vector<char *> av;
@@ -1812,10 +1830,14 @@ int main(int argc, char ** argv) {
             if (dm0 && strcmp(dm0, "speed") == 0) {
                 setenv("ALPHA_SPEED_MODE", "1", 1);
                 setenv("ALPHA_DECODE_MODE", "fast", 1);
-            } else if (!getenv("ALPHA_SPEED_MODE") && !(dm0 && *dm0) && tuned && (!np_explicit || n_slots == 1)) {
-                setenv("ALPHA_SPEED_MODE", "1", 1);
-                fprintf(stderr, "[auto] speed mode: the default for one stream on this model (--decode-mode fast keeps the "
-                                "row's %d-stream shape)\n", air->n_streams);
+            } else if (!getenv("ALPHA_SPEED_MODE") && !(dm0 && *dm0) && (!np_explicit || n_slots == 1)) {
+                if (tuned) {
+                    setenv("ALPHA_SPEED_MODE", "1", 1);
+                    fprintf(stderr, "[auto] speed mode: the default for one stream on this model (--decode-mode fast keeps "
+                                    "the row's %d-stream shape)\n", air->n_streams);
+                } else {   // no speed tuning for this row (or its drafter file is missing): its fast settings are its best speed
+                    fprintf(stderr, "[auto] speed mode: the default; this model's fastest setting is its fast decode\n");
+                }
             }
         }
         // Decode mode (--decode-mode / ALPHA_DECODE_MODE): fast (the default since 2.0.9: multi-token prediction with fast
@@ -1935,6 +1957,9 @@ int main(int argc, char ** argv) {
             else if (dm && strcmp(dm, "exact") == 0)
                 fprintf(stderr, "[auto] decode mode exact: not available for this model (its MTP verify is fast only); "
                                 "serving fast -- use --decode-mode plain for plain greedy\n");
+            else if (!dm || !*dm || strcmp(dm, "speed") == 0)   // the default; Flash-Next has no separate speed tuning
+                fprintf(stderr, "[auto] decode mode: speed (Flash-Next's fastest setting is its fast MTP; not token-identical "
+                                "to plain greedy -- --decode-mode plain for that)\n");
         }
         if (!np_explicit)  n_slots = 1;       // qwen4exp serves one sequence
         if (!ctx_explicit) n_ctx   = 32768;
