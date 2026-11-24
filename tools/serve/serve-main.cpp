@@ -144,12 +144,15 @@ ALPHA_CUDA_API_C void ggml_cuda_expert_pcache_set_cpu_inline(int enable, int spl
 // scan below uses std::filesystem instead.
 #if defined(_WIN32)
 #  include <io.h>
-#  include <filesystem>
+#  include <process.h>   // _spawnv (the alphallama-latest handover)
 #else
 #  include <execinfo.h>
 #  include <unistd.h>
 #  include <dirent.h>
 #endif
+#include <filesystem>
+#include <algorithm>
+#include <cerrno>
 #include <sys/stat.h>
 #ifdef ALPHA_HAS_ALPHAINFER
 #include "alphainfer/src/core/wddm_budget.h"   // Windows video-memory budget for the free-VRAM figure
@@ -1352,6 +1355,156 @@ static void alpha_ready_banner(const char * host, int port, const std::string & 
         g_default_thinking && g_answer_room ? ", answer room kept at max_tokens >= 1024" : "");
 }
 
+// alphallama-latest: the bundled second engine, llama.cpp at a recent upstream release plus our kernels for the newest
+// model families (built from latest/ with -DALPHA_LATEST=ON). When this engine does not know a model's architecture
+// and alphallama-latest sits next to this binary, the process hands over to it: same port, same OpenAI API.
+// AlphaServe-only flags are dropped with a note; every other flag passes through, so llama-server flags work as well.
+// Where unset it applies the measured serving profile: 1 slot, 32K context, q8_0 KV cache, a 512 MiB fit margin,
+// sampling on the GPU, and a DFlash / DSpark drafter for this model found in the model's directory.
+// ALPHA_LATEST=0 disables the handover.
+static std::string alpha_self_dir(char ** argv) {
+    std::string p;
+#if defined(_WIN32)
+    char * pg = nullptr;
+    if (_get_pgmptr(&pg) == 0 && pg) p = pg;
+#elif defined(__linux__)
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) p.assign(buf, n);
+#endif
+    if (p.empty()) p = argv[0];
+    const size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? std::string(".") : p.substr(0, s);
+}
+
+// the drafter for this model in its directory: a dflash-architecture GGUF with the target's vocabulary size
+// (returns the path and sets spec_type to draft-dspark or draft-dflash; empty when there is none)
+static std::string alpha_latest_find_drafter(const char * model_path, int64_t n_vocab, std::string & spec_type) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path mp = fs::absolute(fs::path(model_path), ec);
+    std::vector<fs::path> cands;
+    for (const auto & e : fs::directory_iterator(mp.parent_path(), ec)) {
+        if (e.is_regular_file(ec) && e.path().extension() == ".gguf" && !fs::equivalent(e.path(), mp, ec)) cands.push_back(e.path());
+    }
+    std::sort(cands.begin(), cands.end());
+    for (const auto & c : cands) {
+        gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        gguf_context * gc = gguf_init_from_file(c.string().c_str(), gp);
+        if (!gc) continue;
+        const int64_t ak = gguf_find_key(gc, "general.architecture");
+        const bool dflash = ak >= 0 && strcmp(gguf_get_val_str(gc, ak), "dflash") == 0;
+        const int64_t vk = gguf_find_key(gc, "dflash.vocab_size");
+        const bool same_vocab = n_vocab <= 0 || (vk >= 0 && gguf_get_kv_type(gc, vk) == GGUF_TYPE_UINT32 && (int64_t) gguf_get_val_u32(gc, vk) == n_vocab);
+        bool dspark = false;
+        for (int64_t i = 0; dflash && i < gguf_get_n_tensors(gc) && !dspark; i++) dspark = strstr(gguf_get_tensor_name(gc, i), "markov") != nullptr;
+        gguf_free(gc);
+        if (dflash && same_vocab) {
+            spec_type = dspark ? "draft-dspark" : "draft-dflash";
+            return c.string();
+        }
+    }
+    return "";
+}
+
+static void alpha_latest_handoff(const char * model_path, int argc, char ** argv) {
+    const char * on = getenv("ALPHA_LATEST");
+    if (on && atoi(on) == 0) return;
+
+    gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    gguf_context * gc = gguf_init_from_file(model_path, gp);
+    if (!gc) return;   // not a readable GGUF: the normal load reports it
+    std::string arch;
+    { const int64_t k = gguf_find_key(gc, "general.architecture"); if (k >= 0) arch = gguf_get_val_str(gc, k); }
+    int64_t n_vocab = -1;
+    { const int64_t k = gguf_find_key(gc, (arch + ".vocab_size").c_str()); if (k >= 0 && gguf_get_kv_type(gc, k) == GGUF_TYPE_UINT32) n_vocab = gguf_get_val_u32(gc, k); }
+    gguf_free(gc);
+    if (arch.empty() || llama_model_arch_supported(arch.c_str())) return;
+
+#if defined(_WIN32)
+    const std::string exe = alpha_self_dir(argv) + "\\alphallama-latest.exe";
+#else
+    const std::string exe = alpha_self_dir(argv) + "/alphallama-latest";
+#endif
+    struct stat st;
+    if (stat(exe.c_str(), &st) != 0) {
+        fprintf(stderr, "[latest] architecture '%s' is not supported by this engine, and alphallama-latest is not installed next to it\n", arch.c_str());
+        return;
+    }
+
+    // AlphaServe-only flags (all take a value); --ubatch is -ub there
+    static const char * own[] = { "--backend", "--backend-url", "--backend-key", "--corpus-dir", "--redis-kv", "--deltanet-state",
+                                  "--decode-mode", "--ubatch-prefill", "--auto-threshold", "--marlin-dir" };
+    std::vector<std::string> args = { exe };
+    auto given = [&](std::initializer_list<const char *> names) {
+        for (const auto & a : args) for (const char * n : names) if (a == n) return true;
+        return false;
+    };
+    for (int i = 1; i < argc; i++) {
+        bool drop = false;
+        for (const char * o : own) drop = drop || strcmp(argv[i], o) == 0;
+        if (drop) {
+            fprintf(stderr, "[latest] %s does not apply to alphallama-latest, ignored\n", argv[i]);
+            if (i + 1 < argc) i++;
+            continue;
+        }
+        args.push_back(strcmp(argv[i], "--ubatch") == 0 ? "-ub" : argv[i]);
+    }
+    if (!given({ "-np", "--parallel" }))               { args.push_back("-np"); args.push_back("1"); }
+    if (!given({ "-c", "--ctx-size" }))                { args.push_back("-c"); args.push_back("32768"); }
+    if (!given({ "-ctk", "--cache-type-k" }))          { args.push_back("-ctk"); args.push_back("q8_0"); }
+    if (!given({ "-ctv", "--cache-type-v" }))          { args.push_back("-ctv"); args.push_back("q8_0"); }
+    if (!given({ "-fitt", "--fit-target" }))           { args.push_back("-fitt"); args.push_back("512"); }
+    if (!given({ "-bs", "--backend-sampling", "-no-bs", "--no-backend-sampling" })) args.push_back("-bs");
+    // speculation: n-gram lookup by default (Inkling-2-Mini on a 16 GB card, thinking off: Q3_K_XL 134 tok/s vs 98 with the
+    // DSpark drafter, Q4_K_M 96 vs 71; the drafter's memory pushes experts to the CPU). ALPHA_LATEST_DRAFTER=1 uses the
+    // drafter found beside the model instead. Not token-identical to plain decoding.
+    if (!given({ "-md", "--model-draft", "--spec-draft-model", "--spec-type" })) {
+        const char * dr = getenv("ALPHA_LATEST_DRAFTER");
+        std::string spec_type;
+        const std::string drafter = dr && atoi(dr) != 0 ? alpha_latest_find_drafter(model_path, n_vocab, spec_type) : "";
+        if (!drafter.empty()) {
+            for (const char * a : { "-md", drafter.c_str(), "--spec-type", spec_type.c_str(), "--spec-draft-n-max", "3" }) args.push_back(a);
+        } else {
+            for (const char * a : { "--spec-type", "ngram-mod" }) args.push_back(a);
+        }
+    }
+
+    std::string line;
+    for (const auto & a : args) line += (line.empty() ? "" : " ") + a;
+    fprintf(stderr, "[latest] architecture '%s' -> alphallama-latest (ALPHA_LATEST=0 disables)\n[latest] %s\n", arch.c_str(), line.c_str());
+    fflush(stderr); fflush(stdout);
+#if defined(_WIN32)
+    // no exec on Windows: run it in this console, wait, and exit with its code. _spawnv joins the arguments with
+    // spaces, so quote the ones that need it.
+    std::vector<std::string> q;
+    for (const auto & a : args) {
+        if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) { q.push_back(a); continue; }
+        std::string s = "\"";
+        size_t bs = 0;
+        for (char ch : a) {
+            if (ch == '\\') { bs++; continue; }
+            if (ch == '"') s.append(2 * bs + 1, '\\'); else s.append(bs, '\\');
+            bs = 0; s += ch;
+        }
+        s.append(2 * bs, '\\'); s += '"';
+        q.push_back(s);
+    }
+    std::vector<const char *> av;
+    for (const auto & a : q) av.push_back(a.c_str());
+    av.push_back(nullptr);
+    const intptr_t rc = _spawnv(_P_WAIT, exe.c_str(), av.data());
+    if (rc == -1) { fprintf(stderr, "[latest] could not start %s: %s\n", exe.c_str(), strerror(errno)); return; }
+    exit((int) rc);
+#else
+    std::vector<char *> av;
+    for (auto & a : args) av.push_back(a.data());
+    av.push_back(nullptr);
+    execv(exe.c_str(), av.data());
+    fprintf(stderr, "[latest] could not start %s: %s\n", exe.c_str(), strerror(errno));
+#endif
+}
+
 int main(int argc, char ** argv) {
     // Engine identity banner: alphallama and alphallama-serve are different engines with different speed and
     // endpoints; announce which one is running.
@@ -1468,6 +1621,11 @@ int main(int argc, char ** argv) {
             if (ubatch_prefill > 8192) ubatch_prefill = 8192;
         }
         // --marlin-dir is parsed separately (see marlin_dir variable below)
+    }
+
+    // a model whose architecture this engine does not know goes to alphallama-latest (does not return when it does)
+    if (model_path && (strcmp(backend_str, "local") == 0 || strcmp(backend_str, "auto") == 0)) {
+        alpha_latest_handoff(model_path, argc, argv);
     }
 
     enum BackendMode { MODE_LOCAL, MODE_SGLANG, MODE_VLLM, MODE_AUTO, MODE_FLASHINFER, MODE_ALPHAINFER };

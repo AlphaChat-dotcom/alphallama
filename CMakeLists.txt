@@ -275,6 +275,41 @@ if (ALPHA_ALPHAINFER)
     endif()
 endif()
 
+# alphallama-latest: a second engine on a recent llama.cpp release plus our kernels (latest/), for model families this
+# tree does not implement yet. It is its own CMake project (its ggml is a different version), built as one static
+# executable next to alphallama-serve, which hands such models over to it. The backend switches carry over.
+option(ALPHA_LATEST "Build alphallama-latest, the engine for the newest model families (latest/)" OFF)
+set(ALPHA_LATEST_JOBS "" CACHE STRING "parallel jobs for the alphallama-latest build (empty = the generator's default)")
+if (ALPHA_LATEST)
+    include(ExternalProject)
+    set(ALPHA_LATEST_ARGS
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+        -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=OFF
+        -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF)
+    foreach(v GGML_CUDA GGML_METAL GGML_METAL_EMBED_LIBRARY GGML_NATIVE GGML_AVX GGML_AVX2 GGML_AVX512 GGML_FMA GGML_F16C
+              GGML_BMI2 GGML_OPENMP CMAKE_CUDA_ARCHITECTURES CMAKE_TOOLCHAIN_FILE CMAKE_OSX_ARCHITECTURES
+              CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_MSVC_RUNTIME_LIBRARY)
+        if (DEFINED ${v})
+            string(REPLACE ";" "|" val "${${v}}")   # lists (CUDA architectures) pass through LIST_SEPARATOR
+            list(APPEND ALPHA_LATEST_ARGS "-D${v}=${val}")
+        endif()
+    endforeach()
+    set(ALPHA_LATEST_PARALLEL "")
+    if (ALPHA_LATEST_JOBS)
+        set(ALPHA_LATEST_PARALLEL --parallel ${ALPHA_LATEST_JOBS})
+    endif()
+    ExternalProject_Add(alphallama-latest
+        SOURCE_DIR      ${CMAKE_CURRENT_SOURCE_DIR}/latest
+        BINARY_DIR      ${CMAKE_BINARY_DIR}/latest
+        LIST_SEPARATOR  |
+        CMAKE_ARGS      ${ALPHA_LATEST_ARGS}
+        BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target llama-server ${ALPHA_LATEST_PARALLEL}
+        INSTALL_COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/bin/llama-server${CMAKE_EXECUTABLE_SUFFIX}
+                        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/alphallama-latest${CMAKE_EXECUTABLE_SUFFIX}
+        BUILD_ALWAYS    ON
+        USES_TERMINAL_BUILD ON)
+endif()
+
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()

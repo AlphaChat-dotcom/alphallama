@@ -49,7 +49,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_CUDA=ON -DALPHA_ALPHAINFER=ON -DGGML_CUDA_NCCL=OFF \
+            -DGGML_CUDA=ON -DALPHA_ALPHAINFER=ON -DGGML_CUDA_NCCL=OFF -DALPHA_LATEST=ON -DALPHA_LATEST_JOBS=2 \
             -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
             -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
@@ -71,6 +71,7 @@ jobs:
           cp LICENSE NOTICE README.md "$R/"
           cp -r licenses/. "$R/licenses/"
           cp alphainfer/LICENSE "$R/licenses/LICENSE-alphainfer"
+          cp latest/LICENSE "$R/licenses/LICENSE-alphallama-latest"
           cp tools/serve/LICENSE "$R/licenses/LICENSE-alphaserve"
           [ -f /usr/local/cuda/EULA.txt ] && cp /usr/local/cuda/EULA.txt "$R/licenses/NVIDIA-CUDA-EULA.txt"
           {
@@ -128,19 +129,19 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" ^
-            -DALPHA_ALPHAINFER=ON -DBUILD_SHARED_LIBS=OFF ^
+            -DALPHA_ALPHAINFER=ON -DALPHA_LATEST=ON -DBUILD_SHARED_LIBS=OFF ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DALPHA_FLASHINFER=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF || exit /b 1
           rem static ggml (the AlphaInfer engine calls ggml-cuda internals a DLL does not export): every executable carries
           rem its own copy of the CUDA kernels (~330 MB), so only the core tools are built and shipped
-          cmake --build build -j %NUMBER_OF_PROCESSORS% --target alphallama-serve alphallama alphachat llama-cli llama-quantize llama-bench || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% --target alphallama-serve alphallama alphachat llama-cli llama-quantize llama-bench alphallama-latest || exit /b 1
 
       - name: Package
         shell: pwsh
         run: |
           $n = "$env:PKG-win-x64-${{ matrix.tag }}"; $r = "dist\$n"
           New-Item -ItemType Directory -Force "$r\licenses" | Out-Null
-          foreach ($t in 'alphallama-serve', 'alphallama', 'alphachat', 'llama-cli', 'llama-quantize', 'llama-bench') {
+          foreach ($t in 'alphallama-serve', 'alphallama', 'alphachat', 'llama-cli', 'llama-quantize', 'llama-bench', 'alphallama-latest') {
             $f = Get-ChildItem build\bin -File -Recurse -Filter "$t.exe" | Select-Object -First 1
             if (-not $f) { throw "missing $t.exe" }
             Copy-Item $f.FullName -Destination $r
@@ -152,6 +153,7 @@ jobs:
           Copy-Item licenses\* "$r\licenses" -Recurse
           Copy-Item tools\serve\LICENSE "$r\licenses\LICENSE-alphaserve"
           Copy-Item alphainfer\LICENSE "$r\licenses\LICENSE-alphainfer"
+          Copy-Item latest\LICENSE "$r\licenses\LICENSE-alphallama-latest"
           if (Test-Path "$env:CUDA_PATH\LICENSE") { Copy-Item "$env:CUDA_PATH\LICENSE" "$r\licenses\NVIDIA-CUDA-LICENSE.txt" }
           # OpenSSL: the build links the runner's OpenSSL 3 (CMake: "Found OpenSSL"), so its two DLLs ship next to the
           # executables (a PC without them on PATH could not start any of them: 0xC0000135, DLL not found)
@@ -340,7 +342,7 @@ jobs:
           SSL="$RUNNER_TEMP/ssl"
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF ${{ matrix.defines }} \
-            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DALPHA_LATEST=ON \
             -DLLAMA_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR="$SSL" \
             -DOPENSSL_INCLUDE_DIR="$SSL/include" -DOPENSSL_CRYPTO_LIBRARY="$SSL/lib/libcrypto.a" \
             -DOPENSSL_SSL_LIBRARY="$SSL/lib/libssl.a"
@@ -368,6 +370,7 @@ jobs:
           cp LICENSE NOTICE README.md "$R/"
           cp -r licenses/. "$R/licenses/"
           cp tools/serve/LICENSE "$R/licenses/LICENSE-alphaserve"
+          cp latest/LICENSE "$R/licenses/LICENSE-alphallama-latest"
           printf '%s\n' "AlphaLlama v2 for macOS 12 or newer (${{ matrix.info }})" "" \
             "Run:  bin/alphallama-serve -m <model.gguf>     or  bin/alphallama -m <model.gguf>" "" \
             "If macOS says a program \"cannot be opened\" or \"is damaged\" after downloading," \

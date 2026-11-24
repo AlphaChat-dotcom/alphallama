@@ -27,6 +27,10 @@ license texts are in licenses/.
 - llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT License.
   Copyright (c) 2023-2026 The ggml authors. See licenses/LICENSE-llama.cpp.
 
+- latest/ (alphallama-latest): llama.cpp release b12631 with the pull requests Unsloth pins for its
+  build b12631-mix-acc0843 (https://github.com/unslothai/llama.cpp), MIT License, and our changes to it,
+  also MIT. See latest/LICENSE and latest/README-alphallama.md.
+
 - ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp), MIT License.
   Quantization types and dequantization kernels in ggml/src/ggml-quants-ik.*,
   ggml/src/ggml-cuda/convert-ik.cu. See licenses/LICENSE-ik_llama.cpp.

@@ -1337,6 +1337,10 @@ int32_t llama_split_prefix(
     return 0;
 }
 
+bool llama_model_arch_supported(const char * arch) {
+    return arch && llm_arch_from_string(arch) != LLM_ARCH_UNKNOWN;
+}
+
 const char * llama_print_system_info(void) {
     static std::string s;
     s.clear(); // Clear the string, since it's static, otherwise it will accumulate data from previous calls.

@@ -1601,6 +1601,9 @@ extern "C" {
     //  Returns the split_prefix length.
     LLAMA_API int32_t llama_split_prefix(char * split_prefix, size_t maxlen, const char * split_path, int32_t split_no, int32_t split_count);
 
+    // Whether this build can load models of the given general.architecture
+    LLAMA_API bool llama_model_arch_supported(const char * arch);
+
     // Print system information
     LLAMA_API const char * llama_print_system_info(void);
 
