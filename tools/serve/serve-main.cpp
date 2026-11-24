@@ -856,8 +856,9 @@ static void alpha_auto_profile(const char * model_path, int n_slots, bool np_exp
 // an explicit --backend disables it.
 // Each row is a validated (model file, GPU class, serving shape). A row is added only after token-exactness vs
 // plain through the C API, a soak at the shape, and a check of VRAM headroom after deep context.
-// ALPHA_SPEED_MODE=1 selects the best-speed mode for benchmarks (production keeps exact): fast MTP at the row's
-// fast_k. Fast verify is not token-identical to plain greedy. An explicit AI_MTP_MODE / ALPHA_AI_MTP_K still wins.
+// ALPHA_SPEED_MODE=1 selects the best-speed mode (the default for one stream on rows with speed tuning, see the decode
+// mode below): fast MTP at the row's fast_k, or the row's speed drafter / env. Fast verify is not token-identical to
+// plain greedy. An explicit AI_MTP_MODE / ALPHA_AI_MTP_K still wins.
 struct alpha_ai_validated { const char * sha256; long long size; int sm_major, sm_minor; int n_streams; int ctx_total;
                             const char * mtp_mode;   // AI_MTP_MODE for this row (nullptr = the engine policy default)
                             int fast_k;              // MTP depth in ALPHA_SPEED_MODE (fast verify), best for this row
@@ -1605,7 +1606,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--reasoning-budget") == 0 && i + 1 < argc) {
             g_reasoning_budget = atoi(argv[++i]);
         }
-        else if (strcmp(argv[i], "--decode-mode") == 0 && i + 1 < argc) {   // fast (default) | exact | plain
+        else if (strcmp(argv[i], "--decode-mode") == 0 && i + 1 < argc) {   // speed (default for one stream) | fast | exact | plain
             setenv("ALPHA_DECODE_MODE", argv[++i], 1);
         }
         else if (strcmp(argv[i], "--reasoning-budget-message") == 0 && i + 1 < argc) {
@@ -1799,6 +1800,24 @@ int main(int argc, char ** argv) {
         if (!ctx_explicit) n_ctx   = np_explicit && n_slots < air->n_streams
                                          ? air->ctx_total / std::max(1, air->n_streams) * std::max(1, n_slots)
                                          : air->ctx_total;
+        // Speed mode is the default for one stream on the rows that have speed tuning (since 2.0.12): a bare -m (or -np 1)
+        // gets the row's best-speed drafting; -np 2 or more keeps fast mode at the row's full shape. --decode-mode
+        // fast|exact|plain or ALPHA_SPEED_MODE=0 opts out; --decode-mode speed asks for it at any stream count.
+        {
+            // a row whose best speed is a drafter file only qualifies when the file is there: without it speed mode falls
+            // back to fast MTP at the row's depth, below fast mode with a retrained head (27B: depth 7)
+            const char * dm0   = getenv("ALPHA_DECODE_MODE");
+            const bool   tuned = air->speed_drafter ? (getenv("AI_DFLASH2") || !alpha_ai_find_drafter(model_path, air->speed_drafter).empty())
+                                                    : air->speed_env != nullptr;
+            if (dm0 && strcmp(dm0, "speed") == 0) {
+                setenv("ALPHA_SPEED_MODE", "1", 1);
+                setenv("ALPHA_DECODE_MODE", "fast", 1);
+            } else if (!getenv("ALPHA_SPEED_MODE") && !(dm0 && *dm0) && tuned && (!np_explicit || n_slots == 1)) {
+                setenv("ALPHA_SPEED_MODE", "1", 1);
+                fprintf(stderr, "[auto] speed mode: the default for one stream on this model (--decode-mode fast keeps the "
+                                "row's %d-stream shape)\n", air->n_streams);
+            }
+        }
         // Decode mode (--decode-mode / ALPHA_DECODE_MODE): fast (the default since 2.0.9: multi-token prediction with fast
         // verify at the row's own MTP depth and shape -- not token-identical to plain greedy), exact (MTP whose output
         // is token-identical to plain greedy; the default of the exact rows before 2.0.9) or plain (no MTP). An explicit
