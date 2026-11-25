@@ -288,12 +288,20 @@ if (ALPHA_LATEST)
         -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF)
     foreach(v GGML_CUDA GGML_METAL GGML_METAL_EMBED_LIBRARY GGML_NATIVE GGML_AVX GGML_AVX2 GGML_AVX512 GGML_FMA GGML_F16C
               GGML_BMI2 GGML_OPENMP CMAKE_CUDA_ARCHITECTURES CMAKE_TOOLCHAIN_FILE CMAKE_OSX_ARCHITECTURES
-              CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_MSVC_RUNTIME_LIBRARY)
+              CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_MSVC_RUNTIME_LIBRARY
+              CUDAToolkit_ROOT)
         if (DEFINED ${v})
             string(REPLACE ";" "|" val "${${v}}")   # lists (CUDA architectures) pass through LIST_SEPARATOR
             list(APPEND ALPHA_LATEST_ARGS "-D${v}=${val}")
         endif()
     endforeach()
+    # the toolkit of the CUDA compiler, so the CUDA runtime it links matches the headers it compiled against (a box with
+    # a distro CUDA in /usr linked its older libcudart: undefined cudaGetDeviceProperties_v2)
+    if (NOT DEFINED CUDAToolkit_ROOT AND DEFINED CMAKE_CUDA_COMPILER)
+        get_filename_component(alpha_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+        get_filename_component(alpha_cuda_root "${alpha_cuda_bin}" DIRECTORY)
+        list(APPEND ALPHA_LATEST_ARGS "-DCUDAToolkit_ROOT=${alpha_cuda_root}")
+    endif()
     set(ALPHA_LATEST_PARALLEL "")
     if (ALPHA_LATEST_JOBS)
         set(ALPHA_LATEST_PARALLEL --parallel ${ALPHA_LATEST_JOBS})
