@@ -1831,7 +1831,10 @@ int main(int argc, char ** argv) {
                 setenv("ALPHA_SPEED_MODE", "1", 1);
                 setenv("ALPHA_DECODE_MODE", "fast", 1);
             } else if (!getenv("ALPHA_SPEED_MODE") && !(dm0 && *dm0) && (!np_explicit || n_slots == 1)) {
-                if (tuned) {
+                // not by default on a drafter row: the 27B's DFlash2 speed mode (1 x 131072) ran out of GPU memory at
+                // the 12th copy-heavy request with thinking on, on 2.0.10 as on 2.0.11 (RTX 3090, 2026-11-25); asking for
+                // it (--decode-mode speed, ALPHA_SPEED_MODE=1) still works
+                if (tuned && !air->speed_drafter) {
                     setenv("ALPHA_SPEED_MODE", "1", 1);
                     fprintf(stderr, "[auto] speed mode: the default for one stream on this model (--decode-mode fast keeps "
                                     "the row's %d-stream shape)\n", air->n_streams);
