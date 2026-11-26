@@ -68,6 +68,17 @@ jobs:
             [ -L "$f" ] && continue
             file -b "$f" | grep -q ELF && patchelf --set-rpath '$ORIGIN' "$f"
           done
+          # every library a shipped program needs is in the package or in the base system (libcuda comes with the driver);
+          # ldd can't check this here, the devel image has libraries users don't, such as NCCL
+          base='^(libc|libm|libdl|librt|libpthread|libstdc\+\+|libgcc_s|libgomp|ld-linux-x86-64|libcuda)\.so'
+          bad=0
+          for f in "$R"/bin/*; do
+            [ -L "$f" ] || ! file -b "$f" | grep -q ELF && continue
+            for l in $(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+              [ -e "$R/bin/$l" ] || echo "$l" | grep -qE "$base" || { echo "ERROR: $(basename "$f") needs $l, which the package does not ship"; bad=1; }
+            done
+          done
+          [ $bad = 0 ]
           cp LICENSE NOTICE README.md "$R/"
           cp -r licenses/. "$R/licenses/"
           cp alphainfer/LICENSE "$R/licenses/LICENSE-alphainfer"
