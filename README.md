@@ -9,7 +9,8 @@ than your VRAM at interactive speed: the hot experts stay on the GPU, the rest s
 run on the CPU in parallel.
 
 - **Faster than Strata 0.2.8 on Qwen3.8-Flash-Next** on an RTX 4080 16 GB, RTX 3090 24 GB and RTX 5090 32 GB:
-  same model file, same prompts, same session ([measured on InferArena](https://alphachat.com/inferarena)).
+  same model file, same prompts, same session ([measured on InferArena](https://alphachat.com/inferarena), 2026-11-02;
+  Strata is now at 0.2.23 and has not been re-measured).
 - **One command:** `alphallama-serve -m model.gguf` measures your machine and picks the configuration measured
   best for your GPU class, behind an OpenAI-compatible API.
 - **Exact when you need it:** on validated models the multi-token-prediction output is identical to plain decoding.
